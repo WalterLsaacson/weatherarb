@@ -1,0 +1,58 @@
+{
+  "defaults": {
+    "event_group_id": "fixture-london-2026-09-04",
+    "adapter": "weather_observation",
+    "metric": "daily_max",
+    "unit": "C",
+    "timezone": "Europe/London",
+    "rounding": "whole_degree_as_published",
+    "observation_start": "2026-09-04T00:00:00",
+    "observation_end": "2026-09-04T23:59:59",
+    "manual_approval": true,
+    "source": {
+      "provider": "NOAA-fixture",
+      "station_id": "EGLC",
+      "url": "fixture://weather/london",
+      "resolution_source": "fixture://weather/london",
+      "value_path": "value",
+      "timestamp_path": "timestamp",
+      "final_path": "final",
+      "value_unit": "C",
+      "static": {
+        "features": [
+          {"value": 21, "timestamp": "2026-09-04T06:00:00Z"},
+          {"value": 26, "timestamp": "2026-09-04T12:00:00Z"},
+          {"value": 24, "timestamp": "2026-09-04T18:00:00Z"},
+          {"value": 26, "timestamp": "2026-09-05T00:03:00Z"}
+        ],
+        "final": true
+      }
+    },
+    "buckets": [
+      {"outcome": "22 or below", "upper": 22, "upper_inclusive": true},
+      {"outcome": "23", "lower": 22, "lower_inclusive": false, "upper": 23, "upper_inclusive": true},
+      {"outcome": "24", "lower": 23, "lower_inclusive": false, "upper": 24, "upper_inclusive": true},
+      {"outcome": "25", "lower": 24, "lower_inclusive": false, "upper": 25, "upper_inclusive": true},
+      {"outcome": "26", "lower": 25, "lower_inclusive": false, "upper": 26, "upper_inclusive": true},
+      {"outcome": "27", "lower": 26, "lower_inclusive": false, "upper": 27, "upper_inclusive": true},
+      {"outcome": "28", "lower": 27, "lower_inclusive": false, "upper": 28, "upper_inclusive": true},
+      {"outcome": "29", "lower": 28, "lower_inclusive": false, "upper": 29, "upper_inclusive": true},
+      {"outcome": "30", "lower": 29, "lower_inclusive": false, "upper": 30, "upper_inclusive": true},
+      {"outcome": "31", "lower": 30, "lower_inclusive": false, "upper": 31, "upper_inclusive": true},
+      {"outcome": "32 or higher", "lower": 31, "lower_inclusive": false}
+    ]
+  },
+  "rules": [
+    {"market_id": "wx-london-22-low", "target_outcome": "22 or below"},
+    {"market_id": "wx-london-23", "target_outcome": "23"},
+    {"market_id": "wx-london-24", "target_outcome": "24"},
+    {"market_id": "wx-london-25", "target_outcome": "25"},
+    {"market_id": "wx-london-26", "target_outcome": "26"},
+    {"market_id": "wx-london-27", "target_outcome": "27"},
+    {"market_id": "wx-london-28", "target_outcome": "28"},
+    {"market_id": "wx-london-29", "target_outcome": "29"},
+    {"market_id": "wx-london-30", "target_outcome": "30"},
+    {"market_id": "wx-london-31", "target_outcome": "31"},
+    {"market_id": "wx-london-32-high", "target_outcome": "32 or higher"}
+  ]
+}

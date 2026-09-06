@@ -1,0 +1,39 @@
+{
+  "id": "weather-board",
+  "name": "Polymarket Weather Board",
+  "version": "0.1.0",
+  "kind": "frontend",
+  "status": "poc",
+  "skill": "standalone-weather-finality",
+  "entry": {
+    "html": "public/index.html",
+    "js": "src/main.js",
+    "css": "src/styles.css",
+    "server": "server/app.py"
+  },
+  "api": {
+    "base": "/",
+    "transport": "SSE + REST snapshot",
+    "routes": [
+      "GET /api/health",
+      "GET /api/status",
+      "GET /api/overview",
+      "GET /api/events",
+      "GET /api/events/{event_group_id}",
+      "GET /api/events/{event_group_id}/source",
+      "GET /api/events/{event_group_id}/books",
+      "GET /api/candidates",
+      "GET /api/metrics",
+      "GET /api/stream",
+      "POST /api/scan/once",
+      "POST /api/start",
+      "POST /api/stop"
+    ]
+  },
+  "defaults": {
+    "host": "127.0.0.1",
+    "port": 8793,
+    "interval": 60,
+    "live_orders": false
+  }
+}

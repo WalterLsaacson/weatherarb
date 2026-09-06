@@ -1,0 +1,2 @@
+# Standalone POC intentionally has no third-party runtime dependencies.
+# Python 3.8+ standard library is sufficient.

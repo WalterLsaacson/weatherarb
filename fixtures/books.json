@@ -1,0 +1,156 @@
+{
+  "wx-london-22-low-yes": {
+    "token_id": "wx-london-22-low-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-22-low-no": {
+    "token_id": "wx-london-22-low-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-23-yes": {
+    "token_id": "wx-london-23-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-23-no": {
+    "token_id": "wx-london-23-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-24-yes": {
+    "token_id": "wx-london-24-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-24-no": {
+    "token_id": "wx-london-24-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-25-yes": {
+    "token_id": "wx-london-25-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-25-no": {
+    "token_id": "wx-london-25-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-26-yes": {
+    "token_id": "wx-london-26-yes",
+    "asks": [{"price": 0.990, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-26-no": {
+    "token_id": "wx-london-26-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-27-yes": {
+    "token_id": "wx-london-27-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-27-no": {
+    "token_id": "wx-london-27-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-28-yes": {
+    "token_id": "wx-london-28-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-28-no": {
+    "token_id": "wx-london-28-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-29-yes": {
+    "token_id": "wx-london-29-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-29-no": {
+    "token_id": "wx-london-29-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-30-yes": {
+    "token_id": "wx-london-30-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-30-no": {
+    "token_id": "wx-london-30-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-31-yes": {
+    "token_id": "wx-london-31-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-31-no": {
+    "token_id": "wx-london-31-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-32-high-yes": {
+    "token_id": "wx-london-32-high-yes",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  },
+  "wx-london-32-high-no": {
+    "token_id": "wx-london-32-high-no",
+    "asks": [{"price": 0.999, "size": 20}],
+    "bids": [{"price": 0.001, "size": 10}],
+    "tick_size": 0.001,
+    "min_order_size": 1
+  }
+}

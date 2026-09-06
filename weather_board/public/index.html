@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="weather-module" content="weather-board" />
+    <title>Polymarket Weather Board</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="brand__mark">WX</span>
+        <div>
+          <h1>Weather Finality Board</h1>
+          <p>独立只读 POC · source finality → 桶匹配 → CLOB 深度 · 默认 dry-run</p>
+        </div>
+      </div>
+      <div class="actions">
+        <label class="toggle"><input id="autoRefresh" type="checkbox" checked /> SSE 实时</label>
+        <button id="btnScan" class="btn btn--ghost" type="button">立即扫描</button>
+        <button id="btnStart" class="btn btn--primary" type="button">启动轮询</button>
+        <button id="btnStop" class="btn btn--danger" type="button" disabled>停止</button>
+      </div>
+    </header>
+
+    <section class="meta">
+      <div class="pill" id="pillConnection">连接中</div>
+      <div class="pill pill--muted" id="pillMode">DRY-RUN</div>
+      <div class="pill pill--muted" id="pillCircuit">Circuit —</div>
+      <div class="pill pill--muted" id="pillScan">最近扫描 —</div>
+      <div class="pill pill--muted" id="pillProxy">proxy —</div>
+    </section>
+
+    <main class="page">
+      <section class="kpis" id="kpis"></section>
+      <section class="toolbar panel">
+        <div>
+          <h2>事件匹配总览</h2>
+          <p class="muted">匹配率按当前扫描快照计算，分子/分母均展示；点击事件查看证据、时间序列和盘口。</p>
+        </div>
+        <div class="filters">
+          <input id="search" type="search" placeholder="城市、站点、事件…" />
+          <select id="statusFilter">
+            <option value="">全部状态</option>
+            <option value="final">source final</option>
+            <option value="provisional">provisional</option>
+            <option value="opportunity">有候选</option>
+            <option value="review">review</option>
+            <option value="no_trade">no trade</option>
+          </select>
+        </div>
+      </section>
+      <section class="panel table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>事件 / 站点</th>
+              <th>日期 / 指标</th>
+              <th>规则</th>
+              <th>数据源</th>
+              <th>匹配桶</th>
+              <th>盘口 / 净边际</th>
+              <th>状态</th>
+              <th>更新时间</th>
+            </tr>
+          </thead>
+          <tbody id="eventRows">
+            <tr><td colspan="8" class="empty">等待扫描快照…</td></tr>
+          </tbody>
+        </table>
+      </section>
+      <section class="panel candidates-panel">
+        <div class="section-head">
+          <div>
+            <h2>Dry-run 候选</h2>
+            <p class="muted">只展示通过 source、规则、生命周期、盘口和经济门的候选，不会下单。</p>
+          </div>
+          <span class="count" id="candidateCount">0</span>
+        </div>
+        <div id="candidates" class="candidate-grid"></div>
+      </section>
+    </main>
+
+    <aside id="detail" class="drawer" aria-hidden="true">
+      <div class="drawer__head">
+        <div><span class="eyebrow">EVENT DETAIL</span><h2 id="detailTitle">—</h2></div>
+        <button id="btnCloseDetail" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <div id="detailBody" class="drawer__body"></div>
+    </aside>
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/src/main.js" type="module"></script>
+  </body>
+</html>
+
