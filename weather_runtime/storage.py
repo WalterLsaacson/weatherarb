@@ -26,12 +26,12 @@ def load_json(path: Path, default: Any = None) -> Any:
         return default
 
 
-def write_json_atomic(path: Path, payload: Any) -> None:
+def write_json_atomic(path: Path, payload: Any, *, indent: Optional[int] = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(payload, handle, ensure_ascii=False, indent=indent, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
@@ -79,13 +79,14 @@ def append_jsonl_dedup(
             existing: set[str] = set()
             if path.is_file():
                 try:
-                    for line in path.read_text(encoding="utf-8").splitlines():
-                        if not line.strip():
-                            continue
-                        try:
-                            existing.add(key_fn(json.loads(line)))
-                        except (ValueError, TypeError, KeyError):
-                            continue
+                    with path.open("r", encoding="utf-8") as handle:
+                        for line in handle:
+                            if not line.strip():
+                                continue
+                            try:
+                                existing.add(key_fn(json.loads(line)))
+                            except (ValueError, TypeError, KeyError):
+                                continue
                 except OSError:
                     pass
             unique: list[Any] = []

@@ -9,7 +9,15 @@ from typing import Any, Iterable, Optional
 
 from .books import ClobClient, ask_depth, normalize_book, walk_asks
 from .models import Book, WeatherMarket, WeatherRule, parse_time
-from .rules import bucket_for_value, norm_outcome, normalize_market, source_matches, validate_event_group_siblings
+from .rules import (
+    bucket_for_outcome,
+    bucket_for_value,
+    bucket_impossible_while_open,
+    norm_outcome,
+    normalize_market,
+    source_matches,
+    validate_event_group_siblings,
+)
 from .sources import WeatherSourceAdapter
 from .storage import sha256_json
 
@@ -28,6 +36,12 @@ def _rule_market_id(rule: WeatherRule, market: WeatherMarket) -> str:
 
 def _norm_event_id(value: Any) -> str:
     return str(value or "").strip().rstrip("/").lower()
+
+
+def _without_raw(payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(payload)
+    cleaned.pop("raw", None)
+    return cleaned
 
 
 def _yes_token(market: WeatherMarket) -> str:
@@ -77,6 +91,52 @@ class WeatherScanner:
             return normalize_book(token_id, value)
         return Book(token_id=token_id, book_missing=True, error="book_missing")
 
+    def _queue_matched_trade(
+        self,
+        base: dict[str, Any],
+        rows: list[dict[str, Any]],
+        token_ids: list[str],
+        market: WeatherMarket,
+        *,
+        bucket: Any,
+        trade_side: str,
+        is_target: bool,
+        source_status: str,
+        reason: str,
+        history: list[str],
+    ) -> None:
+        trade_token = _yes_token(market) if trade_side == "YES" else _no_token(market)
+        base.update(
+            {
+                "matched_bucket": bucket.to_dict(),
+                "matched_outcome": bucket.outcome,
+                "rule_status": "matched" if is_target else "not_target",
+                "source_status": source_status,
+                "trade_side": trade_side,
+                "winning_side": trade_side,
+                "winning_token_id": trade_token,
+                "book_token_id": trade_token,
+                "lifecycle": {"state": "RULE_MATCHED", "history": list(history)},
+            }
+        )
+        if not trade_token:
+            base.update(
+                {
+                    "status": "no_trade",
+                    "reason": "missing_yes_token" if is_target else "missing_no_token",
+                }
+            )
+            rows.append(base)
+            return
+        token_ids.append(trade_token)
+        if not market.tradable:
+            base.update({"status": "no_trade", "reason": "market_not_tradable"})
+            rows.append(base)
+            return
+        base["status"] = "rule_matched"
+        base["reason"] = reason
+        rows.append(base)
+
     def scan(
         self,
         markets: Iterable[WeatherMarket | dict[str, Any]],
@@ -125,6 +185,7 @@ class WeatherScanner:
         rows: list[dict[str, Any]] = []
         token_ids: list[str] = []
         source_cache: dict[str, Any] = {}
+        source_evidence: dict[str, dict[str, Any]] = {}
 
         for rule in rule_list:
             market = market_map.get(rule.market_id)
@@ -135,8 +196,8 @@ class WeatherScanner:
                 "target_outcome": rule.target_outcome,
                 "status": "review",
                 "reason": "",
-                "market": market.to_dict() if market else {},
-                "rule": rule.to_dict(),
+                "market": _without_raw(market.to_dict()) if market else {},
+                "rule": _without_raw(rule.to_dict()),
                 "created_at": _iso(current),
             }
             if market is None:
@@ -193,70 +254,172 @@ class WeatherScanner:
             if observation is None:
                 observation = self.source_adapter.poll(rule, now=current)
                 source_cache[cache_key] = observation
-            base["observation"] = observation.to_dict()
-            if observation.status != "final":
-                if observation.status == "waiting_window":
-                    state = "WAITING_WINDOW"
-                    row_status = "waiting"
-                elif observation.status == "provisional":
-                    state = "PROVISIONAL"
-                    row_status = "waiting"
-                elif observation.status == "expired":
-                    state = "WINDOW_EXPIRED"
-                    row_status = "no_trade"
-                else:
-                    state = "SOURCE_UNAVAILABLE"
-                    row_status = "review"
-                base.update({"status": row_status, "reason": observation.reason or observation.status})
-                base["lifecycle"] = {"state": state, "history": ["DISCOVERED", state]}
-                rows.append(base)
-                continue
-
-            bucket = bucket_for_value(observation.value, rule.buckets, rounding=rule.rounding)
-            if bucket is None:
-                base.update({"status": "review", "reason": "value_outside_bucket_set"})
-                base["lifecycle"] = {"state": "RULE_REVIEW", "history": ["SOURCE_FINAL", "RULE_REVIEW"]}
-                rows.append(base)
-                continue
-            target_outcome = _rule_market_id(rule, market)
-            is_target = _norm_outcome(target_outcome) == _norm_outcome(bucket.outcome)
-            trade_side = "YES" if is_target else "NO"
-            trade_token = _yes_token(market) if is_target else _no_token(market)
-            base.update(
-                {
-                    "matched_bucket": bucket.to_dict(),
-                    "matched_outcome": bucket.outcome,
-                    "rule_status": "matched" if is_target else "not_target",
-                    "source_status": "final",
-                    "trade_side": trade_side,
-                    "winning_side": trade_side,
-                    "winning_token_id": trade_token,
-                    "book_token_id": trade_token,
+            evidence = observation.to_dict()
+            if evidence.get("raw") is not None and evidence.get("evidence_hash"):
+                source_evidence.setdefault(
+                    str(evidence["evidence_hash"]),
+                    {
+                        "event_group_id": rule.event_group_id,
+                        "evidence_hash": evidence.get("evidence_hash"),
+                        "status": evidence.get("status"),
+                        "source_timestamp": evidence.get("source_timestamp"),
+                        "observed_at": evidence.get("observed_at"),
+                        "raw": evidence.get("raw"),
+                    },
+                )
+            base["observation"] = _without_raw(evidence)
+            if observation.status == "waiting_window":
+                base.update(
+                    {
+                        "status": "waiting",
+                        "reason": observation.reason or observation.status,
+                    }
+                )
+                base["lifecycle"] = {
+                    "state": "WAITING_WINDOW",
+                    "history": ["DISCOVERED", "WAITING_WINDOW"],
                 }
-            )
-            base["lifecycle"] = {
-                "state": "RULE_MATCHED",
-                "history": ["DISCOVERED", "WINDOW_CLOSED", "SOURCE_FINAL", "RULE_MATCHED"],
-            }
-            if not trade_token:
+                rows.append(base)
+                continue
+            if observation.status == "expired":
                 base.update(
                     {
                         "status": "no_trade",
-                        "reason": "missing_yes_token" if is_target else "missing_no_token",
+                        "reason": observation.reason or observation.status,
                     }
                 )
+                base["lifecycle"] = {
+                    "state": "WINDOW_EXPIRED",
+                    "history": ["DISCOVERED", "WINDOW_EXPIRED"],
+                }
                 rows.append(base)
                 continue
-            token_ids.append(trade_token)
-            if not market.tradable:
-                base.update({"status": "no_trade", "reason": "market_not_tradable"})
+            if observation.status not in {"final", "intraday", "provisional"}:
+                base.update(
+                    {
+                        "status": "review",
+                        "reason": observation.reason or observation.status,
+                    }
+                )
+                base["lifecycle"] = {
+                    "state": "SOURCE_UNAVAILABLE",
+                    "history": ["DISCOVERED", "SOURCE_UNAVAILABLE"],
+                }
                 rows.append(base)
                 continue
-            base["status"] = "rule_matched"
-            base["reason"] = (
-                "source_final_winner_yes" if is_target else "source_final_loser_no"
+
+            running_bucket = bucket_for_value(
+                observation.value, rule.buckets, rounding=rule.rounding
             )
-            rows.append(base)
+            if running_bucket is None:
+                if observation.status == "intraday":
+                    history_prefix = ["DISCOVERED", "INTRADAY", "RULE_REVIEW"]
+                elif observation.status == "final":
+                    history_prefix = ["DISCOVERED", "WINDOW_CLOSED", "SOURCE_FINAL", "RULE_REVIEW"]
+                else:
+                    history_prefix = ["DISCOVERED", "PROVISIONAL", "RULE_REVIEW"]
+                base.update({"status": "review", "reason": "value_outside_bucket_set"})
+                base["lifecycle"] = {
+                    "state": "RULE_REVIEW",
+                    "history": history_prefix,
+                }
+                rows.append(base)
+                continue
+
+            market_bucket = bucket_for_outcome(_rule_market_id(rule, market), rule.buckets)
+            if market_bucket is None:
+                base.update({"status": "review", "reason": "outcome_not_in_bucket_set"})
+                base["lifecycle"] = {
+                    "state": "RULE_REVIEW",
+                    "history": ["DISCOVERED", "RULE_REVIEW"],
+                }
+                rows.append(base)
+                continue
+            is_running = _norm_outcome(market_bucket.outcome) == _norm_outcome(
+                running_bucket.outcome
+            )
+
+            if observation.status == "intraday":
+                if not bucket_impossible_while_open(
+                    rule.metric,
+                    observation.value,
+                    market_bucket,
+                    rounding=rule.rounding,
+                ):
+                    base.update(
+                        {
+                            "status": "waiting",
+                            "reason": observation.reason or observation.status,
+                            "matched_bucket": running_bucket.to_dict(),
+                            "matched_outcome": running_bucket.outcome,
+                            "source_status": "intraday",
+                        }
+                    )
+                    base["lifecycle"] = {
+                        "state": "INTRADAY",
+                        "history": ["DISCOVERED", "INTRADAY"],
+                    }
+                    rows.append(base)
+                    continue
+                self._queue_matched_trade(
+                    base,
+                    rows,
+                    token_ids,
+                    market,
+                    bucket=running_bucket,
+                    trade_side="NO",
+                    is_target=False,
+                    source_status="intraday",
+                    reason="intraday_impossible_no",
+                    history=["DISCOVERED", "INTRADAY", "RULE_MATCHED"],
+                )
+                continue
+
+            if observation.status == "provisional":
+                if is_running:
+                    base.update(
+                        {
+                            "status": "waiting",
+                            "reason": observation.reason or observation.status,
+                            "matched_bucket": running_bucket.to_dict(),
+                            "matched_outcome": running_bucket.outcome,
+                            "source_status": "provisional",
+                        }
+                    )
+                    base["lifecycle"] = {
+                        "state": "PROVISIONAL",
+                        "history": ["DISCOVERED", "PROVISIONAL"],
+                    }
+                    rows.append(base)
+                    continue
+                self._queue_matched_trade(
+                    base,
+                    rows,
+                    token_ids,
+                    market,
+                    bucket=running_bucket,
+                    trade_side="NO",
+                    is_target=False,
+                    source_status="provisional",
+                    reason="provisional_loser_no",
+                    history=["DISCOVERED", "PROVISIONAL", "RULE_MATCHED"],
+                )
+                continue
+
+            self._queue_matched_trade(
+                base,
+                rows,
+                token_ids,
+                market,
+                bucket=running_bucket,
+                trade_side="YES" if is_running else "NO",
+                is_target=is_running,
+                source_status="final",
+                reason=(
+                    "source_final_winner_yes" if is_running else "source_final_loser_no"
+                ),
+                history=["DISCOVERED", "WINDOW_CLOSED", "SOURCE_FINAL", "RULE_MATCHED"],
+            )
 
         if books is None and fetch_books and token_ids:
             fetched = self.clob_client.fetch_books(sorted(set(token_ids)))
@@ -268,7 +431,7 @@ class WeatherScanner:
             token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
             fetched = books.get(token_id) if token_id else None
             if fetched is not None:
-                row["book"] = self._book(fetched, token_id).to_dict()
+                row["book"] = _without_raw(self._book(fetched, token_id).to_dict())
             if row.get("status") != "rule_matched":
                 continue
             if self.config.reject_neg_risk and market is not None and market.neg_risk:
@@ -277,7 +440,7 @@ class WeatherScanner:
                 row.update({"status": "no_trade", "reason": "neg_risk_rejected"})
                 continue
             book = self._book(books.get(token_id), token_id)
-            row["book"] = book.to_dict()
+            row["book"] = _without_raw(book.to_dict())
             if book.book_missing or book.best_ask is None:
                 row.update({"status": "no_trade", "reason": "book_missing"})
                 continue
@@ -389,21 +552,23 @@ class WeatherScanner:
             if edge < self.config.min_net_edge:
                 row.update({"status": "no_trade", "reason": "edge_below_minimum"})
                 continue
+            match_reason = str(row.get("reason") or "")
+            opportunity_reason = (
+                match_reason
+                if match_reason in {"intraday_impossible_no", "provisional_loser_no"}
+                else "dry_run_candidate_only"
+            )
+            history = list((row.get("lifecycle") or {}).get("history") or [])
+            if not history:
+                history = ["DISCOVERED", "RULE_MATCHED"]
+            if history[-1] != "BOOK_READY":
+                history = history + ["BOOK_READY"]
             row.update(
                 {
                     "status": "opportunity",
-                    "reason": "dry_run_candidate_only",
+                    "reason": opportunity_reason,
                     "dry_run": True,
-                    "lifecycle": {
-                        "state": "BOOK_READY",
-                        "history": [
-                            "DISCOVERED",
-                            "WINDOW_CLOSED",
-                            "SOURCE_FINAL",
-                            "RULE_MATCHED",
-                            "BOOK_READY",
-                        ],
-                    },
+                    "lifecycle": {"state": "BOOK_READY", "history": history},
                 }
             )
 
@@ -444,6 +609,8 @@ class WeatherScanner:
                 group_source_status = "unavailable"
             elif observation_statuses & {"waiting_window"}:
                 group_source_status = "waiting_window"
+            elif observation_statuses & {"intraday"}:
+                group_source_status = "intraday"
             else:
                 group_source_status = "provisional"
             group_views.append(
@@ -525,7 +692,11 @@ class WeatherScanner:
             "summary": summary,
             "rows": rows,
             "event_groups": group_views,
-            "books": {token_id: self._book(value, token_id).to_dict() for token_id, value in books.items()},
+            "source_evidence": list(source_evidence.values()),
+            "books": {
+                token_id: _without_raw(self._book(value, token_id).to_dict())
+                for token_id, value in books.items()
+            },
         }
 
 

@@ -32,6 +32,49 @@ from .sources import JsonHttp
 from .storage import append_jsonl_dedup, load_json, write_json_atomic
 
 
+def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
+    """Drop bulky source/market payloads from the board JSON without copying them."""
+
+    slim: list[dict[str, Any]] = []
+    if not isinstance(groups, list):
+        return slim
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        item = dict(group)
+        item["rows"] = [_slim_row(row) for row in group.get("rows") or [] if isinstance(row, dict)]
+        item["markets"] = [
+            _slim_market_view(row) for row in group.get("markets") or [] if isinstance(row, dict)
+        ]
+        slim.append(item)
+    return slim
+
+
+def _slim_row(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    observation = item.get("observation")
+    if isinstance(observation, dict) and "raw" in observation:
+        observation = dict(observation)
+        observation.pop("raw", None)
+        item["observation"] = observation
+    market = item.get("market")
+    if isinstance(market, dict) and "raw" in market:
+        market = dict(market)
+        market.pop("raw", None)
+        item["market"] = market
+    return item
+
+
+def _slim_market_view(row: dict[str, Any]) -> dict[str, Any]:
+    item = dict(row)
+    book = item.get("book")
+    if isinstance(book, dict) and "raw" in book:
+        book = dict(book)
+        book.pop("raw", None)
+        item["book"] = book
+    return item
+
+
 class RuntimeService:
     """Owns periodic scans, last snapshot and bounded SSE subscriber queues."""
 
@@ -253,8 +296,20 @@ class RuntimeService:
             }
         return payload
 
+    def _rotate_jsonl(self, path: Path, *, limit_bytes: int = 32 * 1024 * 1024) -> None:
+        if path.is_file() and path.stat().st_size > limit_bytes:
+            rotated = path.with_name(path.name + ".old")
+            try:
+                path.replace(rotated)
+            except OSError:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+
     def _persist(self, result: dict[str, Any]) -> None:
         stamp = (result.get("summary") or {}).get("scanned_at") or datetime.now(timezone.utc).isoformat()
+        evidence = list(result.pop("source_evidence", []) or [])
         write_json_atomic(self.data_dir / "latest.json", result)
         write_json_atomic(
             self.data_dir / "health.json",
@@ -266,11 +321,18 @@ class RuntimeService:
                 "last_error": self.last_error,
                 "dry_run": self.dry_run,
             },
+            indent=2,
         )
         rows = result.get("rows") or []
+        scan_path = self.data_dir / "scan.jsonl"
+        self._rotate_jsonl(scan_path)
         append_jsonl_dedup(
-            self.data_dir / "scan.jsonl",
-            [{"scan_at": stamp, **row} for row in rows],
+            scan_path,
+            [
+                {"scan_at": stamp, **row}
+                for row in rows
+                if row.get("status") not in {"waiting"}
+            ],
             key_fn=lambda row: json.dumps(
                 {
                     "market_id": row.get("market_id"),
@@ -299,13 +361,10 @@ class RuntimeService:
                 sort_keys=True,
             ),
         )
+        self._rotate_jsonl(self.data_dir / "source_observations.jsonl")
         append_jsonl_dedup(
             self.data_dir / "source_observations.jsonl",
-            [
-                {"scan_at": stamp, "event_group_id": row.get("event_group_id"), **(row.get("observation") or {})}
-                for row in rows
-                if row.get("observation")
-            ],
+            [{"scan_at": stamp, **item} for item in evidence],
             key_fn=lambda row: "{}|{}|{}".format(
                 row.get("event_group_id"), row.get("evidence_hash"), row.get("source_timestamp")
             ),
@@ -361,12 +420,12 @@ class RuntimeService:
             self.last_scan_at = str((result.get("summary") or {}).get("scanned_at") or "")
             self.last_result = result
             self._persist(result)
-        self._publish("snapshot", self.snapshot())
+        self._publish("snapshot", self.board_snapshot())
         self._publish(
             "source_update",
             {
                 "scanned_at": self.last_scan_at,
-                "event_groups": result.get("event_groups") or [],
+                "event_groups": slim_board_groups(result.get("event_groups") or []),
             },
         )
         self._publish(
@@ -374,8 +433,10 @@ class RuntimeService:
             {
                 "scanned_at": self.last_scan_at,
                 "candidates": [
-                    row for row in result.get("rows") or [] if row.get("status") == "opportunity"
-                ],
+                _slim_row(row)
+                for row in result.get("rows") or []
+                if isinstance(row, dict) and row.get("status") == "opportunity"
+            ],
             },
         )
         return result
@@ -418,10 +479,21 @@ class RuntimeService:
         return self.status()
 
     def snapshot(self) -> dict[str, Any]:
+        return self.board_snapshot()
+
+    def current_books(self) -> dict[str, Any]:
         with self.lock:
-            result = json.loads(json.dumps(self.last_result, ensure_ascii=False))
-            result["status"] = self.status()
-            return result
+            books = self.last_result.get("books") or {}
+            return books if isinstance(books, dict) else {}
+
+    def board_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            result = self.last_result
+            return {
+                "summary": dict(result.get("summary") or {}),
+                "event_groups": slim_board_groups(result.get("event_groups") or []),
+                "status": self.status(),
+            }
 
     def overview(self) -> dict[str, Any]:
         with self.lock:
@@ -433,7 +505,7 @@ class RuntimeService:
 
     def events(self, *, status: str = "", query: str = "", limit: int = 200) -> list[dict[str, Any]]:
         with self.lock:
-            groups = list(self.last_result.get("event_groups") or [])
+            groups = slim_board_groups(self.last_result.get("event_groups") or [])
         status = status.strip().lower()
         query = query.strip().lower()
         result = []
@@ -456,9 +528,9 @@ class RuntimeService:
     def candidates(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self.lock:
             rows = [
-                row
+                _slim_row(row)
                 for row in self.last_result.get("rows") or []
-                if row.get("status") == "opportunity"
+                if isinstance(row, dict) and row.get("status") == "opportunity"
             ]
         return rows[: max(1, min(int(limit), 1000))]
 
@@ -521,7 +593,7 @@ class RuntimeService:
                 {
                     "id": str(self._next_event_id),
                     "type": "snapshot",
-                    "data": self.snapshot(),
+                    "data": self.board_snapshot(),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
             )

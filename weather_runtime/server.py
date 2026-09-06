@@ -8,7 +8,7 @@ import mimetypes
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .service import RuntimeService
@@ -22,15 +22,21 @@ PORT = 8793
 SERVICE: RuntimeService
 
 
+_DISCONNECT = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
 def json_response(handler: BaseHTTPRequestHandler, code: int, payload: Any) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    handler.send_response(code)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Access-Control-Allow-Origin", "*")
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(code)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Access-Control-Allow-Origin", "*")
+        handler.end_headers()
+        handler.wfile.write(body)
+    except _DISCONNECT:
+        return
 
 
 def _safe_file(root: Path, relative: str) -> Path | None:
@@ -91,6 +97,18 @@ def sse(handler: BaseHTTPRequestHandler) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "PolymarketWeatherBoard/0.1"
+
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except _DISCONNECT:
+            return
+
+    def log_error(self, fmt: str, *args: Any) -> None:
+        message = fmt % args if args else str(fmt)
+        if "Broken pipe" in message or "Connection reset" in message:
+            return
+        super().log_error(fmt, *args)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
@@ -156,8 +174,7 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {"fetched_at": SERVICE.last_scan_at, "observations": observations})
             return
         if path == "/api/books":
-            books = SERVICE.snapshot().get("books") or {}
-            json_response(self, 200, {"fetched_at": SERVICE.last_scan_at, "books": books})
+            json_response(self, 200, {"fetched_at": SERVICE.last_scan_at, "books": SERVICE.current_books()})
             return
         if path == "/api/events":
             status = str((query.get("status") or [""])[0])
@@ -238,7 +255,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/scan/once":
             try:
-                json_response(self, 200, SERVICE.scan_once())
+                SERVICE.scan_once()
+                json_response(self, 200, SERVICE.overview())
+            except _DISCONNECT:
+                return
             except Exception as exc:  # noqa: BLE001
                 json_response(self, 502, {"ok": False, "error": str(exc)})
             return

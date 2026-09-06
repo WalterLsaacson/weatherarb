@@ -10,10 +10,9 @@ drought, PWS dashboards and other families stay in review.
 from __future__ import annotations
 
 import re
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable
-from zoneinfo import ZoneInfo
 
 from .markets import (
     extract_resolution_url,
@@ -112,20 +111,21 @@ def _noaa_template_reasons(first: WeatherMarket, group: list[WeatherMarket]) -> 
     if local_date and timezone_name and station:
         start = "{}T00:00:00".format(local_date)
         end = "{}T23:59:59".format(local_date)
-        start_utc = datetime.fromisoformat(start).replace(tzinfo=ZoneInfo(timezone_name))
-        end_utc = datetime.fromisoformat(end).replace(tzinfo=start_utc.tzinfo)
         source = {
             "provider": "NOAA",
             "station_id": station,
-            "url": "https://api.weather.gov/stations/{}/observations".format(station),
+            "url": "https://api.synopticdata.com/v2/stations/timeseries",
             "params": {
-                "limit": 500,
-                "start": (start_utc - timedelta(hours=6)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "end": (end_utc + timedelta(hours=18)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "STID": station,
+                "showemptystations": 1,
+                "units": "temp|F,speed|mph,english",
+                "recent": 4320,
+                "complete": 1,
+                "obtimezone": "local",
             },
             "resolution_source": first.resolution_source,
-            "value_path": "properties.temperature.value",
-            "timestamp_path": "properties.timestamp",
+            "value_path": "temp",
+            "timestamp_path": "timestamp",
             "value_unit": "C",
             "finality_mode": "first_following_date_point",
         }
@@ -385,7 +385,7 @@ def discover_rules(markets: Iterable[WeatherMarket]) -> dict[str, Any]:
                 first.resolution_source = source_url
             contract, reasons = _hko_template_reasons(first, group)
         else:
-            contract, reasons = _noaa_template_reasons(first, group)
+            contract, reasons = {}, ["resolution_source_unsupported"]
         auto_enable = not reasons
         if reasons:
             machine, machine_reasons = _machine_contract_reasons(first, group)

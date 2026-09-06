@@ -23,6 +23,7 @@ from weather_runtime.rules import (
     RuleError,
     apply_rounding,
     bucket_for_value,
+    bucket_impossible_while_open,
     buckets_from_outcomes,
     extract_event_group_id,
     load_rules,
@@ -33,9 +34,9 @@ from weather_runtime.rules import (
     validate_event_group_siblings,
 )
 from weather_runtime.scanner import WeatherScanner, WeatherScannerConfig
-from weather_runtime.service import RuntimeService
+from weather_runtime.service import RuntimeService, slim_board_groups
 from weather_runtime.sources import WeatherSourceAdapter
-from weather_runtime.storage import load_json
+from weather_runtime.storage import append_jsonl_dedup, load_json
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,69 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 26)
         self.assertTrue(observation.evidence_hash)
+
+    def test_source_intraday_running_extremum_during_open_window(self) -> None:
+        rule = load_rules(FIXTURES / "rules.json")[0]
+        observation = WeatherSourceAdapter().poll(
+            rule,
+            now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "intraday")
+        self.assertEqual(observation.value, 26)
+        self.assertEqual(observation.reason, "running_extremum")
+
+    def test_source_does_not_fetch_before_observation_start(self) -> None:
+        class CountingAdapter(WeatherSourceAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.payload_calls = 0
+
+            def _payload(self, rule):  # type: ignore[override]
+                self.payload_calls += 1
+                return super()._payload(rule)
+
+        rule = load_rules(FIXTURES / "rules.json")[0]
+        adapter = CountingAdapter()
+        before = adapter.poll(rule, now=datetime(2026, 9, 3, 12, tzinfo=timezone.utc))
+        self.assertEqual(before.status, "waiting_window")
+        self.assertEqual(before.reason, "observation_window_not_started")
+        self.assertEqual(adapter.payload_calls, 0)
+        during = adapter.poll(rule, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
+        self.assertEqual(during.status, "intraday")
+        self.assertEqual(adapter.payload_calls, 1)
+
+    def test_source_intraday_ignores_points_after_now(self) -> None:
+        raw = {
+            "market_id": "m-intraday-future",
+            "event_group_id": "e-intraday-future",
+            "source": {
+                "static": {
+                    "features": [
+                        {"value": 22, "timestamp": "2026-09-06T02:00:00Z"},
+                        {"value": 19, "timestamp": "2026-09-06T06:00:00Z"},
+                        {"value": 15, "timestamp": "2026-09-06T18:00:00Z"},
+                    ]
+                },
+                "url": "fixture://weather/intraday-future",
+                "resolution_source": "fixture://weather/intraday-future",
+                "value_path": "value",
+                "timestamp_path": "timestamp",
+            },
+            "timezone": "UTC",
+            "metric": "daily_min",
+            "observation_start": "2026-09-06T00:00:00Z",
+            "observation_end": "2026-09-06T23:59:59Z",
+            "buckets": [
+                {"outcome": "low", "upper": 20},
+                {"outcome": "high", "lower": 20, "lower_inclusive": False},
+            ],
+        }
+        observation = WeatherSourceAdapter().poll(
+            parse_rule(raw),
+            now=datetime(2026, 9, 6, 12, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "intraday")
+        self.assertEqual(observation.value, 19)
 
     def test_source_waits_for_following_point(self) -> None:
         raw = {
@@ -154,6 +218,8 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(result["summary"]["bucket_match_rate"], 1.0)
         self.assertEqual(result["summary"]["opportunities"], 1)
         self.assertEqual(sum(1 for row in result["rows"] if row.get("book")), 11)
+        self.assertTrue(all("raw" not in (row.get("market") or {}) for row in result["rows"]))
+        self.assertTrue(all("raw" not in (row.get("observation") or {}) for row in result["rows"]))
         candidate = next(row for row in result["rows"] if row["status"] == "opportunity")
         self.assertEqual(candidate["matched_outcome"], "26")
         self.assertEqual(candidate["trade_side"], "YES")
@@ -303,11 +369,321 @@ class WeatherRuntimeTests(unittest.TestCase):
             markets,
             rules,
             fetch_books=False,
-            now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc),
+            now=datetime(2026, 9, 3, 12, tzinfo=timezone.utc),
         )
         self.assertTrue(result["rows"])
         self.assertTrue(all(row.get("status") == "waiting" for row in result["rows"]))
         self.assertTrue(all(not (row.get("book") or {}).get("book_missing") for row in result["rows"]))
+        self.assertTrue(
+            all(
+                (row.get("observation") or {}).get("status") == "waiting_window"
+                for row in result["rows"]
+            )
+        )
+
+    def _event_with_static(
+        self,
+        *,
+        event_id: str,
+        metric: str,
+        outcomes: list,
+        buckets: list,
+        features: list,
+        extra_source: Optional[dict] = None,
+        start: str = "2026-09-06T00:00:00Z",
+        end: str = "2026-09-06T23:59:59Z",
+    ):
+        source_url = "fixture://weather/{}".format(event_id)
+        source = {
+            "static": {"features": features},
+            "url": source_url,
+            "resolution_source": source_url,
+            "value_path": "value",
+            "timestamp_path": "timestamp",
+        }
+        if extra_source:
+            source.update(extra_source)
+        markets_raw = []
+        rules_raw = []
+        for index, outcome in enumerate(outcomes):
+            market_id = "{}-{}".format(event_id, index)
+            markets_raw.append(
+                {
+                    "id": market_id,
+                    "event_group_id": event_id,
+                    "question": outcome,
+                    "slug": event_id,
+                    "category": "weather",
+                    "outcome": outcome,
+                    "outcomes": ["Yes", "No"],
+                    "clobTokenIds": [
+                        "{}-yes".format(market_id),
+                        "{}-no".format(market_id),
+                    ],
+                    "resolutionSource": source_url,
+                    "endDate": "2026-09-07T00:00:00Z",
+                    "active": True,
+                    "closed": False,
+                    "acceptingOrders": True,
+                    "enableOrderBook": True,
+                    "negRisk": False,
+                    "orderPriceMinTickSize": 0.001,
+                    "orderMinSize": 1,
+                    "feeSchedule": {"rate": 0.05},
+                }
+            )
+            rules_raw.append(
+                {
+                    "market_id": market_id,
+                    "event_group_id": event_id,
+                    "source": source,
+                    "timezone": "UTC",
+                    "metric": metric,
+                    "observation_start": start,
+                    "observation_end": end,
+                    "unit": "C",
+                    "buckets": buckets,
+                    "target_outcome": outcome,
+                    "manual_approval": True,
+                }
+            )
+        return weather_markets(markets_raw), [parse_rule(row) for row in rules_raw]
+
+    def _priced_books(self, markets, now: datetime, cheap_no_outcomes: set) -> dict:
+        stamp = now.isoformat()
+        books: dict = {}
+        cheap = {str(item) for item in cheap_no_outcomes}
+        for market in markets:
+            no_token = market.no_token_id or (
+                market.token_ids[1] if len(market.token_ids) > 1 else ""
+            )
+            yes_token = market.yes_token_id or (
+                market.token_ids[0] if market.token_ids else ""
+            )
+            no_price = 0.990 if str(market.outcome) in cheap else 0.999
+            if no_token:
+                books[no_token] = {
+                    "token_id": no_token,
+                    "asks": [{"price": no_price, "size": 20}],
+                    "tick_size": 0.001,
+                    "min_order_size": 1,
+                    "fetched_at": stamp,
+                }
+            if yes_token:
+                books[yes_token] = {
+                    "token_id": yes_token,
+                    "asks": [{"price": 0.999, "size": 20}],
+                    "tick_size": 0.001,
+                    "min_order_size": 1,
+                    "fetched_at": stamp,
+                }
+        return books
+
+    def test_intraday_min_impossible_no_is_candidate(self) -> None:
+        buckets = [
+            {"outcome": "18 or below", "upper": 18, "upper_inclusive": True},
+            {
+                "outcome": "19",
+                "lower": 18,
+                "lower_inclusive": False,
+                "upper": 19,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "20",
+                "lower": 19,
+                "lower_inclusive": False,
+                "upper": 20,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "21",
+                "lower": 20,
+                "lower_inclusive": False,
+                "upper": 21,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "22",
+                "lower": 21,
+                "lower_inclusive": False,
+                "upper": 22,
+                "upper_inclusive": True,
+            },
+            {"outcome": "23", "lower": 22, "lower_inclusive": False, "upper": 23, "upper_inclusive": True},
+            {"outcome": "24 or higher", "lower": 23, "lower_inclusive": False},
+        ]
+        parsed = validate_buckets(parse_bucket(item) for item in buckets)
+        self.assertTrue(bucket_impossible_while_open("daily_min", 19, parsed[5]))
+        self.assertFalse(bucket_impossible_while_open("daily_min", 19, parsed[0]))
+        self.assertFalse(bucket_impossible_while_open("daily_min", 19, parsed[1]))
+        markets, rules = self._event_with_static(
+            event_id="intraday-min-19",
+            metric="daily_min",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[
+                {"value": 22, "timestamp": "2026-09-06T02:00:00Z"},
+                {"value": 19, "timestamp": "2026-09-06T06:00:00Z"},
+                {"value": 24, "timestamp": "2026-09-06T10:00:00Z"},
+            ],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets,
+            rules,
+            books=self._priced_books(markets, now, {"23"}),
+            fetch_books=False,
+            now=now,
+        )
+        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        self.assertEqual(by_outcome["23"]["status"], "opportunity")
+        self.assertEqual(by_outcome["23"]["trade_side"], "NO")
+        self.assertEqual(by_outcome["23"]["reason"], "intraday_impossible_no")
+        self.assertTrue(by_outcome["23"].get("dry_run"))
+        self.assertEqual(by_outcome["18 or below"]["status"], "waiting")
+        self.assertEqual(by_outcome["19"]["status"], "waiting")
+        self.assertNotEqual(by_outcome["19"].get("trade_side"), "YES")
+        self.assertFalse(
+            any(
+                row.get("trade_side") == "YES" and row.get("target_outcome") == "19"
+                for row in result["rows"]
+            )
+        )
+        self.assertEqual((by_outcome["19"].get("observation") or {}).get("status"), "intraday")
+        self.assertEqual((by_outcome["19"].get("observation") or {}).get("value"), 19)
+
+    def test_intraday_max_impossible_no_is_candidate(self) -> None:
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "31",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 31,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "32",
+                "lower": 31,
+                "lower_inclusive": False,
+                "upper": 32,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "33",
+                "lower": 32,
+                "lower_inclusive": False,
+                "upper": 33,
+                "upper_inclusive": True,
+            },
+            {"outcome": "34", "lower": 33, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-max-33",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[
+                {"value": 28, "timestamp": "2026-09-06T02:00:00Z"},
+                {"value": 33, "timestamp": "2026-09-06T08:00:00Z"},
+                {"value": 31, "timestamp": "2026-09-06T10:00:00Z"},
+            ],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets,
+            rules,
+            books=self._priced_books(markets, now, {"30"}),
+            fetch_books=False,
+            now=now,
+        )
+        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        self.assertEqual(by_outcome["30"]["status"], "opportunity")
+        self.assertEqual(by_outcome["30"]["trade_side"], "NO")
+        self.assertEqual(by_outcome["30"]["reason"], "intraday_impossible_no")
+        self.assertEqual(by_outcome["33"]["status"], "waiting")
+        self.assertEqual(by_outcome["34"]["status"], "waiting")
+        self.assertFalse(any(row.get("trade_side") == "YES" for row in result["rows"]))
+
+    def test_intraday_before_local_midnight_does_not_fetch(self) -> None:
+        class CountingAdapter(WeatherSourceAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.payload_calls = 0
+
+            def _payload(self, rule):  # type: ignore[override]
+                self.payload_calls += 1
+                return super()._payload(rule)
+
+        buckets = [
+            {"outcome": "18 or below", "upper": 18, "upper_inclusive": True},
+            {
+                "outcome": "19",
+                "lower": 18,
+                "lower_inclusive": False,
+                "upper": 19,
+                "upper_inclusive": True,
+            },
+            {"outcome": "20 or higher", "lower": 19, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-before-start",
+            metric="daily_min",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[{"value": 19, "timestamp": "2026-09-06T06:00:00Z"}],
+        )
+        adapter = CountingAdapter()
+        result = WeatherScanner(
+            config=WeatherScannerConfig(), source_adapter=adapter
+        ).scan(
+            markets,
+            rules,
+            fetch_books=False,
+            now=datetime(2026, 9, 5, 23, tzinfo=timezone.utc),
+        )
+        self.assertEqual(adapter.payload_calls, 0)
+        self.assertTrue(all(row.get("status") == "waiting" for row in result["rows"]))
+        self.assertTrue(all(not (row.get("book") or {}).get("book_missing") for row in result["rows"]))
+
+    def test_provisional_loser_no_waits_on_winner_yes(self) -> None:
+        buckets = [
+            {"outcome": "18 or below", "upper": 18, "upper_inclusive": True},
+            {
+                "outcome": "19",
+                "lower": 18,
+                "lower_inclusive": False,
+                "upper": 19,
+                "upper_inclusive": True,
+            },
+            {"outcome": "23", "lower": 19, "lower_inclusive": False, "upper": 23, "upper_inclusive": True},
+            {"outcome": "24 or higher", "lower": 23, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="provisional-min-19",
+            metric="daily_min",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[{"value": 19, "timestamp": "2026-09-06T06:00:00Z"}],
+            extra_source={"finality_mode": "first_following_date_point"},
+        )
+        now = datetime(2026, 9, 7, 1, tzinfo=timezone.utc)
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets,
+            rules,
+            books=self._priced_books(markets, now, {"18 or below", "23", "24 or higher"}),
+            fetch_books=False,
+            now=now,
+        )
+        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        self.assertEqual((by_outcome["19"].get("observation") or {}).get("status"), "provisional")
+        self.assertEqual(by_outcome["19"]["status"], "waiting")
+        self.assertNotEqual(by_outcome["19"].get("trade_side"), "YES")
+        self.assertEqual(by_outcome["23"]["status"], "opportunity")
+        self.assertEqual(by_outcome["23"]["trade_side"], "NO")
+        self.assertEqual(by_outcome["23"]["reason"], "provisional_loser_no")
+        self.assertEqual(by_outcome["18 or below"]["status"], "opportunity")
 
     def test_category_fee_is_fail_closed(self) -> None:
         raw_markets = load_market_rows(str(FIXTURES / "markets.json"))
@@ -366,6 +742,31 @@ class WeatherRuntimeTests(unittest.TestCase):
             service.unsubscribe(ident)
             latest = json.loads((Path(temp) / "data" / "latest.json").read_text())
             self.assertEqual(latest["summary"]["bucket_match_rate"], 1.0)
+            self.assertNotIn("source_evidence", latest)
+            published = service.board_snapshot()
+            self.assertIn("event_groups", published)
+            self.assertNotIn("rows", published)
+            board = slim_board_groups(result["event_groups"])
+            for group in board:
+                for row in group.get("rows") or []:
+                    self.assertNotIn("raw", row.get("observation") or {})
+
+    def test_jsonl_dedup_keeps_first_key_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "scan.jsonl"
+            append_jsonl_dedup(
+                path,
+                [{"id": "a", "n": 1}, {"id": "a", "n": 2}, {"id": "b", "n": 3}],
+                key_fn=lambda row: str(row["id"]),
+            )
+            append_jsonl_dedup(
+                path,
+                [{"id": "a", "n": 4}, {"id": "c", "n": 5}],
+                key_fn=lambda row: str(row["id"]),
+            )
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual([row["id"] for row in rows], ["a", "b", "c"])
+            self.assertEqual(rows[0]["n"], 1)
 
 
     def test_whole_degree_rounding_maps_26_4_to_26(self) -> None:
@@ -856,6 +1257,22 @@ class WeatherRuntimeTests(unittest.TestCase):
         rule = parse_rule(result["generated_rules"][0])
         self.assertEqual(rule.timezone, "Asia/Seoul")
         self.assertEqual(rule.source["station_id"], "RKSI")
+        self.assertEqual(rule.source["provider"], "NOAA")
+        self.assertEqual(rule.source["url"], "https://api.synopticdata.com/v2/stations/timeseries")
+        self.assertNotIn("api.weather.gov", rule.source["url"])
+        self.assertEqual(
+            rule.source["resolution_source"],
+            "https://www.weather.gov/wrh/timeseries?site=rksi",
+        )
+        self.assertEqual(rule.source["value_path"], "temp")
+        self.assertEqual(rule.source["timestamp_path"], "timestamp")
+        self.assertEqual(rule.source["params"]["STID"], "RKSI")
+        self.assertEqual(rule.source["params"]["recent"], 4320)
+        self.assertNotIn("start", rule.source.get("params") or {})
+        self.assertNotIn("end", rule.source.get("params") or {})
+        self.assertEqual(rule.source["params"]["obtimezone"], "local")
+        self.assertEqual(rule.source["params"]["units"], "temp|F,speed|mph,english")
+        self.assertNotIn("token", rule.source.get("params") or {})
         self.assertTrue(rule.enabled)
         self.assertTrue(rule.manual_approval)
         self.assertEqual(rule.observation_start, "2026-09-06T00:00:00")
@@ -934,7 +1351,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         result = discover_rules(markets)
         self.assertEqual(result["summary"]["generated_rules"], 0)
         self.assertTrue(result["review"])
-        self.assertEqual(result["review"][0]["reasons"][0], "nws_timeseries_station_missing")
+        self.assertEqual(result["review"][0]["reasons"][0], "resolution_source_unsupported")
 
     def test_wunderground_observations_finalize_daily_min(self) -> None:
         markets = self._temp_markets(
@@ -987,6 +1404,214 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 14)
         self.assertEqual(observation.station_id, "ZSJN")
+
+    def test_synoptic_observations_finalize_daily_max(self) -> None:
+        markets = self._temp_markets(
+            slug="highest-temperature-in-seoul-on-september-6-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=rksi",
+            titles=[
+                "23°C or below",
+                "24°C",
+                "25°C",
+                "26°C",
+                "27°C",
+                "28°C",
+                "29°C",
+                "30°C",
+                "31°C",
+                "32°C",
+                "33°C or higher",
+            ],
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        from weather_runtime.rules import with_source_contract
+
+        rule = with_source_contract(
+            rule,
+            source={
+                **rule.source,
+                "static": {
+                    "STATION": [
+                        {
+                            "STID": "RKSI",
+                            "OBSERVATIONS": {
+                                "date_time": [
+                                    "2026-09-06T03:00:00Z",
+                                    "2026-09-06T06:00:00Z",
+                                    "2026-09-06T12:00:00Z",
+                                    "2026-09-06T15:30:00Z",
+                                ],
+                                "air_temp_set_1": [28.0, 32.2, 24.0, 22.0],
+                            },
+                        }
+                    ]
+                },
+            },
+        )
+        observation = WeatherSourceAdapter().poll(
+            rule,
+            now=datetime(2026, 9, 6, 16, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "final")
+        self.assertEqual(observation.value, 32)
+        self.assertEqual(observation.station_id, "RKSI")
+        self.assertEqual(observation.reason, "final_confirmation")
+
+    def test_synoptic_empty_station_is_unavailable(self) -> None:
+        markets = self._temp_markets(
+            slug="highest-temperature-in-seoul-on-september-6-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=rksi",
+            titles=[
+                "23°C or below",
+                "24°C",
+                "25°C",
+                "26°C",
+                "27°C",
+                "28°C",
+                "29°C",
+                "30°C",
+                "31°C",
+                "32°C",
+                "33°C or higher",
+            ],
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        from weather_runtime.rules import with_source_contract
+
+        rule = with_source_contract(
+            rule,
+            source={
+                **rule.source,
+                "static": {"STATION": []},
+            },
+        )
+        observation = WeatherSourceAdapter().poll(
+            rule,
+            now=datetime(2026, 9, 6, 16, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "unavailable")
+        self.assertEqual(observation.reason, "no_observations_in_window")
+
+    def test_synoptic_fahrenheit_payload_converts_to_celsius(self) -> None:
+        markets = self._temp_markets(
+            slug="highest-temperature-in-seoul-on-september-6-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=rksi",
+            titles=[
+                "23°C or below",
+                "24°C",
+                "25°C",
+                "26°C",
+                "27°C",
+                "28°C",
+                "29°C",
+                "30°C",
+                "31°C",
+                "32°C",
+                "33°C or higher",
+            ],
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        from weather_runtime.rules import with_source_contract
+
+        rule = with_source_contract(
+            rule,
+            source={
+                **rule.source,
+                "static": {
+                    "UNITS": {"air_temp": "Fahrenheit"},
+                    "STATION": [
+                        {
+                            "STID": "RKSI",
+                            "UNITS": {"air_temp": "Fahrenheit"},
+                            "OBSERVATIONS": {
+                                "date_time": [
+                                    "2026-09-06T03:00:00Z",
+                                    "2026-09-06T06:00:00Z",
+                                    "2026-09-06T12:00:00Z",
+                                    "2026-09-06T15:30:00Z",
+                                ],
+                                "air_temp_set_1": [82.4, 89.6, 75.2, 71.6],
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+        observation = WeatherSourceAdapter().poll(
+            rule,
+            now=datetime(2026, 9, 6, 16, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "final")
+        self.assertEqual(observation.value, 32)
+
+    def test_synoptic_request_matches_timeseries_page(self) -> None:
+        markets = self._temp_markets(
+            slug="lowest-temperature-in-zhengzhou-on-september-6-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=zhcc",
+            titles=[
+                "12°C or below",
+                "13°C",
+                "14°C",
+                "15°C",
+                "16°C",
+                "17°C",
+                "18°C",
+                "19°C",
+                "20°C",
+                "21°C",
+                "22°C or higher",
+            ],
+            metric_word="lowest",
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+
+        class Recorder:
+            def __init__(self) -> None:
+                self.params = None
+                self.headers = None
+
+            def get_json(self, url, params=None, headers=None):
+                self.params = params
+                self.headers = headers
+                return {
+                    "UNITS": {"air_temp": "Fahrenheit"},
+                    "STATION": [
+                        {
+                            "STID": "ZHCC",
+                            "UNITS": {"air_temp": "Fahrenheit"},
+                            "OBSERVATIONS": {
+                                "date_time": [
+                                    "2026-09-06T12:00:00",
+                                    "2026-09-07T00:30:00",
+                                ],
+                                "air_temp_set_1": [68.0, 64.4],
+                            },
+                        }
+                    ],
+                }
+
+            def get_text(self, url, headers=None):
+                return "var mesoToken='test-token';"
+
+        http = Recorder()
+        observation = WeatherSourceAdapter(http=http, http_cache_ttl_s=0).poll(
+            rule,
+            now=datetime(2026, 9, 6, 16, 5, tzinfo=timezone.utc),
+        )
+        self.assertEqual(http.params["units"], "temp|F,speed|mph,english")
+        self.assertEqual(http.params["recent"], 4320)
+        self.assertNotIn("start", http.params or {})
+        self.assertNotIn("end", http.params or {})
+        self.assertEqual(http.params["token"], "test-token")
+        self.assertEqual(http.headers["Origin"], "https://www.weather.gov")
+        self.assertEqual(
+            http.headers["Referer"],
+            "https://www.weather.gov/wrh/timeseries?site=zhcc",
+        )
+        self.assertIn("Mozilla/5.0", http.headers["User-Agent"])
+        self.assertEqual(observation.status, "final")
+        self.assertEqual(observation.value, 20)
+        self.assertEqual(observation.station_id, "ZHCC")
 
     def test_expired_window_skips_source_fetch(self) -> None:
         rule = load_rules(FIXTURES / "rules.json")[0]
@@ -1047,6 +1672,14 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(rule.timezone, zone)
             self.assertEqual(rule.source["station_id"], site)
             self.assertEqual(rule.source["provider"], "NOAA")
+            self.assertEqual(rule.source["url"], "https://api.synopticdata.com/v2/stations/timeseries")
+            self.assertNotIn("api.weather.gov", rule.source["url"])
+            self.assertIn(
+                "wrh/timeseries?site={}".format(site.lower()),
+                str(rule.source.get("resolution_source") or "").lower(),
+            )
+            self.assertEqual(rule.source["value_path"], "temp")
+            self.assertNotIn("token", rule.source.get("params") or {})
             self.assertTrue(rule.enabled)
 
     def test_discover_hko_daily_extract_enables_dry_run_rules(self) -> None:

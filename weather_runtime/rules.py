@@ -278,6 +278,22 @@ def validate_buckets(buckets: Iterable[Bucket]) -> list[Bucket]:
     return ordered
 
 
+def bucket_lower_ok(number: float, bucket: Bucket) -> bool:
+    return (
+        bucket.lower is None
+        or number > bucket.lower
+        or (bucket.lower_inclusive and number == bucket.lower)
+    )
+
+
+def bucket_upper_ok(number: float, bucket: Bucket) -> bool:
+    return (
+        bucket.upper is None
+        or number < bucket.upper
+        or (bucket.upper_inclusive and number == bucket.upper)
+    )
+
+
 def bucket_for_value(
     value: Any,
     buckets: Iterable[Bucket],
@@ -288,19 +304,37 @@ def bucket_for_value(
     if number is None:
         return None
     for bucket in buckets:
-        lower_ok = (
-            bucket.lower is None
-            or number > bucket.lower
-            or (bucket.lower_inclusive and number == bucket.lower)
-        )
-        upper_ok = (
-            bucket.upper is None
-            or number < bucket.upper
-            or (bucket.upper_inclusive and number == bucket.upper)
-        )
-        if lower_ok and upper_ok:
+        if bucket_lower_ok(number, bucket) and bucket_upper_ok(number, bucket):
             return bucket
     return None
+
+
+def bucket_for_outcome(outcome: Any, buckets: Iterable[Bucket]) -> Optional[Bucket]:
+    key = norm_outcome(outcome)
+    for bucket in buckets:
+        if norm_outcome(bucket.outcome) == key:
+            return bucket
+    return None
+
+
+def bucket_impossible_while_open(
+    metric: str,
+    running: Any,
+    bucket: Bucket,
+    *,
+    rounding: str = ROUNDING_WHOLE,
+) -> bool:
+    """True when a running min/max can no longer land in ``bucket``."""
+    number = apply_rounding(running, rounding)
+    if number is None:
+        return False
+    if metric == "daily_min":
+        # Once the rounded running min is R, any bucket entirely above R
+        # cannot be the daily minimum (lowest can only stay or fall).
+        return not bucket_lower_ok(number, bucket)
+    if metric == "daily_max":
+        return not bucket_upper_ok(number, bucket)
+    return False
 
 
 def normalize_market(row: dict[str, Any]) -> WeatherMarket:

@@ -1,9 +1,10 @@
-"""NWS/Wunderground-compatible read-only weather source adapters."""
+"""NOAA Time Series (Synoptic), Wunderground, and HKO read-only weather adapters."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,15 @@ class SourceError(RuntimeError):
 
 # Weather Underground's public web client key. Override with WEATHER_COM_API_KEY.
 _WU_WEB_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
+_SYNOPTIC_TOKEN_JS = "https://www.weather.gov/source/wrh/apiKey.js"
+_SYNOPTIC_TOKEN_RE = re.compile(r"mesoToken\s*=\s*['\"]([^'\"]+)['\"]")
+_SYNOPTIC_TOKEN_TTL_S = 3600.0
+_SYNOPTIC_PAGE_UNITS = "temp|F,speed|mph,english"
+_SYNOPTIC_PAGE_RECENT_MINUTES = 72 * 60
+_SYNOPTIC_PAGE_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 def json_path(value: Any, path: str) -> Any:
@@ -113,6 +123,37 @@ class JsonHttp:
         except ValueError as exc:
             raise SourceError("invalid JSON from {}".format(url)) from exc
 
+    def get_text(
+        self,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+    ) -> str:
+        request_headers = {
+            "User-Agent": "polymarket-weather-arb/0.1 (+read-only-dry-run)",
+            "Accept": "text/plain, text/javascript, application/javascript, */*",
+        }
+        if headers:
+            request_headers.update(headers)
+        request = urllib.request.Request(url, headers=request_headers, method="GET")
+        for attempt in range(self.retries + 1):
+            try:
+                with self._opener().open(request, timeout=self.timeout) as response:
+                    return response.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                retryable = exc.code == 429 or 500 <= exc.code <= 599
+                if retryable and attempt < self.retries:
+                    time.sleep(self.backoff_s * (2 ** attempt))
+                    continue
+                raise SourceError("HTTP {} from {}: {}".format(exc.code, url, detail)) from exc
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                if attempt < self.retries:
+                    time.sleep(self.backoff_s * (2 ** attempt))
+                    continue
+                raise SourceError("network error from {}: {}".format(url, exc)) from exc
+        raise SourceError("network error from {}".format(url))
+
     def post_json(
         self,
         url: str,
@@ -183,6 +224,21 @@ def _convert(value: float, from_unit: str, to_unit: str) -> float:
     return value
 
 
+def _synoptic_air_temp_unit(payload: Any, station: dict[str, Any]) -> str:
+    for blob in (station, payload if isinstance(payload, dict) else {}):
+        if not isinstance(blob, dict):
+            continue
+        units = blob.get("UNITS") or blob.get("units")
+        if not isinstance(units, dict):
+            continue
+        raw = str(units.get("air_temp") or units.get("air_temp_set_1") or "").strip().lower()
+        if "celsius" in raw or raw in {"c", "degc", "deg_c"}:
+            return "C"
+        if "fahrenheit" in raw or raw in {"f", "degf", "deg_f"}:
+            return "F"
+    return ""
+
+
 class WeatherSourceAdapter:
     """Poll one approved rule and return immutable source evidence."""
 
@@ -190,6 +246,7 @@ class WeatherSourceAdapter:
         self.http = http or JsonHttp()
         self.http_cache_ttl_s = max(0.0, float(http_cache_ttl_s))
         self._http_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._synoptic_token_cache: Optional[tuple[float, str]] = None
 
     def _zone(self, rule: WeatherRule):
         return load_timezone(rule.timezone)
@@ -212,10 +269,22 @@ class WeatherSourceAdapter:
                 "apiKey",
                 os.environ.get("WEATHER_COM_API_KEY") or os.environ.get("WU_API_KEY") or _WU_WEB_API_KEY,
             )
+        if "synopticdata.com" in url:
+            params.setdefault("token", self._synoptic_token())
+            params["STID"] = params.get("STID") or source.get("station_id")
+            params["showemptystations"] = 1
+            params["units"] = _SYNOPTIC_PAGE_UNITS
+            params["recent"] = _SYNOPTIC_PAGE_RECENT_MINUTES
+            params["complete"] = 1
+            params["obtimezone"] = "local"
+            params.pop("start", None)
+            params.pop("end", None)
         headers = dict(source.get("headers") or {}) if isinstance(source.get("headers"), dict) else {}
         if str(source.get("provider") or "").lower() == "wunderground" or "api.weather.com" in url:
             headers.setdefault("Accept", "application/json")
             headers.setdefault("Referer", "https://www.wunderground.com/")
+        if "synopticdata.com" in url:
+            headers.update(self._synoptic_headers(source, params))
         headers = headers or None
         cache_key = (url, json.dumps(params or {}, sort_keys=True, default=str))
         if self.http_cache_ttl_s:
@@ -230,6 +299,7 @@ class WeatherSourceAdapter:
 
     def poll(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> ObservationEvidence:
         current = now or datetime.now(timezone.utc)
+        start = self._parse(rule, rule.observation_start)
         end = self._parse(rule, rule.observation_end)
         if end is None:
             return ObservationEvidence(
@@ -237,7 +307,8 @@ class WeatherSourceAdapter:
                 observed_at=now_iso(current),
                 reason="invalid_observation_end",
             )
-        if current.astimezone(timezone.utc) < end:
+        current_utc = current.astimezone(timezone.utc)
+        if start is not None and current_utc < start:
             return ObservationEvidence(
                 status="waiting_window",
                 observed_at=now_iso(current),
@@ -245,19 +316,21 @@ class WeatherSourceAdapter:
                 station_id=str(rule.source.get("station_id") or ""),
                 unit=rule.unit,
                 aggregation=rule.metric,
-                reason="observation_window_open",
+                reason="observation_window_not_started",
             )
-        grace_hours = float(rule.source.get("poll_after_end_hours") or 48)
-        if current.astimezone(timezone.utc) > end + timedelta(hours=max(0.0, grace_hours)):
-            return ObservationEvidence(
-                status="expired",
-                observed_at=now_iso(current),
-                provider=str(rule.source.get("provider") or ""),
-                station_id=str(rule.source.get("station_id") or ""),
-                unit=rule.unit,
-                aggregation=rule.metric,
-                reason="observation_window_expired",
-            )
+        window_open = current_utc < end
+        if not window_open:
+            grace_hours = float(rule.source.get("poll_after_end_hours") or 48)
+            if current_utc > end + timedelta(hours=max(0.0, grace_hours)):
+                return ObservationEvidence(
+                    status="expired",
+                    observed_at=now_iso(current),
+                    provider=str(rule.source.get("provider") or ""),
+                    station_id=str(rule.source.get("station_id") or ""),
+                    unit=rule.unit,
+                    aggregation=rule.metric,
+                    reason="observation_window_expired",
+                )
         try:
             payload, url = self._payload(rule)
         except SourceError as exc:
@@ -273,7 +346,9 @@ class WeatherSourceAdapter:
             )
         evidence_hash = sha256_json(payload)
         try:
-            return self._evaluate(rule, payload, url, current, evidence_hash)
+            return self._evaluate(
+                rule, payload, url, current, evidence_hash, window_open=window_open
+            )
         except Exception as exc:  # noqa: BLE001
             return ObservationEvidence(
                 status="error",
@@ -288,13 +363,90 @@ class WeatherSourceAdapter:
                 evidence_hash=evidence_hash,
             )
 
+    def _synoptic_token(self) -> str:
+        env = (
+            os.environ.get("SYNOPTIC_API_TOKEN")
+            or os.environ.get("MESOWEST_TOKEN")
+            or ""
+        ).strip()
+        if env:
+            return env
+        now = time.time()
+        cached = self._synoptic_token_cache
+        if cached and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S and cached[1]:
+            return cached[1]
+        raw = self.http.get_text(_SYNOPTIC_TOKEN_JS)
+        match = _SYNOPTIC_TOKEN_RE.search(raw)
+        token = (match.group(1) if match else "").strip()
+        if not token:
+            raise SourceError("synoptic token missing")
+        self._synoptic_token_cache = (now, token)
+        return token
+
+    def _synoptic_headers(self, source: dict[str, Any], params: dict[str, Any]) -> dict[str, str]:
+        page = str(source.get("resolution_source") or "").strip()
+        if "timeseries" not in page.lower():
+            station = str(params.get("STID") or source.get("station_id") or "").strip().lower()
+            page = "https://www.weather.gov/wrh/timeseries?site={}".format(station)
+        return {
+            "User-Agent": _SYNOPTIC_PAGE_UA,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Origin": "https://www.weather.gov",
+            "Referer": page,
+        }
+
     def _normalize_payload(self, rule: WeatherRule, payload: Any) -> Any:
         source = rule.source
         provider = str(source.get("provider") or "").lower()
         url = str(source.get("url") or source.get("resolution_source") or "")
         if provider == "hko" or "data.weather.gov.hk" in url or "weather.gov.hk" in url:
             return self._hko_observations(payload)
+        if provider == "noaa" or "synopticdata.com" in url:
+            return self._synoptic_observations(payload)
         return payload
+
+    def _synoptic_observations(self, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        stations = payload.get("STATION")
+        if stations is None:
+            stations = payload.get("station")
+        if not isinstance(stations, list):
+            return payload
+        observations: list[dict[str, Any]] = []
+        for station in stations:
+            if not isinstance(station, dict):
+                continue
+            obs = station.get("OBSERVATIONS") or station.get("observations") or {}
+            if not isinstance(obs, dict):
+                continue
+            times = obs.get("date_time")
+            if not isinstance(times, list):
+                times = obs.get("date_time_set_1")
+            temps = None
+            for key in ("air_temp_set_1", "air_temp_set_1d"):
+                value = obs.get(key)
+                if isinstance(value, list):
+                    temps = value
+                    break
+            if temps is None:
+                for key, value in obs.items():
+                    if str(key).lower().startswith("air_temp") and isinstance(value, list):
+                        temps = value
+                        break
+            if not isinstance(times, list) or not isinstance(temps, list):
+                continue
+            source_unit = _synoptic_air_temp_unit(payload, station)
+            for timestamp_raw, temp_raw in zip(times, temps):
+                if timestamp_raw in {None, ""}:
+                    continue
+                number = _number(temp_raw)
+                if number is None:
+                    continue
+                if source_unit == "F":
+                    number = _convert(number, "F", "C")
+                observations.append({"timestamp": timestamp_raw, "temp": number})
+        return {"observations": observations}
 
     def _hko_observations(self, payload: Any) -> Any:
         if not isinstance(payload, dict):
@@ -413,11 +565,16 @@ class WeatherSourceAdapter:
         url: str,
         current: datetime,
         evidence_hash: str,
+        *,
+        window_open: bool = False,
     ) -> ObservationEvidence:
         values = self._iter_values(rule, payload)
+        if window_open:
+            current_utc = current.astimezone(timezone.utc)
+            values = [item for item in values if item[0] <= current_utc]
         if not values:
             return ObservationEvidence(
-                status="unavailable",
+                status="waiting_window" if window_open else "unavailable",
                 observed_at=now_iso(current),
                 source_url=url,
                 provider=str(rule.source.get("provider") or ""),
@@ -466,6 +623,22 @@ class WeatherSourceAdapter:
             rule.source.get("requires_following_date_point")
             or rule.source.get("finality_mode") == "first_following_date_point"
         )
+        if window_open:
+            return ObservationEvidence(
+                status="intraday",
+                value=float(value),
+                raw_aggregate=raw_aggregate,
+                source_timestamp=latest_timestamp.isoformat(),
+                observed_at=now_iso(current),
+                source_url=url,
+                provider=str(rule.source.get("provider") or ""),
+                station_id=str(rule.source.get("station_id") or ""),
+                unit=rule.unit,
+                aggregation=rule.metric,
+                reason="running_extremum",
+                raw=payload,
+                evidence_hash=evidence_hash,
+            )
         is_final = explicit_final or (requires_following and bool(following))
         confirmation = ""
         if following:
