@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -56,8 +57,8 @@ class JsonHttp:
         self,
         *,
         proxy: Optional[str] = None,
-        timeout: float = 15.0,
-        retries: int = 2,
+        timeout: float = 8.0,
+        retries: int = 1,
         backoff_s: float = 0.25,
     ):
         raw_proxy = proxy
@@ -81,6 +82,31 @@ class JsonHttp:
             )
         return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+    def _deadline(self, fn, *, label: str) -> Any:
+        box: list[Any] = []
+        err: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                box.append(fn())
+            except BaseException as exc:  # noqa: BLE001
+                err.append(exc)
+
+        worker_thread = threading.Thread(target=worker, daemon=True)
+        worker_thread.start()
+        worker_thread.join(self.timeout)
+        if worker_thread.is_alive():
+            raise SourceError("timed out after {}s from {}".format(self.timeout, label))
+        if err:
+            raise err[0]
+        if not box:
+            raise SourceError("empty response from {}".format(label))
+        return box[0]
+
+    def _read(self, request: urllib.request.Request) -> str:
+        with self._opener().open(request, timeout=self.timeout) as response:
+            return response.read().decode("utf-8")
+
     def get_json(
         self,
         url: str,
@@ -103,8 +129,7 @@ class JsonHttp:
         request = urllib.request.Request(url, headers=request_headers, method="GET")
         for attempt in range(self.retries + 1):
             try:
-                with self._opener().open(request, timeout=self.timeout) as response:
-                    raw = response.read().decode("utf-8")
+                raw = self._deadline(lambda: self._read(request), label=url)
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -138,8 +163,7 @@ class JsonHttp:
         request = urllib.request.Request(url, headers=request_headers, method="GET")
         for attempt in range(self.retries + 1):
             try:
-                with self._opener().open(request, timeout=self.timeout) as response:
-                    return response.read().decode("utf-8")
+                return self._deadline(lambda: self._read(request), label=url)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
                 retryable = exc.code == 429 or 500 <= exc.code <= 599
@@ -176,8 +200,7 @@ class JsonHttp:
         )
         for attempt in range(self.retries + 1):
             try:
-                with self._opener().open(request, timeout=self.timeout) as response:
-                    raw = response.read().decode("utf-8")
+                raw = self._deadline(lambda: self._read(request), label=url)
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -204,6 +227,42 @@ def _number(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def series_from_raw(payload: Any) -> list[dict[str, Any]]:
+    """Compact hour points for the board; accepts Synoptic or NWS GeoJSON blobs."""
+
+    if not isinstance(payload, dict):
+        return []
+    points: list[dict[str, Any]] = []
+    rows = payload.get("observations")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            timestamp = row.get("timestamp") or row.get("date_time") or row.get("validTime")
+            temp = row.get("temp")
+            if temp is None:
+                temp = row.get("value")
+            props = row.get("properties") if isinstance(row.get("properties"), dict) else {}
+            if timestamp is None:
+                timestamp = props.get("timestamp")
+            if temp is None:
+                temperature = props.get("temperature")
+                if isinstance(temperature, dict):
+                    temp = temperature.get("value")
+                else:
+                    temp = temperature
+            number = _number(temp)
+            if timestamp in {None, ""} or number is None:
+                continue
+            points.append({"timestamp": str(timestamp), "temp": number})
+        if points:
+            return points
+    features = payload.get("features")
+    if isinstance(features, list):
+        return series_from_raw({"observations": features})
+    return points
 
 
 def _boolean(value: Any) -> bool:
@@ -246,7 +305,10 @@ class WeatherSourceAdapter:
         self.http = http or JsonHttp()
         self.http_cache_ttl_s = max(0.0, float(http_cache_ttl_s))
         self._http_cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._http_fail: dict[tuple[str, str], float] = {}
+        self._http_lock = threading.Lock()
         self._synoptic_token_cache: Optional[tuple[float, str]] = None
+        self._synoptic_token_error_at = 0.0
 
     def _zone(self, rule: WeatherRule):
         return load_timezone(rule.timezone)
@@ -254,11 +316,20 @@ class WeatherSourceAdapter:
     def _parse(self, rule: WeatherRule, value: Any):
         return parse_time(value, default_tz=self._zone(rule))
 
-    def _payload(self, rule: WeatherRule) -> tuple[Any, str]:
+    def _window_open(self, rule: WeatherRule, current_utc: datetime) -> bool:
+        start = self._parse(rule, rule.observation_start)
+        end = self._parse(rule, rule.observation_end)
+        if end is None:
+            return False
+        if start is not None and current_utc < start:
+            return False
+        return current_utc < end
+
+    def _cache_key(self, url: str, params: dict[str, Any]) -> tuple[str, str]:
+        return (url, json.dumps(params or {}, sort_keys=True, default=str))
+
+    def _request_parts(self, rule: WeatherRule) -> tuple[str, dict[str, Any], Optional[dict[str, str]]]:
         source = rule.source
-        if isinstance(source.get("static"), dict):
-            payload = self._normalize_payload(rule, source["static"])
-            return payload, str(source.get("url") or source.get("resolution_source") or "static://weather")
         url = str(source.get("url") or "").strip()
         if not url:
             raise SourceError("weather source URL missing")
@@ -285,17 +356,103 @@ class WeatherSourceAdapter:
             headers.setdefault("Referer", "https://www.wunderground.com/")
         if "synopticdata.com" in url:
             headers.update(self._synoptic_headers(source, params))
-        headers = headers or None
-        cache_key = (url, json.dumps(params or {}, sort_keys=True, default=str))
+        return url, params, headers or None
+
+    def _payload(self, rule: WeatherRule) -> tuple[Any, str]:
+        source = rule.source
+        if isinstance(source.get("static"), dict):
+            payload = self._normalize_payload(rule, source["static"])
+            return payload, str(source.get("url") or source.get("resolution_source") or "static://weather")
+        url, params, headers = self._request_parts(rule)
+        cache_key = self._cache_key(url, params)
         if self.http_cache_ttl_s:
-            hit = self._http_cache.get(cache_key)
+            with self._http_lock:
+                hit = self._http_cache.get(cache_key)
+                failed_at = self._http_fail.get(cache_key)
             if hit and (time.time() - hit[0]) < self.http_cache_ttl_s:
                 return hit[1], url
-        payload = self.http.get_json(url, params=params or None, headers=headers)
+            if failed_at and (time.time() - failed_at) < 30.0:
+                raise SourceError("source recently timed out")
+        try:
+            payload = self.http.get_json(url, params=params or None, headers=headers)
+        except SourceError:
+            with self._http_lock:
+                self._http_fail[cache_key] = time.time()
+            raise
         payload = self._normalize_payload(rule, payload)
         if self.http_cache_ttl_s:
-            self._http_cache[cache_key] = (time.time(), payload)
+            with self._http_lock:
+                self._http_cache[cache_key] = (time.time(), payload)
+                self._http_fail.pop(cache_key, None)
         return payload, url
+
+    def prefetch(self, rules: Iterable[WeatherRule], *, now: Optional[datetime] = None, deadline_s: float = 20.0) -> None:
+        """Warm the HTTP cache for unique stations without blocking the scan on a hung host."""
+
+        current = now or datetime.now(timezone.utc)
+        current_utc = current.astimezone(timezone.utc)
+        unique: list[WeatherRule] = []
+        seen: set[tuple[str, str]] = set()
+        for rule in rules:
+            if not isinstance(rule, WeatherRule):
+                continue
+            if isinstance(rule.source.get("static"), dict):
+                continue
+            start = self._parse(rule, rule.observation_start)
+            end = self._parse(rule, rule.observation_end)
+            if start is not None and current_utc < start:
+                continue
+            if end is not None:
+                grace_hours = float(rule.source.get("poll_after_end_hours") or 48)
+                if current_utc > end + timedelta(hours=max(0.0, grace_hours)):
+                    continue
+            url = str(rule.source.get("url") or "")
+            station = str(rule.source.get("station_id") or "")
+            key = (url, station)
+            if not url or key in seen:
+                continue
+            seen.add(key)
+            unique.append(rule)
+        if not unique:
+            return
+        unique.sort(key=lambda item: 0 if self._window_open(item, current_utc) else 1)
+        try:
+            if any("synopticdata.com" in str(rule.source.get("url") or "") for rule in unique):
+                self._synoptic_token()
+        except Exception:
+            pass
+        gate = threading.Semaphore(8)
+        deadline = time.time() + max(1.0, float(deadline_s))
+
+        def _warm(item: WeatherRule) -> None:
+            with gate:
+                if time.time() > deadline:
+                    return
+                try:
+                    self._payload(item)
+                except Exception:
+                    return
+
+        workers = [
+            threading.Thread(target=_warm, args=(rule,), daemon=True, name="wx-prefetch")
+            for rule in unique
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            remain = deadline - time.time()
+            worker.join(timeout=max(0.05, remain))
+        # Do not let the serial poll loop spend 8s on every station prefetch missed.
+        now_ts = time.time()
+        for rule in unique:
+            try:
+                url, params, _headers = self._request_parts(rule)
+            except SourceError:
+                continue
+            key = self._cache_key(url, params)
+            with self._http_lock:
+                if key not in self._http_cache:
+                    self._http_fail.setdefault(key, now_ts)
 
     def poll(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> ObservationEvidence:
         current = now or datetime.now(timezone.utc)
@@ -372,15 +529,27 @@ class WeatherSourceAdapter:
         if env:
             return env
         now = time.time()
-        cached = self._synoptic_token_cache
-        if cached and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S and cached[1]:
-            return cached[1]
-        raw = self.http.get_text(_SYNOPTIC_TOKEN_JS)
+        with self._http_lock:
+            if self._synoptic_token_error_at and (now - self._synoptic_token_error_at) < 60.0:
+                raise SourceError("synoptic token recently failed")
+            cached = self._synoptic_token_cache
+            if cached and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S and cached[1]:
+                return cached[1]
+        try:
+            raw = self.http.get_text(_SYNOPTIC_TOKEN_JS)
+        except SourceError:
+            with self._http_lock:
+                self._synoptic_token_error_at = time.time()
+            raise
         match = _SYNOPTIC_TOKEN_RE.search(raw)
         token = (match.group(1) if match else "").strip()
         if not token:
+            with self._http_lock:
+                self._synoptic_token_error_at = time.time()
             raise SourceError("synoptic token missing")
-        self._synoptic_token_cache = (now, token)
+        with self._http_lock:
+            self._synoptic_token_cache = (now, token)
+            self._synoptic_token_error_at = 0.0
         return token
 
     def _synoptic_headers(self, source: dict[str, Any], params: dict[str, Any]) -> dict[str, str]:
@@ -539,6 +708,25 @@ class WeatherSourceAdapter:
             values.append((timestamp, converted, row))
         return values
 
+    def _series_points(
+        self, rule: WeatherRule, values: list[tuple[datetime, float, dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        zone = self._zone(rule)
+        zone_name = getattr(zone, "key", None) or str(rule.timezone or "UTC")
+        points: list[dict[str, Any]] = []
+        for stamp, temp, _row in sorted(values, key=lambda item: item[0]):
+            utc = stamp.astimezone(timezone.utc)
+            local = utc.astimezone(zone)
+            points.append(
+                {
+                    "timestamp": utc.isoformat(),
+                    "local_time": local.strftime("%Y-%m-%d %H:%M"),
+                    "timezone": zone_name,
+                    "temp": round(float(temp), 1),
+                }
+            )
+        return points
+
     def _following_values(self, rule: WeatherRule, payload: Any) -> list[tuple[datetime, float]]:
         source = rule.source
         value_path = str(source.get("value_path") or "properties.temperature.value")
@@ -611,6 +799,7 @@ class WeatherSourceAdapter:
             )
         value = settled
         latest_timestamp = max(item[0] for item in values)
+        series = self._series_points(rule, values)
         following = self._following_values(rule, payload)
         final_path = str(rule.source.get("final_path") or "").strip()
         explicit_final = _boolean(json_path(payload, final_path)) if final_path else False
@@ -638,6 +827,7 @@ class WeatherSourceAdapter:
                 reason="running_extremum",
                 raw=payload,
                 evidence_hash=evidence_hash,
+                series=series,
             )
         is_final = explicit_final or (requires_following and bool(following))
         confirmation = ""
@@ -664,4 +854,5 @@ class WeatherSourceAdapter:
             reason="final_confirmation" if is_final else "awaiting_final_confirmation",
             raw=payload,
             evidence_hash=evidence_hash,
+            series=series,
         )

@@ -1,5 +1,5 @@
 import { state } from "./state.js";
-import { $, age, escapeHtml, fmtTime, num, pct, price, statusClass, statusLabel } from "./utils.js";
+import { $, age, escapeHtml, fmtStationTime, fmtTemp, fmtTime, num, pct, price, statusClass, statusLabel } from "./utils.js";
 
 function badge(value, label = value) {
   return `<span class="badge badge--${statusClass(value)}">${escapeHtml(statusLabel(label))}</span>`;
@@ -25,7 +25,9 @@ export function renderMeta() {
   const service = state.service || {};
   $("pillConnection").textContent = state.connected ? "SSE 已连接" : "REST / 重连中";
   $("pillConnection").className = "pill " + (state.connected ? "" : "pill--warn");
-  $("pillMode").textContent = service.dry_run === false ? "LIVE" : "DRY-RUN / READ-ONLY";
+    $("pillMode").textContent = (service.trading && service.trading.live_orders) || service.dry_run === false
+      ? "LIVE · max " + (service.trading && service.trading.max_order_usdc != null ? service.trading.max_order_usdc : "5") + " USDC"
+      : "DRY-RUN / READ-ONLY";
   $("pillCircuit").textContent = "Circuit " + (service.circuit || "—");
   $("pillCircuit").className = "pill " + (service.circuit === "OPEN" ? "pill--bad" : "pill--muted");
   $("pillScan").textContent = "最近扫描 " + fmtTime(service.last_scan_at);
@@ -124,16 +126,48 @@ export function renderCandidates() {
     : `<div class="empty">当前没有通过盘口经济门的候选</div>`;
 }
 
-function renderObservationTable(rows) {
-  const values = rows.flatMap((row) => {
+function seriesPoints(detail) {
+  if (Array.isArray(detail.source_series) && detail.source_series.length) return detail.source_series;
+  const rows = detail.rows || [];
+  for (const row of rows) {
     const obs = row.observation || {};
-    return obs.raw?.features || [];
-  }).slice(-80);
-  if (!values.length) return `<div class="empty">当前快照没有原始 features；请检查 source URL 或 fixture。</div>`;
-  return `<table class="compact"><thead><tr><th>时间</th><th>原始观测</th><th>状态</th></tr></thead><tbody>${
+    if (Array.isArray(obs.series) && obs.series.length) return obs.series;
+  }
+  return [];
+}
+
+function observationEmptyMessage(detail) {
+  const meta = groupMeta(detail);
+  const reason = meta.source.reason || "";
+  const tz = meta.rule.timezone || "";
+  if (reason === "observation_window_not_started") {
+    return `站点当地日尚未开始（${tz || "当地时区"}），现在没有该日小时序列是正常的，不是漏拉。`;
+  }
+  if (reason === "no_observations_in_window") {
+    return "窗口已开，源还没有返回这一天窗口内的观测点。";
+  }
+  if (reason === "observation_window_open") {
+    return "窗口已开，但这一轮没有拿到窗口内观测。";
+  }
+  if (String(detail.source_status || meta.source.status || "").includes("waiting")) {
+    return `窗口未开${reason ? "：" + reason : ""}${tz ? "（" + tz + "）" : ""}。`;
+  }
+  return reason ? `当前没有小时序列：${reason}` : "当前没有小时序列。";
+}
+
+function renderObservationTable(detail) {
+  const meta = groupMeta(detail);
+  const tz = meta.rule.timezone || "";
+  const values = seriesPoints(detail).slice(-96);
+  if (!values.length) {
+    return `<div class="empty">${escapeHtml(observationEmptyMessage(detail))}</div>`;
+  }
+  return `<table class="compact"><thead><tr><th>站点当地时间${tz ? "（" + escapeHtml(tz) + "）" : ""}</th><th>温度</th></tr></thead><tbody>${
     values.map((item) => {
-      const props = item.properties || item;
-      return `<tr><td>${escapeHtml(props.timestamp || item.timestamp || "—")}</td><td>${escapeHtml(props.temperature?.value ?? props.value ?? "—")}</td><td>${badge(props.final ? "final" : "provisional")}</td></tr>`;
+      const when = item.local_time || fmtStationTime(item.timestamp, tz);
+      const temp = fmtTemp(item.temp ?? item.value);
+      const unit = meta.rule.unit || meta.source.unit || "";
+      return `<tr><td>${escapeHtml(when)}</td><td>${escapeHtml(temp)}${unit ? " " + escapeHtml(unit) : ""}</td></tr>`;
     }).join("")
   }</tbody></table>`;
 }
@@ -142,10 +176,14 @@ function renderBooks(rows) {
   return `<div class="book-grid">${rows.map((row) => {
     const book = row.book || {};
     const asks = (book.asks || []).slice(0, 6);
+    const side = row.trade_side || "YES";
+    const empty = book.book_missing
+      ? `<small>${escapeHtml(book.error || "盘口未拉到")}</small>`
+      : `<small>无 asks</small>`;
     return `<article class="book">
-      <div class="book__head"><strong>${escapeHtml((row.outcome || "—") + (row.trade_side ? " " + row.trade_side : ""))}</strong><span>${escapeHtml(row.market_id || "")}</span></div>
+      <div class="book__head"><strong>${escapeHtml((row.outcome || "—") + " " + side)}</strong><span>${escapeHtml(row.market_id || "")}</span></div>
       <div class="book__meta">ask ${price(book.best_ask)} · bid ${price(book.best_bid)} · age ${age(book.fetched_at)}</div>
-      <div class="ladder">${asks.length ? asks.map((level) => `<div><span>${price(level.price)}</span><b>${num(level.size, 2)}</b></div>`).join("") : `<small>无 asks</small>`}</div>
+      <div class="ladder">${asks.length ? asks.map((level) => `<div><span>${price(level.price)}</span><b>${num(level.size, 2)}</b></div>`).join("") : empty}</div>
     </article>`;
   }).join("")}</div>`;
 }
@@ -159,15 +197,17 @@ export function renderDetail(detail) {
   }
   state.selectedEvent = detail;
   const meta = groupMeta(detail);
+  const running = meta.source.value;
+  const runningText = running == null || running === "" ? "—" : fmtTemp(running) + " " + (meta.rule.unit || meta.source.unit || "");
   $("detailTitle").textContent = (meta.station || "事件") + " · " + meta.date;
   $("detailBody").innerHTML = `
     <section class="detail-card">
       <div class="detail-title"><span class="eyebrow">RULE / FINALITY</span>${badge(detail.source_status, detail.source_status)}</div>
       <p>${escapeHtml(meta.question)}</p>
-      <div class="facts"><span>station <b>${escapeHtml(meta.station)}</b></span><span>metric <b>${escapeHtml(meta.metric)}</b></span><span>unit <b>${escapeHtml(meta.rule.unit || meta.source.unit || "—")}</b></span><span>bucket <b>${escapeHtml(detail.matched_bucket?.outcome || "—")}</b></span></div>
+      <div class="facts"><span>station <b>${escapeHtml(meta.station)}</b></span><span>metric <b>${escapeHtml(meta.metric)}</b></span><span>unit <b>${escapeHtml(meta.rule.unit || meta.source.unit || "—")}</b></span><span>盘中 <b>${escapeHtml(runningText)}</b></span><span>bucket <b>${escapeHtml(detail.matched_bucket?.outcome || "—")}</b></span></div>
     </section>
-    <section class="detail-card"><div class="section-head"><div><span class="eyebrow">SOURCE OBSERVATIONS</span><h3>实时数据</h3></div><span class="muted">${escapeHtml(meta.source.provider || "—")} · ${escapeHtml(fmtTime(meta.source.observed_at))}</span></div>${renderObservationTable(detail.rows || [])}</section>
-    <section class="detail-card"><div class="section-head"><div><span class="eyebrow">CLOB</span><h3>盘口深度</h3></div><span class="muted">目标桶与兄弟桶</span></div>${renderBooks(detail.markets || [])}</section>
+    <section class="detail-card"><div class="section-head"><div><span class="eyebrow">SOURCE OBSERVATIONS</span><h3>实时数据</h3></div><span class="muted">${escapeHtml(meta.source.provider || "—")} · 扫描 ${escapeHtml(fmtTime(meta.source.observed_at))}${meta.rule.timezone ? " · " + escapeHtml(meta.rule.timezone) : ""}</span></div>${renderObservationTable(detail)}</section>
+    <section class="detail-card"><div class="section-head"><div><span class="eyebrow">CLOB</span><h3>盘口深度</h3></div><span class="muted">先拉新死掉的 No，再拉其余交易盘，Yes 展示盘最后</span></div>${renderBooks(detail.markets || [])}</section>
     <section class="detail-card"><span class="eyebrow">AUDIT</span><div class="audit">${(detail.rows || []).map((row) => `<div><b>${escapeHtml((row.target_outcome || row.matched_outcome || "—") + (row.trade_side ? " " + row.trade_side : ""))}</b><span>${escapeHtml(row.status || "")}</span><small>${escapeHtml(row.reason || "")} · ${escapeHtml(row.observation?.evidence_hash || "no evidence hash")}</small></div>`).join("")}</div></section>`;
   drawer.setAttribute("aria-hidden", "false");
   drawer.classList.add("is-open");

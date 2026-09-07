@@ -67,7 +67,7 @@ th { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .05
 .badge--warn { color: #ffdc8a; background: rgba(240,180,41,.13); }
 .badge--bad { color: #ffc1c1; background: rgba(255,107,107,.13); }
 .badge--muted { color: var(--muted); background: rgba(255,255,255,.07); }
-.candidates-panel { padding: 16px; margin-top: 14px; }
+.candidates-panel { padding: 16px; margin-bottom: 14px; }
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
 .count { display: grid; place-items: center; min-width: 30px; height: 30px; border-radius: 10px; color: #07111e; background: var(--accent); font-weight: 800; }
 .candidate-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 10px; }

@@ -155,6 +155,7 @@ class ObservationEvidence:
     reason: str = ""
     raw: Any = None
     evidence_hash: str = ""
+    series: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

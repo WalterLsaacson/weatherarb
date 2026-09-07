@@ -45,6 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--allow-category-fee", action="store_true")
     scan.add_argument("--min-net-edge", type=float, default=0.0075)
     scan.add_argument("--max-ask", type=float, default=0.995)
+    take = sub.add_parser("take", help="refresh one candidate book and simulate or submit a FAK buy")
+    take.add_argument("--data-dir", type=Path, default=Path("data/pm-weather-live"))
+    take.add_argument("--event", required=True, help="event group id or unique substring")
+    take.add_argument("--outcome", default="", help="bucket title, e.g. 58-59°F")
+    take.add_argument("--live", action="store_true", help="POST a FAK buy; also requires LIVE_ORDERS=true")
+    take.add_argument("--allow-unlocked", action="store_true", help="skip the locked-No gate")
+    take.add_argument("--proxy", default=None)
     return parser
 
 
@@ -109,12 +116,35 @@ def scan_command(args: argparse.Namespace) -> int:
         weather_markets(rows),
         rules,
         books=books,
-        fetch_books=books is None,
         now=datetime.now(timezone.utc),
+        fetch_books=books is None,
     )
     write_json_atomic(args.output, result)
     print(json.dumps(result["summary"], ensure_ascii=False, sort_keys=True))
     return 0
+
+
+def take_command(args: argparse.Namespace) -> int:
+    from .env import load_dotenv, public_trading_status
+    from .service import RuntimeService
+
+    load_dotenv()
+    service = RuntimeService(
+        root=ROOT,
+        data_dir=args.data_dir.resolve(),
+        proxy=args.proxy,
+        sync=False,
+        dry_run=not bool(args.live),
+    )
+    result = service.take_opportunity(
+        event_group_id=args.event,
+        target_outcome=args.outcome,
+        live=bool(args.live),
+        require_locked_no=not bool(args.allow_unlocked),
+    )
+    result["trading"] = public_trading_status()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str))
+    return 0 if result.get("ok") else 1
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -123,6 +153,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return discover_command(args)
     if args.command == "scan":
         return scan_command(args)
+    if args.command == "take":
+        return take_command(args)
     return 2
 
 

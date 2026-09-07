@@ -30,6 +30,34 @@ export function fmtTime(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
+export function fmtStationTime(value, timeZone) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const options = {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  };
+  try {
+    return new Intl.DateTimeFormat("sv-SE", timeZone ? { ...options, timeZone } : options)
+      .format(date)
+      .replace("T", " ");
+  } catch (_error) {
+    return date.toISOString().slice(0, 16).replace("T", " ");
+  }
+}
+
+export function fmtTemp(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "—";
+  const rounded = Math.round(n * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
 export function age(value) {
   if (!value) return "—";
   const stamp = new Date(value).getTime();

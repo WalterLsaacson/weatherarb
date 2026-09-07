@@ -97,8 +97,13 @@ class ClobClient:
     def fetch_books(self, token_ids: Iterable[str]) -> dict[str, Book]:
         ids = [str(token_id) for token_id in token_ids if str(token_id)]
         result: dict[str, Book] = {}
+        stopped: Optional[SourceError] = None
         for start in range(0, len(ids), 50):
             chunk = ids[start : start + 50]
+            if stopped is not None:
+                for token_id in chunk:
+                    result[token_id] = Book(token_id=token_id, book_missing=True, error=str(stopped))
+                continue
             try:
                 payload = self.http.post_json(
                     self.base_url + "/books",
@@ -111,19 +116,18 @@ class ClobClient:
                     if not isinstance(row, dict):
                         continue
                     token_id = str(row.get("asset_id") or row.get("token_id") or "")
-                    if token_id:
-                        # CLOB responses do not consistently echo a capture
-                        # timestamp; use the local receipt time for TTL
-                        # enforcement and preserve any server timestamp in raw.
-                        normalized = dict(row)
-                        normalized.setdefault("fetched_at", captured_at)
-                        result[token_id] = normalize_book(token_id, normalized)
+                    if not token_id:
+                        continue
+                    normalized = dict(row)
+                    normalized.setdefault("fetched_at", captured_at)
+                    result[token_id] = normalize_book(token_id, normalized)
             except SourceError as exc:
+                stopped = exc
                 for token_id in chunk:
                     result[token_id] = Book(token_id=token_id, book_missing=True, error=str(exc))
-        for token_id in ids:
-            result.setdefault(
-                token_id,
-                Book(token_id=token_id, book_missing=True, error="token_missing_from_response"),
-            )
+            for token_id in chunk:
+                result.setdefault(
+                    token_id,
+                    Book(token_id=token_id, book_missing=True, error="token_missing_from_response"),
+                )
         return result

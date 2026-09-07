@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import queue
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .books import Book
+from .books import ClobClient
 from .markets import (
     GammaClient,
     catalog_event_groups,
@@ -25,15 +27,25 @@ from .markets import (
     weather_markets,
 )
 from .discovery import discover_rules
-from .models import WeatherMarket
-from .rules import RuleError, load_rules, parse_rule
-from .scanner import WeatherScanner, WeatherScannerConfig
-from .sources import JsonHttp
-from .storage import append_jsonl_dedup, load_json, write_json_atomic
+from .models import WeatherMarket, parse_time
+from .rules import (
+    RuleError,
+    bucket_for_outcome,
+    bucket_impossible_while_open,
+    load_rules,
+    load_timezone,
+    norm_outcome,
+    normalize_market,
+    parse_bucket,
+    parse_rule,
+)
+from .scanner import WeatherScanner, WeatherScannerConfig, extrema_from_rows
+from .sources import JsonHttp, series_from_raw
+from .storage import append_jsonl, append_jsonl_dedup, load_json, write_json_atomic
 
 
 def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
-    """Drop bulky source/market payloads from the board JSON without copying them."""
+    """Compact groups for the event list and SSE. Detail still reads last_result."""
 
     slim: list[dict[str, Any]] = []
     if not isinstance(groups, list):
@@ -41,13 +53,206 @@ def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
     for group in groups:
         if not isinstance(group, dict):
             continue
-        item = dict(group)
-        item["rows"] = [_slim_row(row) for row in group.get("rows") or [] if isinstance(row, dict)]
-        item["markets"] = [
-            _slim_market_view(row) for row in group.get("markets") or [] if isinstance(row, dict)
-        ]
-        slim.append(item)
+        slim.append(
+            {
+                "event_group_id": group.get("event_group_id"),
+                "question": group.get("question"),
+                "station_id": group.get("station_id"),
+                "unit": group.get("unit"),
+                "metric": group.get("metric"),
+                "source_status": group.get("source_status"),
+                "bucket_match_consistent": group.get("bucket_match_consistent"),
+                "matched_bucket": group.get("matched_bucket"),
+                "market_count": group.get("market_count"),
+                "matched_market_count": group.get("matched_market_count"),
+                "candidate_count": group.get("candidate_count"),
+                "status_counts": group.get("status_counts"),
+                "rows": _list_rows_for_board(group),
+                "markets": [],
+            }
+        )
     return slim
+
+
+def _list_rows_for_board(group: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [row for row in group.get("rows") or [] if isinstance(row, dict)]
+    if not rows:
+        return []
+    chosen = next((row for row in rows if row.get("status") == "opportunity"), rows[0])
+    return [_list_row(chosen)]
+
+
+def _compact_book(book: Any) -> dict[str, Any]:
+    if not isinstance(book, dict):
+        return {}
+    return {
+        "best_ask": book.get("best_ask"),
+        "best_bid": book.get("best_bid"),
+        "fetched_at": book.get("fetched_at"),
+        "book_missing": book.get("book_missing"),
+        "error": book.get("error"),
+    }
+
+
+def _list_row(row: dict[str, Any]) -> dict[str, Any]:
+    observation = row.get("observation") if isinstance(row.get("observation"), dict) else {}
+    market = row.get("market") if isinstance(row.get("market"), dict) else {}
+    rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
+    source = rule.get("source") if isinstance(rule.get("source"), dict) else {}
+    economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+    return {
+        "market_id": row.get("market_id"),
+        "event_group_id": row.get("event_group_id"),
+        "status": row.get("status"),
+        "reason": row.get("reason"),
+        "trade_side": row.get("trade_side"),
+        "target_outcome": row.get("target_outcome"),
+        "matched_outcome": row.get("matched_outcome"),
+        "lifecycle": row.get("lifecycle"),
+        "economics": {
+            "execution_price": economics.get("execution_price"),
+            "net_edge": economics.get("net_edge"),
+        },
+        "book": _compact_book(row.get("book")),
+        "observation": {
+            "status": observation.get("status"),
+            "provider": observation.get("provider"),
+            "station_id": observation.get("station_id"),
+            "value": observation.get("value"),
+            "unit": observation.get("unit"),
+            "aggregation": observation.get("aggregation"),
+            "reason": observation.get("reason"),
+            "observed_at": observation.get("observed_at"),
+            "source_timestamp": observation.get("source_timestamp"),
+        },
+        "market": {
+            "question": market.get("question"),
+            "outcome": market.get("outcome"),
+            "market_id": market.get("market_id"),
+        },
+        "rule": {
+            "timezone": rule.get("timezone"),
+            "observation_start": rule.get("observation_start"),
+            "metric": rule.get("metric"),
+            "unit": rule.get("unit"),
+            "manual_approval": rule.get("manual_approval"),
+            "source": {"station_id": source.get("station_id")},
+        },
+    }
+
+
+def _list_market(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "market_id": row.get("market_id"),
+        "outcome": row.get("outcome"),
+        "trade_side": row.get("trade_side"),
+        "status": row.get("status"),
+        "reason": row.get("reason"),
+        "book": _compact_book(row.get("book")),
+    }
+
+
+def _take_matches(
+    rows: list[dict[str, Any]],
+    event_group_id: str,
+    target_outcome: str,
+) -> list[dict[str, Any]]:
+    wanted_event = event_group_id.strip().lower().rstrip("/")
+    wanted_outcome = norm_outcome(target_outcome) if target_outcome else ""
+    found: list[dict[str, Any]] = []
+    for row in rows:
+        gid = str(row.get("event_group_id") or "").strip().lower().rstrip("/")
+        if gid != wanted_event and wanted_event not in gid:
+            continue
+        if wanted_outcome:
+            actual = norm_outcome(row.get("target_outcome") or row.get("matched_outcome"))
+            if actual != wanted_outcome:
+                continue
+        found.append(row)
+    if wanted_outcome or len(found) <= 1:
+        return found
+    opportunities = [row for row in found if row.get("status") == "opportunity"]
+    return opportunities or found
+
+
+_LOCKED_NO_REASONS = {
+    "intraday_impossible_no",
+    "provisional_loser_no",
+    "source_final_loser_no",
+}
+
+
+def _lock_snapshot(row: dict[str, Any]) -> dict[str, Any]:
+    observation = row.get("observation") if isinstance(row.get("observation"), dict) else {}
+    rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
+    buckets = []
+    for item in rule.get("buckets") or []:
+        if isinstance(item, dict):
+            try:
+                buckets.append(parse_bucket(item))
+            except Exception:  # noqa: BLE001
+                continue
+    target = bucket_for_outcome(row.get("target_outcome") or row.get("matched_outcome"), buckets)
+    metric = str(rule.get("metric") or "")
+    rounding = str(rule.get("rounding") or "whole_degree_as_published")
+    running = observation.get("value")
+    impossible = bool(
+        target is not None
+        and metric in {"daily_min", "daily_max"}
+        and bucket_impossible_while_open(metric, running, target, rounding=rounding)
+    )
+    reason = str(row.get("reason") or "")
+    side = str(row.get("trade_side") or "").upper()
+    return {
+        "locked": bool(
+            side == "NO" and reason in _LOCKED_NO_REASONS and impossible
+        ),
+        "trade_side": side,
+        "reason": reason,
+        "metric": metric,
+        "running_value": running,
+        "raw_aggregate": observation.get("raw_aggregate"),
+        "observation_status": observation.get("status"),
+        "station_id": observation.get("station_id"),
+        "target_outcome": row.get("target_outcome"),
+        "target_bucket": target.to_dict() if target is not None else None,
+        "bucket_impossible": impossible,
+        "provider": observation.get("provider"),
+    }
+
+
+_FILL_STATUSES = {"submitted", "matched", "live"}
+
+
+def _fill_keys(record: Any) -> set[str]:
+    if not isinstance(record, dict) or record.get("dry_run"):
+        return set()
+    status = str(record.get("status") or "")
+    exchange = record.get("exchange") if isinstance(record.get("exchange"), dict) else {}
+    filled = status in _FILL_STATUSES or bool(exchange.get("ok")) or str(exchange.get("status") or "") in _FILL_STATUSES
+    if not filled:
+        return set()
+    keys: set[str] = set()
+    token_id = str(record.get("token_id") or "")
+    if token_id:
+        keys.add(token_id)
+    event_id = str(record.get("event_group_id") or "")
+    outcome = str(record.get("target_outcome") or "")
+    if event_id and outcome:
+        keys.add(event_id + "|" + outcome)
+    return keys
+
+
+def _instrument_keys(row: dict[str, Any], token_id: str = "") -> set[str]:
+    keys: set[str] = set()
+    token = str(token_id or row.get("book_token_id") or row.get("winning_token_id") or row.get("token_id") or "")
+    if token:
+        keys.add(token)
+    event_id = str(row.get("event_group_id") or "")
+    outcome = str(row.get("target_outcome") or "")
+    if event_id and outcome:
+        keys.add(event_id + "|" + outcome)
+    return keys
 
 
 def _slim_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -73,6 +278,33 @@ def _slim_market_view(row: dict[str, Any]) -> dict[str, Any]:
         book.pop("raw", None)
         item["book"] = book
     return item
+
+
+def _series_in_group_window(group: dict[str, Any], points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    row = next((item for item in group.get("rows") or [] if isinstance(item, dict)), {})
+    rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
+    tz_name = str(rule.get("timezone") or "UTC")
+    try:
+        zone = load_timezone(tz_name)
+    except RuleError:
+        zone = timezone.utc
+    start = parse_time(rule.get("observation_start"), default_tz=zone)
+    end = parse_time(rule.get("observation_end"), default_tz=zone)
+    if start is None and end is None:
+        return points
+    filtered: list[dict[str, Any]] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        stamp = parse_time(point.get("timestamp") or point.get("local_time"), default_tz=zone)
+        if stamp is None:
+            continue
+        if start is not None and stamp < start:
+            continue
+        if end is not None and stamp > end:
+            continue
+        filtered.append(point)
+    return filtered
 
 
 class RuntimeService:
@@ -123,7 +355,6 @@ class RuntimeService:
         )
         # Keep all source/CLOB calls on the explicitly configured HTTP client.
         from .sources import WeatherSourceAdapter
-        from .books import ClobClient
 
         self.scanner.source_adapter = WeatherSourceAdapter(http=self.http)
         self.scanner.clob_client = ClobClient(http=self.http)
@@ -155,11 +386,68 @@ class RuntimeService:
         self._subscribers: dict[int, queue.Queue[dict[str, Any]]] = {}
         self._subscriber_id = 0
         self._history: deque[dict[str, Any]] = deque(maxlen=64)
+        self._gamma_sync_error = ""
+        self._series_index: Optional[dict[str, list[dict[str, Any]]]] = None
+        self.scan_in_progress = False
+        self._extrema: dict[str, dict[str, Any]] = {}
+        self._taken_tokens: set[str] = set()
+        self._hydrate_last_result()
+        self._hydrate_taken()
 
     def _catalog_path(self) -> Path:
         return self.data_dir / "weather_catalog.json"
 
+    def _hydrate_last_result(self) -> None:
+        if self.fixture:
+            return
+        latest = load_json(self.data_dir / "latest.json", default={})
+        if not isinstance(latest, dict):
+            return
+        groups = latest.get("event_groups")
+        if not isinstance(groups, list) or not groups:
+            return
+        latest.pop("source_evidence", None)
+        self.last_result = latest
+        self.last_scan_at = str((latest.get("summary") or {}).get("scanned_at") or "")
+        self._extrema = extrema_from_rows(latest.get("rows") or [])
+
+    def _hydrate_taken(self) -> None:
+        path = self.data_dir / "orders.jsonl"
+        if not path.is_file():
+            return
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    keys = _fill_keys(record)
+                    if keys:
+                        self._taken_tokens.update(keys)
+        except OSError:
+            return
+
+    def _disk_market_rows(self) -> list[dict[str, Any]]:
+        if self.markets_file and Path(self.markets_file).is_file():
+            return load_market_rows(str(self.markets_file))
+        snapshot = self.data_dir / "market_snapshot.json"
+        if snapshot.is_file():
+            return load_market_rows(str(snapshot))
+        return []
+
+    def _ensure_catalog_from_disk(self) -> None:
+        if not self._all_catalog_groups:
+            self._all_catalog_groups = self._load_catalog_from_disk()
+
     def _horizon_now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _scan_now(self) -> datetime:
+        if self.fixture:
+            return datetime(2026, 9, 5, 1, tzinfo=timezone.utc)
         return datetime.now(timezone.utc)
 
     def _apply_horizon_to_catalog(self) -> list[dict[str, Any]]:
@@ -203,23 +491,35 @@ class RuntimeService:
     def _load_markets(self) -> list[dict[str, Any]]:
         now = time.time()
         catalog_stale = (now - self._catalog_at) >= self.catalog_ttl_s or not self._all_catalog_groups
+        rows: list[dict[str, Any]] = []
         if self.sync_enabled and catalog_stale:
-            events = GammaClient(http=self.http).list_events(tag_slug="weather", max_pages=20)
-            rows = flatten_event_markets(events)
-            self._all_catalog_groups = self._write_weather_catalog(events, rows)
-            self._catalog_at = now
-            write_json_atomic(self.data_dir / "market_snapshot.json", snapshot_payload(rows))
-        else:
-            if not self._all_catalog_groups:
-                self._all_catalog_groups = self._load_catalog_from_disk()
-                if self._all_catalog_groups:
-                    self._catalog_at = now
-            if self.markets_file and self.markets_file.is_file():
-                rows = load_market_rows(str(self.markets_file))
-            elif self.sync_enabled and (self.data_dir / "market_snapshot.json").is_file():
-                rows = load_market_rows(str(self.data_dir / "market_snapshot.json"))
+            self._ensure_catalog_from_disk()
+            disk_rows = self._disk_market_rows()
+            # First process start: use the on-disk snapshot immediately so the
+            # board is not blocked on a Gamma timeout.
+            if self._catalog_at <= 0.0 and (disk_rows or self._all_catalog_groups):
+                rows = disk_rows
+                self._catalog_at = now
             else:
-                rows = []
+                try:
+                    events = GammaClient(http=self.http).list_events(tag_slug="weather", max_pages=20)
+                    rows = flatten_event_markets(events)
+                    self._all_catalog_groups = self._write_weather_catalog(events, rows)
+                    self._catalog_at = now
+                    write_json_atomic(self.data_dir / "market_snapshot.json", snapshot_payload(rows))
+                    self._gamma_sync_error = ""
+                except Exception as exc:  # noqa: BLE001
+                    self._gamma_sync_error = str(exc)
+                    self._ensure_catalog_from_disk()
+                    rows = self._disk_market_rows()
+                    if not rows and not self._all_catalog_groups:
+                        raise
+                    self._catalog_at = now
+        else:
+            self._ensure_catalog_from_disk()
+            if self._all_catalog_groups and not self._catalog_at:
+                self._catalog_at = now
+            rows = self._disk_market_rows()
         if self.fixture:
             return rows
         self._apply_horizon_to_catalog()
@@ -285,7 +585,7 @@ class RuntimeService:
             # Fixture books are replay inputs without an exchange capture
             # clock. Stamp them at load time so the normal book TTL gate is
             # still applied to every subsequent scan.
-            stamp = datetime.now(timezone.utc).isoformat()
+            stamp = self._scan_now().isoformat()
             return {
                 str(token_id): (
                     {**book, "fetched_at": stamp}
@@ -369,8 +669,16 @@ class RuntimeService:
                 row.get("event_group_id"), row.get("evidence_hash"), row.get("source_timestamp")
             ),
         )
+        self._series_index = None
 
     def scan_once(self) -> dict[str, Any]:
+        self.scan_in_progress = True
+        try:
+            return self._scan_once()
+        finally:
+            self.scan_in_progress = False
+
+    def _scan_once(self) -> dict[str, Any]:
         try:
             raw_markets = self._load_markets()
             markets = weather_markets(raw_markets)
@@ -380,21 +688,25 @@ class RuntimeService:
                 self.last_scan_at = datetime.now(timezone.utc).isoformat()
             self._publish("health_update", self.status())
             raise
-        with self.lock:
-            try:
-                rules = self._load_rules(markets)
-                books = self._load_books()
-            except Exception as exc:  # noqa: BLE001
+        try:
+            rules = self._load_rules(markets)
+            books = self._load_books()
+        except Exception as exc:  # noqa: BLE001
+            with self.lock:
                 self.last_error = str(exc)
                 self.last_scan_at = datetime.now(timezone.utc).isoformat()
-                self._publish("health_update", self.status())
-                raise
+            self._publish("health_update", self.status())
+            raise
+        with self.lock:
+            previous_extrema = dict(self._extrema)
+        scan_now = self._scan_now()
         result = self.scanner.scan(
             markets,
             rules,
             books=books,
-            now=datetime.now(timezone.utc),
+            now=scan_now,
             fetch_books=books is None,
+            previous_extrema=previous_extrema,
         )
         result["summary"]["proxy"] = self.http.proxy or "direct"
         result["summary"]["data_dir"] = str(self.data_dir)
@@ -419,7 +731,8 @@ class RuntimeService:
             self.last_error = ""
             self.last_scan_at = str((result.get("summary") or {}).get("scanned_at") or "")
             self.last_result = result
-            self._persist(result)
+            self._extrema = extrema_from_rows(result.get("rows") or [])
+        self._persist(result)
         self._publish("snapshot", self.board_snapshot())
         self._publish(
             "source_update",
@@ -428,17 +741,21 @@ class RuntimeService:
                 "event_groups": slim_board_groups(result.get("event_groups") or []),
             },
         )
+        candidates = [
+            _slim_row(row)
+            for row in result.get("rows") or []
+            if isinstance(row, dict) and row.get("status") == "opportunity"
+        ]
         self._publish(
             "candidate_update",
             {
                 "scanned_at": self.last_scan_at,
-                "candidates": [
-                _slim_row(row)
-                for row in result.get("rows") or []
-                if isinstance(row, dict) and row.get("status") == "opportunity"
-            ],
+                "candidates": candidates,
             },
         )
+        takes = self._auto_take_opportunities(result)
+        if takes:
+            self._publish("health_update", self.status())
         return result
 
     def _loop(self) -> None:
@@ -517,12 +834,55 @@ class RuntimeService:
             result.append(group)
         return result[: max(1, min(int(limit), 1000))]
 
+    def _source_series_index(self) -> dict[str, list[dict[str, Any]]]:
+        if self._series_index is not None:
+            return self._series_index
+        index: dict[str, list[dict[str, Any]]] = {}
+        path = self.data_dir / "source_observations.jsonl"
+        if path.is_file():
+            try:
+                with path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        if not line.strip():
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(row, dict):
+                            continue
+                        points = row.get("series")
+                        if not isinstance(points, list) or not points:
+                            points = series_from_raw(row.get("raw"))
+                        if not points:
+                            continue
+                        event_id = str(row.get("event_group_id") or "")
+                        if event_id:
+                            index[event_id] = points
+            except OSError:
+                pass
+        self._series_index = index
+        return index
+
+    def _lookup_source_series(self, group: dict[str, Any]) -> list[dict[str, Any]]:
+        if "source_series" in group and isinstance(group.get("source_series"), list):
+            return group["source_series"]
+        index = self._source_series_index()
+        event_id = str(group.get("event_group_id") or "")
+        points = index.get(event_id) if event_id else None
+        if not isinstance(points, list) or not points:
+            return []
+        return _series_in_group_window(group, points)
+
     def event_detail(self, event_group_id: str) -> Optional[dict[str, Any]]:
         wanted = str(event_group_id).strip()
         with self.lock:
             for group in self.last_result.get("event_groups") or []:
-                if str(group.get("event_group_id")) == wanted:
-                    return group
+                if str(group.get("event_group_id")) != wanted:
+                    continue
+                item = dict(group)
+                item["source_series"] = self._lookup_source_series(item)
+                return item
         return None
 
     def candidates(self, *, limit: int = 200) -> list[dict[str, Any]]:
@@ -546,6 +906,7 @@ class RuntimeService:
                 "horizon_hours": self.horizon_hours,
                 "interval_s": self.interval_s,
                 "ticks": self.ticks,
+                "scan_in_progress": self.scan_in_progress,
                 "last_scan_at": self.last_scan_at,
                 "last_error": self.last_error,
                 "data_dir": str(self.data_dir),
@@ -554,8 +915,234 @@ class RuntimeService:
                 "books_file": str(self.books_file) if self.books_file else "",
                 "proxy": self.http.proxy or "direct",
                 "circuit": "OPEN" if self.last_error else "CLOSED",
+                "gamma_sync_error": self._gamma_sync_error,
                 "summary": summary,
+                "trading": self.trading_status(),
+                "taken_tokens": len(self._taken_tokens),
             }
+
+    def trading_status(self) -> dict[str, Any]:
+        from .env import public_trading_status
+
+        status = public_trading_status()
+        status["taken_tokens"] = len(self._taken_tokens)
+        return status
+
+    def _auto_take_opportunities(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        from .env import trading_config
+
+        cfg = trading_config()
+        if not cfg["live_orders"] or self.fixture:
+            return []
+        takes: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in result.get("rows") or []:
+            if not isinstance(row, dict) or row.get("status") != "opportunity":
+                continue
+            token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
+            if not token_id:
+                continue
+            keys = _instrument_keys(row, token_id)
+            if keys & self._taken_tokens or token_id in seen:
+                continue
+            seen.add(token_id)
+            event_id = str(row.get("event_group_id") or "")
+            outcome = str(row.get("target_outcome") or "")
+            print(
+                "LIVE auto-take {} {} {}".format(event_id, outcome, row.get("trade_side")),
+                flush=True,
+            )
+            takes.append(
+                self.take_opportunity(
+                    event_group_id=event_id,
+                    target_outcome=outcome,
+                    live=True,
+                    require_locked_no=True,
+                )
+            )
+        return takes
+
+    def take_opportunity(
+        self,
+        *,
+        event_group_id: str,
+        target_outcome: str = "",
+        live: bool = False,
+        require_locked_no: bool = True,
+    ) -> dict[str, Any]:
+        from .env import trading_config
+        from .models import utc_now
+        from .orders import LiveOrderError, quantize_buy, submit_fak_buy
+
+        cfg = trading_config()
+        wanted_event = str(event_group_id or "").strip()
+        wanted_outcome = str(target_outcome or "").strip()
+        if not wanted_event:
+            return {"ok": False, "error": "event_required"}
+        with self.lock:
+            rows = [row for row in self.last_result.get("rows") or [] if isinstance(row, dict)]
+        matches = _take_matches(rows, wanted_event, wanted_outcome)
+        if not matches:
+            return {
+                "ok": False,
+                "error": "row_not_found",
+                "event_group_id": wanted_event,
+                "target_outcome": wanted_outcome,
+            }
+        if len(matches) > 1:
+            return {
+                "ok": False,
+                "error": "ambiguous_outcome",
+                "matches": [
+                    {
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "status": row.get("status"),
+                    }
+                    for row in matches[:20]
+                ],
+            }
+        row = copy.deepcopy(matches[0])
+        token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
+        if not token_id:
+            return {"ok": False, "error": "missing_token", "row": _slim_row(row)}
+        if live and (_instrument_keys(row, token_id) & self._taken_tokens):
+            return {
+                "ok": False,
+                "error": "already_taken",
+                "token_id": token_id,
+                "event_group_id": row.get("event_group_id"),
+                "target_outcome": row.get("target_outcome"),
+            }
+        market_payload = row.get("market") if isinstance(row.get("market"), dict) else {}
+        try:
+            market = normalize_market(market_payload)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": "invalid_market", "detail": str(exc)}
+        books = self.scanner.clob_client.fetch_books([token_id])
+        row["status"] = "rule_matched"
+        original_max_usdc = float(self.scanner.config.max_usdc)
+        original_target = float(self.scanner.config.target_shares)
+        self.scanner.config.max_usdc = float(cfg["max_order_usdc"])
+        self.scanner.config.target_shares = max(
+            original_target, float(cfg["max_order_usdc"]) * 1000.0
+        )
+        try:
+            self.scanner._evaluate_matched_row(row, books, {market.market_id: market}, utc_now())
+        finally:
+            self.scanner.config.max_usdc = original_max_usdc
+            self.scanner.config.target_shares = original_target
+        if row.get("status") != "opportunity":
+            return {
+                "ok": False,
+                "error": str(row.get("reason") or "not_opportunity"),
+                "row": _slim_row(row),
+            }
+        lock = _lock_snapshot(row)
+        if require_locked_no and not lock.get("locked"):
+            return {
+                "ok": False,
+                "error": "not_locked_no",
+                "lock": lock,
+                "row": _slim_row(row),
+            }
+        economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+        price = float(economics.get("worst_price") or economics.get("execution_price") or 0.0)
+        size = float(economics.get("execution_shares") or 0.0)
+        min_order = float(economics.get("min_order_size") or 0.0)
+        if price <= 0.0 or size <= 0.0:
+            return {"ok": False, "error": "invalid_size_or_price", "row": _slim_row(row)}
+        max_shares = float(cfg["max_order_usdc"]) / price
+        size = min(size, max_shares)
+        try:
+            price, size = quantize_buy(price, size, float(cfg["max_order_usdc"]))
+        except LiveOrderError as exc:
+            return {"ok": False, "error": str(exc), "price": price, "size": size}
+        if min_order > 0 and size + 1e-12 < min_order:
+            return {
+                "ok": False,
+                "error": "max_usdc_below_min_order",
+                "max_order_usdc": cfg["max_order_usdc"],
+                "min_order_size": min_order,
+                "price": price,
+            }
+        record = {
+            "client_order_id": str(uuid.uuid4()),
+            "created_at": utc_now().isoformat(),
+            "event_group_id": row.get("event_group_id"),
+            "market_id": row.get("market_id"),
+            "target_outcome": row.get("target_outcome"),
+            "trade_side": row.get("trade_side"),
+            "token_id": token_id,
+            "side": "BUY",
+            "order_type": "FAK",
+            "price": price,
+            "size": size,
+            "notional_usdc": round(price * size, 6),
+            "economics": economics,
+            "reason": row.get("reason"),
+            "lock": lock,
+            "dry_run": not bool(live),
+            "live_requested": bool(live),
+        }
+        if live:
+            if not cfg["live_orders"]:
+                record["status"] = "blocked"
+                record["error"] = "live_orders_disabled"
+                append_jsonl(self.data_dir / "orders.jsonl", [record])
+                return {
+                    "ok": False,
+                    "error": "live_orders_disabled",
+                    "hint": "Set LIVE_ORDERS=true in .env, then pass --live",
+                    "order": record,
+                    "trading": self.trading_status(),
+                }
+            with self.lock:
+                fill_keys = _instrument_keys(row, token_id)
+                if fill_keys & self._taken_tokens:
+                    return {
+                        "ok": False,
+                        "error": "already_taken",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                    }
+                self._taken_tokens.update(fill_keys)
+            try:
+                exchange = submit_fak_buy(
+                    token_id=token_id,
+                    price=price,
+                    size=size,
+                    config=cfg,
+                )
+                record["exchange"] = exchange
+                if isinstance(exchange, dict):
+                    record["status"] = str(exchange.get("status") or "submitted")
+                    if exchange.get("order_id"):
+                        record["client_order_id"] = str(exchange.get("order_id"))
+                else:
+                    record["status"] = "submitted"
+            except LiveOrderError as exc:
+                with self.lock:
+                    self._taken_tokens.difference_update(fill_keys)
+                record["status"] = "error"
+                record["error"] = str(exc)
+                append_jsonl(self.data_dir / "orders.jsonl", [record])
+                return {"ok": False, "error": str(exc), "order": record}
+            except Exception as exc:  # noqa: BLE001
+                with self.lock:
+                    self._taken_tokens.difference_update(fill_keys)
+                record["status"] = "error"
+                record["error"] = str(exc)
+                append_jsonl(self.data_dir / "orders.jsonl", [record])
+                return {"ok": False, "error": str(exc), "order": record}
+            with self.lock:
+                summary = self.last_result.setdefault("summary", {})
+                summary["live_orders_submitted"] = int(summary.get("live_orders_submitted") or 0) + 1
+        else:
+            record["status"] = "simulated_fak"
+        append_jsonl(self.data_dir / "orders.jsonl", [record])
+        return {"ok": True, "order": record, "trading": self.trading_status()}
 
     def _publish(self, event_type: str, data: Any) -> None:
         with self.lock:

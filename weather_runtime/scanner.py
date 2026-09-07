@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
 from .books import ClobClient, ask_depth, normalize_book, walk_asks
-from .models import Book, WeatherMarket, WeatherRule, parse_time
+from .models import Book, WeatherMarket, WeatherRule, as_float, parse_time, utc_now
 from .rules import (
     bucket_for_outcome,
     bucket_for_value,
@@ -54,6 +54,35 @@ def _no_token(market: WeatherMarket) -> str:
     if len(market.token_ids) > 1:
         return str(market.token_ids[1])
     return ""
+
+
+def _unique_ids(ids: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in ids:
+        token = str(item or "")
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        result.append(token)
+    return result
+
+
+def extrema_from_rows(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    extrema: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        event_id = str(row.get("event_group_id") or "")
+        observation = row.get("observation") if isinstance(row.get("observation"), dict) else {}
+        value = as_float(observation.get("value"))
+        if not event_id or value is None:
+            continue
+        extrema[event_id] = {
+            "value": value,
+            "status": str(observation.get("status") or ""),
+        }
+    return extrema
 
 
 @dataclass
@@ -104,6 +133,8 @@ class WeatherScanner:
         source_status: str,
         reason: str,
         history: list[str],
+        priority_token_ids: Optional[list[str]] = None,
+        priority: bool = False,
     ) -> None:
         trade_token = _yes_token(market) if trade_side == "YES" else _no_token(market)
         base.update(
@@ -129,6 +160,8 @@ class WeatherScanner:
             rows.append(base)
             return
         token_ids.append(trade_token)
+        if priority and priority_token_ids is not None:
+            priority_token_ids.append(trade_token)
         if not market.tradable:
             base.update({"status": "no_trade", "reason": "market_not_tradable"})
             rows.append(base)
@@ -136,6 +169,214 @@ class WeatherScanner:
         base["status"] = "rule_matched"
         base["reason"] = reason
         rows.append(base)
+
+    def _trade_is_priority(
+        self,
+        *,
+        observation_status: str,
+        metric: str,
+        previous: Any,
+        market_bucket: Any,
+        rounding: str,
+        trade_side: str,
+    ) -> bool:
+        prev = previous if isinstance(previous, dict) else {}
+        prev_status = str(prev.get("status") or "")
+        if observation_status == "final":
+            return prev_status != "final"
+        if trade_side != "NO":
+            return prev_status != observation_status
+        prev_value = as_float(prev.get("value"))
+        if prev_value is None:
+            return True
+        return not bucket_impossible_while_open(
+            metric, prev_value, market_bucket, rounding=rounding
+        )
+
+    def _bind_row_book(
+        self,
+        row: dict[str, Any],
+        books: dict[str, Any],
+        *,
+        overwrite: bool = False,
+    ) -> str:
+        if row.get("book") and not overwrite:
+            return str((row.get("book") or {}).get("token_id") or "")
+        token_id = str(
+            row.get("book_token_id")
+            or row.get("winning_token_id")
+            or row.get("display_token_id")
+            or ""
+        )
+        fetched = books.get(token_id) if token_id else None
+        if fetched is not None:
+            row["book"] = _without_raw(self._book(fetched, token_id).to_dict())
+        return token_id
+
+    def _evaluate_matched_row(
+        self,
+        row: dict[str, Any],
+        books: dict[str, Any],
+        market_map: dict[str, WeatherMarket],
+        eval_at: datetime,
+    ) -> None:
+        if row.get("status") != "rule_matched":
+            return
+        market = market_map.get(str(row.get("market_id")))
+        token_id = self._bind_row_book(row, books, overwrite=True)
+        if self.config.reject_neg_risk and market is not None and market.neg_risk:
+            row.update({"status": "no_trade", "reason": "neg_risk_rejected"})
+            return
+        book = self._book(books.get(token_id), token_id)
+        row["book"] = _without_raw(book.to_dict())
+        if book.book_missing or book.best_ask is None:
+            row.update({"status": "no_trade", "reason": "book_missing"})
+            return
+        if market is None:
+            row.update({"status": "no_trade", "reason": "market_not_found"})
+            return
+        if self.config.require_explicit_fee and market.fee_source == "category_default":
+            row.update({"status": "no_trade", "reason": "fee_not_explicit"})
+            return
+        book_time = parse_time(book.fetched_at)
+        if book_time is None:
+            row.update({"status": "no_trade", "reason": "book_timestamp_missing"})
+            return
+        book_age = (eval_at.astimezone(timezone.utc) - book_time).total_seconds()
+        if book_age < -1.0 or book_age > float(self.config.book_ttl_s):
+            row.update(
+                {
+                    "status": "no_trade",
+                    "reason": "book_stale",
+                    "economics": {
+                        "book_age_s": book_age,
+                        "book_ttl_s": float(self.config.book_ttl_s),
+                    },
+                }
+            )
+            return
+        best_ask = float(book.best_ask)
+        if best_ask <= 0.0:
+            row.update({"status": "no_trade", "reason": "invalid_ask"})
+            return
+        if best_ask > self.config.max_ask or best_ask >= 1.0:
+            row.update({"status": "no_trade", "reason": "ask_above_limit"})
+            return
+        tick = book.tick_size or market.tick_size
+        min_order_size = book.min_order_size or market.min_order_size
+        if self.config.require_market_constraints and (
+            tick is None or tick <= 0 or min_order_size is None or min_order_size <= 0
+        ):
+            row.update({"status": "no_trade", "reason": "market_constraints_missing"})
+            return
+        target = max(
+            float(self.config.min_order_shares),
+            float(min_order_size or 0.0),
+            min(float(self.config.target_shares), self.config.max_usdc / best_ask),
+        )
+        if target * best_ask > float(self.config.max_usdc) + 1e-12:
+            row.update(
+                {
+                    "status": "no_trade",
+                    "reason": "max_usdc_below_min_order",
+                    "economics": {
+                        "best_ask": best_ask,
+                        "min_order_size": min_order_size,
+                        "max_usdc": float(self.config.max_usdc),
+                        "tick_size": tick,
+                    },
+                }
+            )
+            return
+        execution_limit = min(
+            float(self.config.max_ask),
+            best_ask + max(0.0, float(self.config.max_slippage)),
+        )
+        fill = walk_asks(book, max_price=execution_limit, target_shares=target)
+        if not fill["complete"]:
+            row.update(
+                {
+                    "status": "no_trade",
+                    "reason": "insufficient_depth_within_slippage",
+                    "economics": {
+                        "best_ask": best_ask,
+                        "execution_limit": execution_limit,
+                        "ask_depth_at_limit": ask_depth(book, max_price=execution_limit),
+                        "target_shares": target,
+                        "filled_shares": fill["filled_shares"],
+                        "tick_size": tick,
+                    },
+                }
+            )
+            return
+        execution_price = float(fill["vwap"] or 0.0)
+        fee_rate = market.fee_rate
+        if fee_rate is None:
+            row.update({"status": "no_trade", "reason": "fee_unknown"})
+            return
+        fee = float(fee_rate) * execution_price * (1.0 - execution_price)
+        gross = 1.0 - execution_price
+        edge = gross - fee
+        row["economics"] = {
+            "best_ask": best_ask,
+            "execution_price": execution_price,
+            "execution_shares": fill["filled_shares"],
+            "worst_price": fill["worst_price"],
+            "slippage": max(0.0, execution_price - best_ask),
+            "fee_rate": float(fee_rate),
+            "fee_source": market.fee_source,
+            "fee_per_share": fee,
+            "gross_edge": gross,
+            "net_edge": edge,
+            "ask_depth_at_limit": ask_depth(book, max_price=execution_limit),
+            "execution_limit": execution_limit,
+            "max_ask": self.config.max_ask,
+            "min_net_edge": self.config.min_net_edge,
+            "tick_size": tick,
+            "min_order_size": min_order_size,
+            "book_age_s": book_age,
+            "trade_side": row.get("trade_side") or "YES",
+        }
+        if edge < self.config.min_net_edge:
+            row.update({"status": "no_trade", "reason": "edge_below_minimum"})
+            return
+        match_reason = str(row.get("reason") or "")
+        opportunity_reason = (
+            match_reason
+            if match_reason in {"intraday_impossible_no", "provisional_loser_no"}
+            else "dry_run_candidate_only"
+        )
+        history = list((row.get("lifecycle") or {}).get("history") or [])
+        if not history:
+            history = ["DISCOVERED", "RULE_MATCHED"]
+        if history[-1] != "BOOK_READY":
+            history = history + ["BOOK_READY"]
+        row.update(
+            {
+                "status": "opportunity",
+                "reason": opportunity_reason,
+                "dry_run": True,
+                "lifecycle": {"state": "BOOK_READY", "history": history},
+            }
+        )
+
+    def _evaluate_tokens(
+        self,
+        rows: list[dict[str, Any]],
+        books: dict[str, Any],
+        market_map: dict[str, WeatherMarket],
+        eval_at: datetime,
+        token_ids: Iterable[str],
+    ) -> None:
+        wanted = {str(token_id) for token_id in token_ids if token_id}
+        if not wanted:
+            return
+        for row in rows:
+            if row.get("status") != "rule_matched":
+                continue
+            if str(row.get("book_token_id") or "") not in wanted:
+                continue
+            self._evaluate_matched_row(row, books, market_map, eval_at)
 
     def scan(
         self,
@@ -145,6 +386,7 @@ class WeatherScanner:
         books: Optional[dict[str, Book | dict[str, Any]]] = None,
         now: Optional[datetime] = None,
         fetch_books: bool = True,
+        previous_extrema: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         current = now or datetime.now(timezone.utc)
         market_list = [
@@ -184,8 +426,11 @@ class WeatherScanner:
                 group_block[group_id] = sibling_reason
         rows: list[dict[str, Any]] = []
         token_ids: list[str] = []
+        priority_token_ids: list[str] = []
+        prior_extrema = previous_extrema if isinstance(previous_extrema, dict) else {}
         source_cache: dict[str, Any] = {}
         source_evidence: dict[str, dict[str, Any]] = {}
+        self.source_adapter.prefetch(rule_list, now=current)
 
         for rule in rule_list:
             market = market_map.get(rule.market_id)
@@ -264,6 +509,7 @@ class WeatherScanner:
                         "status": evidence.get("status"),
                         "source_timestamp": evidence.get("source_timestamp"),
                         "observed_at": evidence.get("observed_at"),
+                        "series": evidence.get("series") or [],
                         "raw": evidence.get("raw"),
                     },
                 )
@@ -372,6 +618,15 @@ class WeatherScanner:
                     source_status="intraday",
                     reason="intraday_impossible_no",
                     history=["DISCOVERED", "INTRADAY", "RULE_MATCHED"],
+                    priority_token_ids=priority_token_ids,
+                    priority=self._trade_is_priority(
+                        observation_status="intraday",
+                        metric=rule.metric,
+                        previous=prior_extrema.get(str(rule.event_group_id)),
+                        market_bucket=market_bucket,
+                        rounding=rule.rounding,
+                        trade_side="NO",
+                    ),
                 )
                 continue
 
@@ -403,174 +658,97 @@ class WeatherScanner:
                     source_status="provisional",
                     reason="provisional_loser_no",
                     history=["DISCOVERED", "PROVISIONAL", "RULE_MATCHED"],
+                    priority_token_ids=priority_token_ids,
+                    priority=self._trade_is_priority(
+                        observation_status="provisional",
+                        metric=rule.metric,
+                        previous=prior_extrema.get(str(rule.event_group_id)),
+                        market_bucket=market_bucket,
+                        rounding=rule.rounding,
+                        trade_side="NO",
+                    ),
                 )
                 continue
 
+            final_side = "YES" if is_running else "NO"
             self._queue_matched_trade(
                 base,
                 rows,
                 token_ids,
                 market,
                 bucket=running_bucket,
-                trade_side="YES" if is_running else "NO",
+                trade_side=final_side,
                 is_target=is_running,
                 source_status="final",
                 reason=(
                     "source_final_winner_yes" if is_running else "source_final_loser_no"
                 ),
                 history=["DISCOVERED", "WINDOW_CLOSED", "SOURCE_FINAL", "RULE_MATCHED"],
+                priority_token_ids=priority_token_ids,
+                priority=self._trade_is_priority(
+                    observation_status="final",
+                    metric=rule.metric,
+                    previous=prior_extrema.get(str(rule.event_group_id)),
+                    market_bucket=market_bucket,
+                    rounding=rule.rounding,
+                    trade_side=final_side,
+                ),
             )
 
-        if books is None and fetch_books and token_ids:
-            fetched = self.clob_client.fetch_books(sorted(set(token_ids)))
-            books = {token_id: book for token_id, book in fetched.items()}
-        books = books or {}
-
+        display_token_ids: list[str] = []
         for row in rows:
+            status = str((row.get("observation") or {}).get("status") or "")
+            if status not in {"intraday", "provisional", "final"}:
+                continue
             market = market_map.get(str(row.get("market_id")))
-            token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
-            fetched = books.get(token_id) if token_id else None
-            if fetched is not None:
-                row["book"] = _without_raw(self._book(fetched, token_id).to_dict())
-            if row.get("status") != "rule_matched":
+            yes_token = _yes_token(market) if market else ""
+            if not yes_token:
                 continue
-            if self.config.reject_neg_risk and market is not None and market.neg_risk:
-                # Opt-in only. Weather bucket events are negRisk by design;
-                # a source-final winner Yes or loser No is still a single CLOB take.
-                row.update({"status": "no_trade", "reason": "neg_risk_rejected"})
-                continue
-            book = self._book(books.get(token_id), token_id)
-            row["book"] = _without_raw(book.to_dict())
-            if book.book_missing or book.best_ask is None:
-                row.update({"status": "no_trade", "reason": "book_missing"})
-                continue
-            if market is None:
-                row.update({"status": "no_trade", "reason": "market_not_found"})
-                continue
-            if self.config.require_explicit_fee and market.fee_source == "category_default":
-                row.update({"status": "no_trade", "reason": "fee_not_explicit"})
-                continue
-            book_time = parse_time(book.fetched_at)
-            if book_time is None:
-                row.update({"status": "no_trade", "reason": "book_timestamp_missing"})
-                continue
-            book_age = (current.astimezone(timezone.utc) - book_time).total_seconds()
-            if book_age < -1.0 or book_age > float(self.config.book_ttl_s):
-                row.update(
-                    {
-                        "status": "no_trade",
-                        "reason": "book_stale",
-                        "economics": {
-                            "book_age_s": book_age,
-                            "book_ttl_s": float(self.config.book_ttl_s),
-                        },
-                    }
-                )
-                continue
-            best_ask = float(book.best_ask)
-            if best_ask <= 0.0:
-                row.update({"status": "no_trade", "reason": "invalid_ask"})
-                continue
-            if best_ask > self.config.max_ask or best_ask >= 1.0:
-                row.update({"status": "no_trade", "reason": "ask_above_limit"})
-                continue
-            tick = book.tick_size or market.tick_size
-            min_order_size = book.min_order_size or market.min_order_size
-            if self.config.require_market_constraints and (
-                tick is None or tick <= 0 or min_order_size is None or min_order_size <= 0
-            ):
-                row.update({"status": "no_trade", "reason": "market_constraints_missing"})
-                continue
-            target = max(
-                float(self.config.min_order_shares),
-                float(min_order_size or 0.0),
-                min(float(self.config.target_shares), self.config.max_usdc / best_ask),
-            )
-            if target * best_ask > float(self.config.max_usdc) + 1e-12:
-                row.update(
-                    {
-                        "status": "no_trade",
-                        "reason": "max_usdc_below_min_order",
-                        "economics": {
-                            "best_ask": best_ask,
-                            "min_order_size": min_order_size,
-                            "max_usdc": float(self.config.max_usdc),
-                            "tick_size": tick,
-                        },
-                    }
-                )
-                continue
-            execution_limit = min(
-                float(self.config.max_ask),
-                best_ask + max(0.0, float(self.config.max_slippage)),
-            )
-            fill = walk_asks(book, max_price=execution_limit, target_shares=target)
-            if not fill["complete"]:
-                row.update(
-                    {
-                        "status": "no_trade",
-                        "reason": "insufficient_depth_within_slippage",
-                        "economics": {
-                            "best_ask": best_ask,
-                            "execution_limit": execution_limit,
-                            "ask_depth_at_limit": ask_depth(book, max_price=execution_limit),
-                            "target_shares": target,
-                            "filled_shares": fill["filled_shares"],
-                            "tick_size": tick,
-                        },
-                    }
-                )
-                continue
-            execution_price = float(fill["vwap"] or 0.0)
-            fee_rate = market.fee_rate
-            if fee_rate is None:
-                row.update({"status": "no_trade", "reason": "fee_unknown"})
-                continue
-            fee = float(fee_rate) * execution_price * (1.0 - execution_price)
-            gross = 1.0 - execution_price
-            edge = gross - fee
-            row["economics"] = {
-                "best_ask": best_ask,
-                "execution_price": execution_price,
-                "execution_shares": fill["filled_shares"],
-                "worst_price": fill["worst_price"],
-                "slippage": max(0.0, execution_price - best_ask),
-                "fee_rate": float(fee_rate),
-                "fee_source": market.fee_source,
-                "fee_per_share": fee,
-                "gross_edge": gross,
-                "net_edge": edge,
-                "ask_depth_at_limit": ask_depth(book, max_price=execution_limit),
-                "execution_limit": execution_limit,
-                "max_ask": self.config.max_ask,
-                "min_net_edge": self.config.min_net_edge,
-                "tick_size": tick,
-                "min_order_size": min_order_size,
-                "book_age_s": book_age,
-                "trade_side": row.get("trade_side") or "YES",
-            }
-            if edge < self.config.min_net_edge:
-                row.update({"status": "no_trade", "reason": "edge_below_minimum"})
-                continue
-            match_reason = str(row.get("reason") or "")
-            opportunity_reason = (
-                match_reason
-                if match_reason in {"intraday_impossible_no", "provisional_loser_no"}
-                else "dry_run_candidate_only"
-            )
-            history = list((row.get("lifecycle") or {}).get("history") or [])
-            if not history:
-                history = ["DISCOVERED", "RULE_MATCHED"]
-            if history[-1] != "BOOK_READY":
-                history = history + ["BOOK_READY"]
-            row.update(
-                {
-                    "status": "opportunity",
-                    "reason": opportunity_reason,
-                    "dry_run": True,
-                    "lifecycle": {"state": "BOOK_READY", "history": history},
-                }
-            )
+            row["display_token_id"] = yes_token
+            display_token_ids.append(yes_token)
+
+        fetch_priority = _unique_ids(priority_token_ids)
+        fetch_trade = _unique_ids(
+            token_id for token_id in token_ids if str(token_id) not in set(fetch_priority)
+        )
+        fetch_display = _unique_ids(
+            token_id
+            for token_id in display_token_ids
+            if token_id and str(token_id) not in set(fetch_priority) and str(token_id) not in set(fetch_trade)
+        )
+        live_fetch = books is None and fetch_books
+        if live_fetch:
+            books = {}
+
+            def _pull(token_ids_batch: list[str]) -> None:
+                if token_ids_batch:
+                    books.update(self.clob_client.fetch_books(token_ids_batch))
+
+            def _eval_at() -> datetime:
+                return utc_now()
+
+            _pull(fetch_priority)
+            self._evaluate_tokens(rows, books, market_map, _eval_at(), fetch_priority)
+            _pull(fetch_trade)
+            self._evaluate_tokens(rows, books, market_map, _eval_at(), fetch_trade)
+            remaining_matched = [
+                str(row.get("book_token_id") or "")
+                for row in rows
+                if row.get("status") == "rule_matched"
+            ]
+            if remaining_matched:
+                self._evaluate_tokens(rows, books, market_map, _eval_at(), remaining_matched)
+            _pull(fetch_display)
+            for row in rows:
+                self._bind_row_book(row, books)
+        else:
+            books = books or {}
+            eval_at = now if now is not None else utc_now()
+            for row in rows:
+                if row.get("status") == "rule_matched":
+                    self._evaluate_matched_row(row, books, market_map, eval_at)
+                else:
+                    self._bind_row_book(row, books)
 
         event_groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -613,6 +791,19 @@ class WeatherScanner:
                 group_source_status = "intraday"
             else:
                 group_source_status = "provisional"
+            source_series = []
+            for row in group_rows:
+                obs = row.get("observation") or {}
+                points = obs.get("series")
+                if isinstance(points, list) and points:
+                    source_series = points
+                    break
+            for row in group_rows:
+                obs = row.get("observation")
+                if isinstance(obs, dict) and "series" in obs:
+                    cleaned = dict(obs)
+                    cleaned.pop("series", None)
+                    row["observation"] = cleaned
             group_views.append(
                 {
                     "event_group_id": event_group_id,
@@ -621,6 +812,7 @@ class WeatherScanner:
                     "unit": (observations[0] if observations else {}).get("unit", ""),
                     "metric": (observations[0] if observations else {}).get("aggregation", ""),
                     "source_status": group_source_status,
+                    "source_series": source_series,
                     "bucket_match_consistent": bucket_match_consistent,
                     "matched_bucket": (
                         (target_rows[0].get("matched_bucket") if target_rows else None)
@@ -685,6 +877,9 @@ class WeatherScanner:
             "waiting": sum(1 for row in rows if row.get("status") == "waiting"),
             "review": sum(1 for row in rows if row.get("status") == "review"),
             "no_trade": sum(1 for row in rows if row.get("status") == "no_trade"),
+            "book_fetch_priority": len(fetch_priority),
+            "book_fetch_trade": len(fetch_trade),
+            "book_fetch_display": len(fetch_display),
             "dry_run": True,
             "live_orders_submitted": 0,
         }

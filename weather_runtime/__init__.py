@@ -1,8 +1,8 @@
 """Standalone Polymarket weather finality POC.
 
-The package is intentionally read-only: it discovers markets, reads source
-observations and CLOB books, and emits dry-run candidates.  It has no private
-key loading or order submission path.
+Default is read-only. When ``LIVE_ORDERS=true``, each scan auto-submits a
+FAK buy for newly locked No opportunities, capped by ``MAX_ORDER_USDC``
+and de-duplicated by token id.
 """
 
 __version__ = "0.1.0"

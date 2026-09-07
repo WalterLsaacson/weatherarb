@@ -6,8 +6,10 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from unittest.mock import patch
 
 from weather_runtime.markets import (
+    GammaError,
     catalog_event_groups,
     filter_events_in_horizon,
     flatten_event_markets,
@@ -15,6 +17,7 @@ from weather_runtime.markets import (
     load_market_rows,
     merge_event_groups,
     observation_in_horizon,
+    snapshot_payload,
     weather_markets,
 )
 from weather_runtime.discovery import discover_rules
@@ -35,7 +38,7 @@ from weather_runtime.rules import (
 )
 from weather_runtime.scanner import WeatherScanner, WeatherScannerConfig
 from weather_runtime.service import RuntimeService, slim_board_groups
-from weather_runtime.sources import WeatherSourceAdapter
+from weather_runtime.sources import SourceError, WeatherSourceAdapter
 from weather_runtime.storage import append_jsonl_dedup, load_json
 
 
@@ -78,6 +81,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 26)
         self.assertTrue(observation.evidence_hash)
+        self.assertGreaterEqual(len(observation.series), 3)
 
     def test_source_intraday_running_extremum_during_open_window(self) -> None:
         rule = load_rules(FIXTURES / "rules.json")[0]
@@ -108,6 +112,59 @@ class WeatherRuntimeTests(unittest.TestCase):
         during = adapter.poll(rule, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
         self.assertEqual(during.status, "intraday")
         self.assertEqual(adapter.payload_calls, 1)
+
+    def test_synoptic_token_failure_is_cached(self) -> None:
+        class BoomHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_text(self, url, **kwargs):  # noqa: ARG002
+                self.calls += 1
+                raise SourceError("timed out after 8s from {}".format(url))
+
+            def get_json(self, *args, **kwargs):  # noqa: ARG002
+                raise AssertionError("timeseries should not run after token failure")
+
+        http = BoomHttp()
+        adapter = WeatherSourceAdapter(http=http)
+        with self.assertRaises(SourceError):
+            adapter._synoptic_token()
+        with self.assertRaises(SourceError):
+            adapter._synoptic_token()
+        self.assertEqual(http.calls, 1)
+
+    def test_prefetch_fail_caches_stations_not_fetched(self) -> None:
+        class CountingHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                self.calls += 1
+                raise SourceError("timed out after 8s from {}".format(url))
+
+        rule = load_rules(FIXTURES / "rules.json")[0]
+        live = parse_rule(
+            {
+                **rule.to_dict(),
+                "source": {
+                    **dict(rule.source),
+                    "static": None,
+                    "url": "https://example.invalid/weather",
+                    "station_id": "TEST",
+                    "provider": "NOAA",
+                },
+            }
+        )
+        live.source.pop("static", None)
+        http = CountingHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        adapter.prefetch([live], now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc), deadline_s=1.0)
+        first_calls = http.calls
+        self.assertGreaterEqual(first_calls, 1)
+        observation = adapter.poll(live, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
+        self.assertEqual(observation.status, "unavailable")
+        self.assertIn("recently timed out", observation.reason)
+        self.assertEqual(http.calls, first_calls)
 
     def test_source_intraday_ignores_points_after_now(self) -> None:
         raw = {
@@ -220,6 +277,10 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(sum(1 for row in result["rows"] if row.get("book")), 11)
         self.assertTrue(all("raw" not in (row.get("market") or {}) for row in result["rows"]))
         self.assertTrue(all("raw" not in (row.get("observation") or {}) for row in result["rows"]))
+        self.assertTrue(all("series" not in (row.get("observation") or {}) for row in result["rows"]))
+        group = result["event_groups"][0]
+        self.assertGreaterEqual(len(group.get("source_series") or []), 3)
+        self.assertEqual(group["source_series"][0]["temp"], 21)
         candidate = next(row for row in result["rows"] if row["status"] == "opportunity")
         self.assertEqual(candidate["matched_outcome"], "26")
         self.assertEqual(candidate["trade_side"], "YES")
@@ -713,7 +774,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             rules,
             books=books,
             fetch_books=False,
-            now=datetime.now(timezone.utc),
+            now=datetime(2026, 9, 5, 1, tzinfo=timezone.utc),
         )
         target = next(row for row in result["rows"] if row["target_outcome"] == "26")
         self.assertEqual(target["status"], "no_trade")
@@ -748,8 +809,464 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertNotIn("rows", published)
             board = slim_board_groups(result["event_groups"])
             for group in board:
+                self.assertNotIn("source_series", group)
                 for row in group.get("rows") or []:
                     self.assertNotIn("raw", row.get("observation") or {})
+                    self.assertNotIn("asks", row.get("book") or {})
+
+    def test_service_hydrates_board_from_latest_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            (data / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"scanned_at": "2026-09-06T00:00:00+00:00", "event_groups": 1},
+                        "event_groups": [
+                            {
+                                "event_group_id": "hydrated-event",
+                                "status": "waiting",
+                                "rows": [],
+                                "markets": [],
+                            }
+                        ],
+                        "rows": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
+            events = service.events()
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0]["event_group_id"], "hydrated-event")
+            self.assertEqual(service.last_scan_at, "2026-09-06T00:00:00+00:00")
+
+    def test_gamma_timeout_falls_back_to_disk_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            rows = load_market_rows(str(FIXTURES / "markets.json"))
+            (data / "market_snapshot.json").write_text(
+                json.dumps(snapshot_payload(rows)),
+                encoding="utf-8",
+            )
+            (data / "weather_catalog.json").write_text(
+                json.dumps(
+                    {
+                        "event_groups": catalog_event_groups(
+                            [
+                                {
+                                    "slug": "highest-temperature-in-london-on-september-4-2026",
+                                    "title": "Highest temperature in London on September 4?",
+                                    "markets": [{"id": "c", "groupItemTitle": "26"}],
+                                }
+                            ]
+                        )
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = RuntimeService(
+                root=ROOT,
+                data_dir=data,
+                rules_file=FIXTURES / "rules.json",
+                books_file=FIXTURES / "books.json",
+                sync=True,
+                horizon_hours=24.0,
+            )
+            service._horizon_now = lambda: datetime(2026, 9, 5, 1, tzinfo=timezone.utc)  # type: ignore[method-assign]
+            with patch("weather_runtime.service.GammaClient") as client_cls:
+                loaded = service._load_markets()
+                client_cls.assert_not_called()
+            self.assertTrue(loaded)
+            service._catalog_at = 1.0
+            with patch("weather_runtime.service.GammaClient") as client_cls:
+                client_cls.return_value.list_events.side_effect = GammaError(
+                    "network error from gamma: timed out"
+                )
+                loaded = service._load_markets()
+            self.assertTrue(loaded)
+            self.assertIn("timed out", service._gamma_sync_error)
+
+    def test_event_detail_backfills_series_from_source_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            event_id = "highest-temperature-in-zhengzhou-on-september-6-2026"
+            evidence_hash = "313953c9f6a574d1deadbeef"
+            (data / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"scanned_at": "2026-09-06T16:50:21+00:00"},
+                        "event_groups": [
+                            {
+                                "event_group_id": event_id,
+                                "source_status": "final",
+                                "rows": [
+                                    {
+                                        "observation": {
+                                            "status": "final",
+                                            "value": 33,
+                                            "evidence_hash": evidence_hash,
+                                            "station_id": "ZHCC",
+                                        }
+                                    }
+                                ],
+                                "markets": [],
+                            }
+                        ],
+                        "rows": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (data / "source_observations.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event_group_id": event_id,
+                        "evidence_hash": evidence_hash,
+                        "raw": {
+                            "observations": [
+                                {"timestamp": "2026-09-06T00:00:00+00:00", "temp": 22},
+                                {"timestamp": "2026-09-06T06:00:00+00:00", "temp": 19},
+                                {"timestamp": "2026-09-06T10:00:00+00:00", "temp": 33},
+                            ]
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
+            detail = service.event_detail(event_id)
+            self.assertIsNotNone(detail)
+            series = (detail or {}).get("source_series") or []
+            self.assertEqual(len(series), 3)
+            self.assertEqual(series[-1]["temp"], 33)
+
+    def test_event_detail_keeps_empty_source_series(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            event_id = "highest-temperature-in-dallas-on-september-7-2026"
+            (data / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"scanned_at": "2026-09-06T17:34:58+00:00"},
+                        "event_groups": [
+                            {
+                                "event_group_id": event_id,
+                                "source_status": "waiting_window",
+                                "source_series": [],
+                                "rows": [
+                                    {
+                                        "observation": {
+                                            "status": "waiting_window",
+                                            "reason": "observation_window_not_started",
+                                            "station_id": "KDAL",
+                                        },
+                                        "rule": {
+                                            "timezone": "America/Chicago",
+                                            "observation_start": "2026-09-07T00:00:00",
+                                            "observation_end": "2026-09-07T23:59:59",
+                                        },
+                                    }
+                                ],
+                                "markets": [],
+                            }
+                        ],
+                        "rows": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (data / "source_observations.jsonl").write_text(
+                json.dumps(
+                    {
+                        "event_group_id": event_id,
+                        "raw": {
+                            "observations": [
+                                {"timestamp": "2026-09-06T00:00:00+00:00", "temp": 88},
+                                {"timestamp": "2026-09-06T12:00:00+00:00", "temp": 94},
+                            ]
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
+            detail = service.event_detail(event_id)
+            self.assertEqual((detail or {}).get("source_series"), [])
+
+    def test_scan_fetches_yes_books_for_waiting_intraday_buckets(self) -> None:
+        from weather_runtime.models import Book, utc_now
+
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "33",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 33,
+                "upper_inclusive": True,
+            },
+            {"outcome": "34", "lower": 33, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-max-display-books",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[
+                {"value": 28, "timestamp": "2026-09-06T02:00:00Z"},
+                {"value": 33, "timestamp": "2026-09-06T08:00:00Z"},
+            ],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        recorded: list[str] = []
+        calls: list[list[str]] = []
+
+        class FakeClob:
+            def fetch_books(self, token_ids):
+                batch = [str(item) for item in token_ids]
+                calls.append(batch)
+                recorded.extend(batch)
+                stamp = utc_now().isoformat()
+                return {
+                    str(token_id): Book(
+                        token_id=str(token_id),
+                        best_ask=0.01 if str(token_id).endswith("-yes") else 0.99,
+                        asks=[{"price": 0.01 if str(token_id).endswith("-yes") else 0.99, "size": 10}],
+                        tick_size=0.001,
+                        min_order_size=1,
+                        fetched_at=stamp,
+                    )
+                    for token_id in token_ids
+                }
+
+        result = WeatherScanner(
+            config=WeatherScannerConfig(),
+            clob_client=FakeClob(),
+        ).scan(markets, rules, fetch_books=True, now=now)
+        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        waiting_yes = next(item.yes_token_id for item in markets if item.outcome == "33")
+        impossible_no = next(item.no_token_id for item in markets if item.outcome == "30")
+        self.assertTrue(calls)
+        self.assertIn(impossible_no, calls[0])
+        self.assertNotIn(waiting_yes, calls[0])
+        self.assertIn(waiting_yes, recorded)
+        self.assertIn(impossible_no, recorded)
+        self.assertTrue(any(waiting_yes in batch for batch in calls[1:]))
+        self.assertEqual(by_outcome["30"]["status"], "opportunity")
+        self.assertEqual(by_outcome["30"]["trade_side"], "NO")
+        self.assertEqual((by_outcome["33"].get("book") or {}).get("best_ask"), 0.01)
+        self.assertEqual((by_outcome["33"].get("book") or {}).get("asks")[0]["size"], 10)
+        group = result["event_groups"][0]
+        waiting_view = next(item for item in group["markets"] if item.get("outcome") == "33")
+        self.assertEqual((waiting_view.get("book") or {}).get("best_ask"), 0.01)
+
+    def test_new_extremum_no_tokens_fetched_before_prior_nos(self) -> None:
+        from weather_runtime.models import Book, utc_now
+
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "31",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 31,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "32",
+                "lower": 31,
+                "lower_inclusive": False,
+                "upper": 32,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "33",
+                "lower": 32,
+                "lower_inclusive": False,
+                "upper": 33,
+                "upper_inclusive": True,
+            },
+            {"outcome": "34", "lower": 33, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-max-priority",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[{"value": 33, "timestamp": "2026-09-06T08:00:00Z"}],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        calls: list[list[str]] = []
+
+        class FakeClob:
+            def fetch_books(self, token_ids):
+                calls.append([str(item) for item in token_ids])
+                stamp = utc_now().isoformat()
+                return {
+                    str(token_id): Book(
+                        token_id=str(token_id),
+                        best_ask=0.99,
+                        asks=[{"price": 0.99, "size": 10}],
+                        tick_size=0.001,
+                        min_order_size=1,
+                        fetched_at=stamp,
+                    )
+                    for token_id in token_ids
+                }
+
+        WeatherScanner(config=WeatherScannerConfig(), clob_client=FakeClob()).scan(
+            markets,
+            rules,
+            fetch_books=True,
+            now=now,
+            previous_extrema={
+                "intraday-max-priority": {"value": 31.0, "status": "intraday"}
+            },
+        )
+        no_30 = next(item.no_token_id for item in markets if item.outcome == "30")
+        no_31 = next(item.no_token_id for item in markets if item.outcome == "31")
+        no_32 = next(item.no_token_id for item in markets if item.outcome == "32")
+        waiting_yes = next(item.yes_token_id for item in markets if item.outcome == "33")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertIn(no_31, calls[0])
+        self.assertIn(no_32, calls[0])
+        self.assertNotIn(no_30, calls[0])
+        self.assertNotIn(waiting_yes, calls[0])
+        self.assertTrue(any(no_30 in batch for batch in calls[1:]))
+        self.assertIn(waiting_yes, calls[-1])
+        self.assertNotIn(no_30, calls[-1])
+
+    def test_eval_clock_accepts_books_fetched_after_scan_start(self) -> None:
+        from weather_runtime.models import Book, utc_now
+
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "33",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 33,
+                "upper_inclusive": True,
+            },
+            {"outcome": "34", "lower": 33, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-max-ttl-eval",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[{"value": 33, "timestamp": "2026-09-07T08:00:00Z"}],
+            start="2026-09-07T00:00:00Z",
+            end="2026-09-07T23:59:59Z",
+        )
+
+        class FakeClob:
+            def fetch_books(self, token_ids):
+                stamp = utc_now().isoformat()
+                return {
+                    str(token_id): Book(
+                        token_id=str(token_id),
+                        best_ask=0.99,
+                        asks=[{"price": 0.99, "size": 10}],
+                        tick_size=0.001,
+                        min_order_size=1,
+                        fetched_at=stamp,
+                    )
+                    for token_id in token_ids
+                }
+
+        result = WeatherScanner(
+            config=WeatherScannerConfig(),
+            clob_client=FakeClob(),
+        ).scan(markets, rules, fetch_books=True)
+        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        self.assertEqual(by_outcome["30"]["status"], "opportunity")
+        self.assertNotEqual(by_outcome["30"].get("reason"), "book_stale")
+
+    def test_event_detail_uses_snapshot_books_without_clob(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            event_id = "highest-temperature-in-guangzhou-on-september-7-2026"
+            (data / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "summary": {"scanned_at": "2026-09-06T17:40:24+00:00"},
+                        "event_groups": [
+                            {
+                                "event_group_id": event_id,
+                                "source_status": "intraday",
+                                "markets": [
+                                    {
+                                        "market_id": "4239390",
+                                        "outcome": "29°C or below",
+                                        "status": "waiting",
+                                        "book": {
+                                            "best_ask": 0.001,
+                                            "asks": [{"price": 0.001, "size": 185.98}],
+                                        },
+                                    }
+                                ],
+                                "rows": [],
+                            }
+                        ],
+                        "rows": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
+
+            class BoomClob:
+                def fetch_books(self, token_ids):
+                    raise AssertionError("event detail must not fetch CLOB")
+
+            service.scanner.clob_client = BoomClob()
+            detail = service.event_detail(event_id)
+            book = ((detail or {}).get("markets") or [{}])[0].get("book") or {}
+            self.assertEqual(book.get("best_ask"), 0.001)
+
+    def test_intraday_series_uses_station_local_date(self) -> None:
+        raw = {
+            "market_id": "m-zhcc-local",
+            "event_group_id": "highest-temperature-in-zhengzhou-on-september-7-2026",
+            "source": {
+                "static": {
+                    "features": [
+                        {"value": 21.999999999999996, "timestamp": "2026-09-06T16:00:00Z"},
+                        {"value": 21.999999999999996, "timestamp": "2026-09-06T17:00:00Z"},
+                    ]
+                },
+                "url": "fixture://weather/zhcc-local",
+                "resolution_source": "fixture://weather/zhcc-local",
+                "value_path": "value",
+                "timestamp_path": "timestamp",
+            },
+            "timezone": "Asia/Shanghai",
+            "metric": "daily_max",
+            "observation_start": "2026-09-07T00:00:00",
+            "observation_end": "2026-09-07T23:59:59",
+            "unit": "C",
+            "buckets": [
+                {"outcome": "22 or below", "upper": 22, "upper_inclusive": True},
+                {"outcome": "23 or higher", "lower": 22, "lower_inclusive": False},
+            ],
+        }
+        observation = WeatherSourceAdapter().poll(
+            parse_rule(raw),
+            now=datetime(2026, 9, 6, 17, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "intraday")
+        self.assertEqual(observation.series[0]["local_time"], "2026-09-07 00:00")
+        self.assertEqual(observation.series[1]["local_time"], "2026-09-07 01:00")
+        self.assertEqual(observation.series[0]["timezone"], "Asia/Shanghai")
+        self.assertEqual(observation.series[0]["temp"], 22.0)
 
     def test_jsonl_dedup_keeps_first_key_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -1758,6 +2275,119 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 25)
         self.assertEqual(observation.station_id, "HKO")
+
+    def test_walk_asks_consumes_cheapest_levels_first(self) -> None:
+        from weather_runtime.books import normalize_book, walk_asks
+
+        book = normalize_book(
+            "tok",
+            {
+                "asks": [
+                    {"price": "0.97", "size": "10"},
+                    {"price": "0.94", "size": "3"},
+                    {"price": "0.95", "size": "4"},
+                ],
+                "fetched_at": "2026-09-07T00:00:00+00:00",
+            },
+        )
+        self.assertEqual([level["price"] for level in book.asks], [0.94, 0.95, 0.97])
+        fill = walk_asks(book, max_price=0.96, target_shares=5)
+        self.assertTrue(fill["complete"])
+        self.assertAlmostEqual(fill["filled_shares"], 5)
+        self.assertAlmostEqual(fill["worst_price"], 0.95)
+        self.assertAlmostEqual(fill["cost"], 3 * 0.94 + 2 * 0.95)
+
+    def test_quantize_buy_makes_two_decimal_usdc(self) -> None:
+        from decimal import Decimal
+
+        from weather_runtime.orders import quantize_buy
+
+        price, size = quantize_buy(0.58, 8.620689655172415, 5.0)
+        maker = Decimal(str(price)) * Decimal(str(size))
+        self.assertLessEqual(maker, Decimal("5.0"))
+        self.assertEqual(maker, maker.quantize(Decimal("0.01")))
+
+    def test_live_take_skips_already_filled_token(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            (data / "orders.jsonl").write_text(
+                json.dumps(
+                    {
+                        "dry_run": False,
+                        "status": "matched",
+                        "token_id": "already-filled",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=False)
+            self.assertIn("already-filled", service._taken_tokens)
+            service.last_result = {
+                "summary": {},
+                "rows": [
+                    {
+                        "event_group_id": "lowest-temperature-in-test-on-september-7-2026",
+                        "target_outcome": "58-59°F",
+                        "trade_side": "NO",
+                        "status": "opportunity",
+                        "book_token_id": "already-filled",
+                        "market": {"id": "m1"},
+                    }
+                ],
+            }
+            with patch("weather_runtime.orders.submit_fak_buy") as submit:
+                result = service.take_opportunity(
+                    event_group_id="lowest-temperature-in-test-on-september-7-2026",
+                    target_outcome="58-59°F",
+                    live=True,
+                )
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "already_taken")
+            submit.assert_not_called()
+
+    def test_auto_take_is_disabled_on_fixture_even_if_live_env(self) -> None:
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(
+                root=ROOT,
+                fixture=FIXTURES,
+                data_dir=Path(temp) / "data",
+                interval_s=60,
+            )
+            with patch.dict("os.environ", {"LIVE_ORDERS": "true"}, clear=False):
+                with patch("weather_runtime.orders.submit_fak_buy") as submit:
+                    service.scan_once()
+            submit.assert_not_called()
+
+    def test_auto_take_submits_new_locked_token_once(self) -> None:
+        from unittest.mock import patch
+
+        row = {
+            "event_group_id": "lowest-temperature-in-austin-on-september-7-2026",
+            "target_outcome": "74-75°F",
+            "trade_side": "NO",
+            "status": "opportunity",
+            "reason": "intraday_impossible_no",
+            "book_token_id": "new-token",
+            "market_id": "m-aus",
+            "market": {"id": "m-aus", "market_id": "m-aus"},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service.last_result = {"summary": {}, "rows": [row, dict(row)]}
+            with patch.dict("os.environ", {"LIVE_ORDERS": "true", "MAX_ORDER_USDC": "5"}, clear=False):
+                with patch.object(service, "take_opportunity", return_value={"ok": True}) as take:
+                    takes = service._auto_take_opportunities(service.last_result)
+            self.assertEqual(len(takes), 1)
+            take.assert_called_once()
+            kwargs = take.call_args.kwargs
+            self.assertTrue(kwargs["live"])
+            self.assertEqual(kwargs["target_outcome"], "74-75°F")
 
 
 if __name__ == "__main__":

@@ -38,6 +38,16 @@
 
     <main class="page">
       <section class="kpis" id="kpis"></section>
+      <section class="panel candidates-panel">
+        <div class="section-head">
+          <div>
+            <h2>Dry-run 候选</h2>
+            <p class="muted">只展示通过 source、规则、生命周期、盘口和经济门的候选，不会下单。</p>
+          </div>
+          <span class="count" id="candidateCount">0</span>
+        </div>
+        <div id="candidates" class="candidate-grid"></div>
+      </section>
       <section class="toolbar panel">
         <div>
           <h2>事件匹配总览</h2>
@@ -73,16 +83,6 @@
             <tr><td colspan="8" class="empty">等待扫描快照…</td></tr>
           </tbody>
         </table>
-      </section>
-      <section class="panel candidates-panel">
-        <div class="section-head">
-          <div>
-            <h2>Dry-run 候选</h2>
-            <p class="muted">只展示通过 source、规则、生命周期、盘口和经济门的候选，不会下单。</p>
-          </div>
-          <span class="count" id="candidateCount">0</span>
-        </div>
-        <div id="candidates" class="candidate-grid"></div>
       </section>
     </main>
 

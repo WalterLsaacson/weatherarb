@@ -304,6 +304,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     global SERVICE, PUBLIC, SRC
+    from .env import load_dotenv, trading_config
+
+    load_dotenv()
     args = build_parser().parse_args(argv)
     root = args.root.resolve()
     PUBLIC = root / "weather_board" / "public"
@@ -311,12 +314,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     data_dir = args.data_dir.resolve() if args.data_dir else root / "data" / "pm-weather"
     from .scanner import WeatherScannerConfig
 
+    trading = trading_config()
     config = WeatherScannerConfig(
         max_ask=args.max_ask,
         max_slippage=args.max_slippage,
         min_net_edge=args.min_net_edge,
         require_explicit_fee=not args.allow_category_fee,
+        max_usdc=float(trading["max_order_usdc"]),
+        target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
     )
+    live = bool(trading["live_orders"])
     SERVICE = RuntimeService(
         root=root,
         data_dir=data_dir,
@@ -326,7 +333,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         fixture=args.fixture.resolve() if args.fixture else None,
         proxy=args.proxy,
         interval_s=args.interval,
-        dry_run=True,
+        dry_run=not live,
         sync=args.sync,
         scanner_config=config,
         horizon_hours=args.horizon_hours,
@@ -337,7 +344,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         SERVICE.start()
     print("Weather Board → http://{}:{}/".format(args.host, args.port), flush=True)
     print("Data directory → {}".format(SERVICE.data_dir), flush=True)
-    print("Mode → dry-run/read-only", flush=True)
+    if live:
+        print(
+            "Mode → LIVE auto-take · max {} USDC · taken {}".format(
+                trading["max_order_usdc"],
+                len(SERVICE._taken_tokens),
+            ),
+            flush=True,
+        )
+    else:
+        print("Mode → dry-run/read-only", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
