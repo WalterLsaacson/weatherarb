@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="weather-module" content="weather-candidates" />
+    <title>Weather Candidates</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=Sora:wght@600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+    <header class="top">
+      <div class="brand">
+        <span class="brand__mark">WX</span>
+        <div>
+          <h1>Candidate Desk</h1>
+          <p>只展示通过 source、规则、生命周期、盘口和经济门的候选 · 默认 dry-run</p>
+        </div>
+      </div>
+      <div class="actions">
+        <nav class="site-nav" aria-label="页面">
+          <a href="/">总览</a>
+          <a href="/candidates" aria-current="page">候选台</a>
+        </nav>
+        <label class="toggle"><input id="autoRefresh" type="checkbox" checked /> SSE 实时</label>
+      </div>
+    </header>
+
+    <section class="meta">
+      <div class="pill" id="pillConnection">连接中</div>
+      <div class="pill pill--muted" id="pillMode">DRY-RUN</div>
+      <div class="pill pill--muted" id="pillScan">最近扫描 —</div>
+      <div class="pill pill--muted" id="pillCount">候选 0</div>
+    </section>
+
+    <main class="page">
+      <section class="kpis" id="kpis"></section>
+      <section class="toolbar panel">
+        <div>
+          <h2>当前候选</h2>
+          <p class="muted">按净边际排序。点一行看完整证据、费用拆解和盘口，不必翻 JSON。</p>
+        </div>
+        <div class="filters">
+          <input id="search" type="search" placeholder="站点、城市、桶、原因…" />
+          <select id="sideFilter">
+            <option value="">全部方向</option>
+            <option value="NO">只看 No</option>
+            <option value="YES">只看 Yes</option>
+          </select>
+          <select id="reasonFilter">
+            <option value="">全部原因</option>
+            <option value="intraday_impossible_no">盘中已死 No</option>
+            <option value="provisional_loser_no">暂定输家 No</option>
+            <option value="source_final_loser_no">源已终局 No</option>
+            <option value="dry_run_candidate_only">匹配 Yes</option>
+          </select>
+        </div>
+      </section>
+      <section class="panel table-wrap">
+        <table class="desk-table">
+          <thead>
+            <tr>
+              <th>站点 / 事件</th>
+              <th>日期 · 指标</th>
+              <th>桶 / 方向</th>
+              <th>原因</th>
+              <th>盘中</th>
+              <th>VWAP</th>
+              <th>净边际</th>
+              <th>深度</th>
+              <th>盘口</th>
+            </tr>
+          </thead>
+          <tbody id="candidateRows">
+            <tr><td colspan="9" class="empty">等待候选快照…</td></tr>
+          </tbody>
+        </table>
+      </section>
+    </main>
+
+    <aside id="detail" class="drawer" aria-hidden="true">
+      <div class="drawer__head">
+        <div><span class="eyebrow">CANDIDATE</span><h2 id="detailTitle">—</h2></div>
+        <button id="btnCloseDetail" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <div id="detailBody" class="drawer__body"></div>
+    </aside>
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/src/candidates.js" type="module"></script>
+  </body>
+</html>

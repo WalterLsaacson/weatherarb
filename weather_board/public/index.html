@@ -21,10 +21,14 @@
         </div>
       </div>
       <div class="actions">
+        <nav class="site-nav" aria-label="页面">
+          <a href="/" aria-current="page">总览</a>
+          <a href="/candidates">候选台</a>
+        </nav>
         <label class="toggle"><input id="autoRefresh" type="checkbox" checked /> SSE 实时</label>
         <button id="btnScan" class="btn btn--ghost" type="button">立即扫描</button>
-        <button id="btnStart" class="btn btn--primary" type="button">启动轮询</button>
-        <button id="btnStop" class="btn btn--danger" type="button" disabled>停止</button>
+        <button id="btnStart" class="btn btn--primary" type="button" disabled>启动轮询</button>
+        <button id="btnStop" class="btn btn--danger" type="button">停止</button>
       </div>
     </header>
 
@@ -42,7 +46,7 @@
         <div class="section-head">
           <div>
             <h2>Dry-run 候选</h2>
-            <p class="muted">只展示通过 source、规则、生命周期、盘口和经济门的候选，不会下单。</p>
+            <p class="muted">通过全部门的机会。完整表格在 <a href="/candidates">候选台</a>。</p>
           </div>
           <span class="count" id="candidateCount">0</span>
         </div>

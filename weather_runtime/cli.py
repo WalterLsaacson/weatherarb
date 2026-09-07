@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Standalone weather finality POC")
+    parser = argparse.ArgumentParser(
+        description="Standalone weather finality POC. No subcommand starts the board UI and scan loop together."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     discover = sub.add_parser("discover", help="discover conservative rules from Gamma metadata")
     discover.add_argument("--markets", type=Path)
@@ -107,11 +110,12 @@ def scan_command(args: argparse.Namespace) -> int:
         source_adapter=None,
         clob_client=None,
     )
-    http = JsonHttp(proxy=args.proxy)
-    from .sources import WeatherSourceAdapter
+    from .sources import WeatherSourceAdapter, _WEATHER_HTTP_TIMEOUT_S
     from .books import ClobClient
-    scanner.source_adapter = WeatherSourceAdapter(http=http)
-    scanner.clob_client = ClobClient(http=http)
+    scanner.source_adapter = WeatherSourceAdapter(
+        http=JsonHttp(proxy=args.proxy, timeout=_WEATHER_HTTP_TIMEOUT_S)
+    )
+    scanner.clob_client = ClobClient(http=JsonHttp(proxy=args.proxy))
     result = scanner.scan(
         weather_markets(rows),
         rules,
@@ -147,8 +151,25 @@ def take_command(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def serve_argv(argv: Optional[list[str]]) -> Optional[list[str]]:
+    """Return leftover argv for the combined board+scanner, or None for one-shot commands."""
+
+    raw = list(argv or [])
+    if not raw or raw[0] not in {"discover", "scan", "take"}:
+        if raw and raw[0] == "serve":
+            return raw[1:]
+        return raw
+    return None
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    rest = serve_argv(raw)
+    if rest is not None:
+        from .server import main as serve_main
+
+        return serve_main(rest)
+    args = build_parser().parse_args(raw)
     if args.command == "discover":
         return discover_command(args)
     if args.command == "scan":

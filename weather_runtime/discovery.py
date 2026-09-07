@@ -61,6 +61,37 @@ def _source_contract(market: WeatherMarket) -> dict[str, Any]:
     return {}
 
 
+_HOURLY_DATA_RE = re.compile(
+    r"show\s+hourly\s+data|hourly\s+data\s+provided",
+    re.I,
+)
+_NWS_FAA_TIMEZONES = {"Pacific/Honolulu", "America/Anchorage"}
+
+
+def sample_set_from_description(*texts: str) -> str:
+    blob = " ".join(str(item or "") for item in texts)
+    if _HOURLY_DATA_RE.search(blob):
+        return "hourly"
+    return "all"
+
+
+def hourly_window_for_timezone(timezone_name: str) -> str:
+    name = str(timezone_name or "").strip()
+    if name.startswith("America/") or name in _NWS_FAA_TIMEZONES:
+        return "nws_faa"
+    return "other"
+
+
+def wrh_hourly_page_url(url: str) -> str:
+    """Same WRH timeseries page with Show Hourly Data turned on (hourly=true)."""
+    page = str(url or "").strip()
+    if not page:
+        return page
+    if re.search(r"(?:^|[?&])hourly=", page, re.I):
+        return page
+    return page + ("&" if "?" in page else "?") + "hourly=true"
+
+
 def _unit_from_outcomes(outcomes: Iterable[str], description: str = "") -> str:
     labels = " ".join(str(item or "") for item in outcomes)
     if re.search(r"°\s*F", labels, re.I):
@@ -111,6 +142,10 @@ def _noaa_template_reasons(first: WeatherMarket, group: list[WeatherMarket]) -> 
     if local_date and timezone_name and station:
         start = "{}T00:00:00".format(local_date)
         end = "{}T23:59:59".format(local_date)
+        description = " ".join(
+            str(market.raw.get("description") or "") for market in ([first] + list(group))
+        )
+        sample_set = sample_set_from_description(description)
         source = {
             "provider": "NOAA",
             "station_id": station,
@@ -128,7 +163,10 @@ def _noaa_template_reasons(first: WeatherMarket, group: list[WeatherMarket]) -> 
             "timestamp_path": "timestamp",
             "value_unit": "C",
             "finality_mode": "first_following_date_point",
+            "sample_set": sample_set,
         }
+        if sample_set == "hourly":
+            source["hourly_window"] = hourly_window_for_timezone(timezone_name)
     contract = {
         "metric": metric,
         "unit": unit,

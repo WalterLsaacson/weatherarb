@@ -151,6 +151,10 @@ async function init() {
   try {
     await reload();
     connectStream();
+    const eventId = new URLSearchParams(location.search).get("event");
+    if (eventId) {
+      window.dispatchEvent(new CustomEvent("weather:select", { detail: eventId }));
+    }
   } catch (error) {
     $("eventRows").innerHTML = `<tr><td colspan="8" class="empty">连接失败：${escapeHtml(error.message)}</td></tr>`;
     toast(error.message, true);

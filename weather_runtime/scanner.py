@@ -430,7 +430,7 @@ class WeatherScanner:
         prior_extrema = previous_extrema if isinstance(previous_extrema, dict) else {}
         source_cache: dict[str, Any] = {}
         source_evidence: dict[str, dict[str, Any]] = {}
-        self.source_adapter.prefetch(rule_list, now=current)
+        self.source_adapter.prefetch(rule_list, now=current, deadline_s=45.0)
 
         for rule in rule_list:
             market = market_map.get(rule.market_id)

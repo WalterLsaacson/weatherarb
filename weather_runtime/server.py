@@ -6,6 +6,8 @@ import argparse
 import json
 import mimetypes
 import sys
+import threading
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Optional
@@ -126,6 +128,13 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if path in {"/", "/index.html"}:
             file_path = PUBLIC / "index.html"
+            if file_path.is_file():
+                serve_file(self, file_path)
+            else:
+                self.send_error(404)
+            return
+        if path in {"/candidates", "/candidates.html"}:
+            file_path = PUBLIC / "candidates.html"
             if file_path.is_file():
                 serve_file(self, file_path)
             else:
@@ -282,13 +291,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--books", type=Path, default=None)
     parser.add_argument("--fixture", type=Path, default=None)
     parser.add_argument("--proxy", default=None)
-    parser.add_argument("--interval", type=float, default=60.0)
+    parser.add_argument("--interval", type=float, default=30.0)
     parser.add_argument(
         "--sync",
         action="store_true",
         help="paginate Gamma /events?tag_slug=weather and merge the catalog onto the board",
     )
+    parser.add_argument(
+        "--no-sync",
+        action="store_true",
+        help="do not call Gamma; scan only local snapshots/rules",
+    )
     parser.add_argument("--no-auto-start", action="store_true")
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="do not open the board in a browser",
+    )
     parser.add_argument("--min-net-edge", type=float, default=0.0075)
     parser.add_argument("--max-ask", type=float, default=0.995)
     parser.add_argument("--max-slippage", type=float, default=0.003)
@@ -302,6 +321,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolved_service_options(args: argparse.Namespace, *, root: Path) -> dict[str, Any]:
+    """Pick scanner+board defaults so one process serves the UI and the scan loop."""
+
+    fixture = args.fixture.resolve() if args.fixture else None
+    if args.no_sync and args.sync:
+        raise SystemExit("choose --sync or --no-sync, not both")
+    if args.no_sync:
+        sync = False
+    elif args.sync:
+        sync = True
+    else:
+        sync = fixture is None
+    data_dir = args.data_dir.resolve() if args.data_dir else root / "data" / "pm-weather-live"
+    return {
+        "data_dir": data_dir,
+        "fixture": fixture,
+        "sync": sync,
+        "markets": args.markets.resolve() if args.markets else None,
+        "rules": args.rules.resolve() if args.rules else None,
+        "books": args.books.resolve() if args.books else None,
+    }
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     global SERVICE, PUBLIC, SRC
     from .env import load_dotenv, trading_config
@@ -311,7 +353,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     root = args.root.resolve()
     PUBLIC = root / "weather_board" / "public"
     SRC = root / "weather_board" / "src"
-    data_dir = args.data_dir.resolve() if args.data_dir else root / "data" / "pm-weather"
+    options = resolved_service_options(args, root=root)
     from .scanner import WeatherScannerConfig
 
     trading = trading_config()
@@ -326,15 +368,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     live = bool(trading["live_orders"])
     SERVICE = RuntimeService(
         root=root,
-        data_dir=data_dir,
-        markets_file=args.markets.resolve() if args.markets else None,
-        rules_file=args.rules.resolve() if args.rules else None,
-        books_file=args.books.resolve() if args.books else None,
-        fixture=args.fixture.resolve() if args.fixture else None,
+        data_dir=options["data_dir"],
+        markets_file=options["markets"],
+        rules_file=options["rules"],
+        books_file=options["books"],
+        fixture=options["fixture"],
         proxy=args.proxy,
         interval_s=args.interval,
         dry_run=not live,
-        sync=args.sync,
+        sync=options["sync"],
         scanner_config=config,
         horizon_hours=args.horizon_hours,
     )
@@ -342,8 +384,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     server.daemon_threads = True
     if not args.no_auto_start:
         SERVICE.start()
-    print("Weather Board → http://{}:{}/".format(args.host, args.port), flush=True)
+    board_url = "http://{}:{}/".format(args.host, args.port)
+    print("Weather scanner + board → {}".format(board_url), flush=True)
     print("Data directory → {}".format(SERVICE.data_dir), flush=True)
+    print(
+        "Scan loop → every {}s · Gamma sync {} · auto-start {}".format(
+            args.interval,
+            "on" if options["sync"] else "off",
+            "on" if not args.no_auto_start else "off",
+        ),
+        flush=True,
+    )
     if live:
         print(
             "Mode → LIVE auto-take · max {} USDC · taken {}".format(
@@ -354,6 +405,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     else:
         print("Mode → dry-run/read-only", flush=True)
+    if not args.no_open:
+        threading.Timer(0.3, lambda: webbrowser.open(board_url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

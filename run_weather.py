@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the standalone Polymarket weather board and scanner."""
+"""Start the weather board UI and background scanner in one process."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parent
 
 
 def main() -> int:
-    # Keep module-relative imports working when launched from any directory.
     sys.path.insert(0, str(ROOT))
     try:
         runpy.run_module("weather_runtime.server", run_name="__main__")
@@ -23,4 +22,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

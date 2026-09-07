@@ -29,10 +29,79 @@ _SYNOPTIC_TOKEN_RE = re.compile(r"mesoToken\s*=\s*['\"]([^'\"]+)['\"]")
 _SYNOPTIC_TOKEN_TTL_S = 3600.0
 _SYNOPTIC_PAGE_UNITS = "temp|F,speed|mph,english"
 _SYNOPTIC_PAGE_RECENT_MINUTES = 72 * 60
+_SYNOPTIC_VARS = "air_temp,sea_level_pressure,metar"
+_WEATHER_HTTP_TIMEOUT_S = 20.0
+_WU_POST_CLOSE_REFRESH_HOURS = 3.0
+_WU_POST_CLOSE_CACHE_S = 15.0
 _SYNOPTIC_PAGE_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+
+def sample_set_of(rule: WeatherRule) -> str:
+    raw = str(rule.source.get("sample_set") or "all").strip().lower()
+    return "hourly" if raw == "hourly" else "all"
+
+
+def hourly_window_of(rule: WeatherRule) -> str:
+    raw = str(rule.source.get("hourly_window") or "").strip().lower()
+    if raw in {"nws_faa", "other"}:
+        return raw
+    name = str(rule.timezone or "").strip()
+    if name.startswith("America/") or name in {"Pacific/Honolulu", "America/Anchorage"}:
+        return "nws_faa"
+    return "other"
+
+
+def hourly_minute_counts(minute: int, window: str) -> bool:
+    value = int(minute)
+    if window == "other":
+        return value >= 56 or value <= 4
+    return 51 <= value <= 59
+
+
+def _asos_network(value: Any) -> str:
+    name = str(value or "").strip().upper().replace("_", "/")
+    if name == "GLOBAL-METAR":
+        return "ASOS/AWOS"
+    return name
+
+
+def wrh_show_hourly_counts(
+    *,
+    stamp: datetime,
+    row: dict[str, Any],
+    zone: Any,
+    window: str,
+    station_id: str,
+) -> bool:
+    """Client-side filter used by weather.gov after Show Hourly Data.
+
+    The timeseries page still loads the same Synoptic URL; hourly=true only
+    changes which rows are rendered (obs.js). ASOS/AWOS keeps official METAR
+    rows that have sea-level pressure, plus SPECI whose METAR starts with the
+    station id. Other networks keep minutes 56-04; non-fed ASOS without SLP
+    keeps minutes 51-59.
+    """
+    network = _asos_network(row.get("network"))
+    has_slp_field = "slp" in row or "sea_level_pressure" in row
+    has_metar_field = "metar" in row
+    slp = row.get("slp", row.get("sea_level_pressure"))
+    metar = str(row.get("metar") or "").strip()
+    site = str(station_id or "").strip().upper()
+    if network == "ASOS/AWOS" or has_slp_field or has_metar_field:
+        if has_slp_field:
+            if slp not in {None, ""}:
+                return True
+            return bool(metar and site and metar.upper().startswith(site))
+        if network != "ASOS/AWOS":
+            local = stamp.astimezone(zone)
+            return hourly_minute_counts(local.minute, window)
+        local = stamp.astimezone(zone)
+        return hourly_minute_counts(local.minute, "nws_faa")
+    local = stamp.astimezone(zone)
+    return hourly_minute_counts(local.minute, window)
 
 
 def json_path(value: Any, path: str) -> Any:
@@ -240,7 +309,12 @@ def series_from_raw(payload: Any) -> list[dict[str, Any]]:
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            timestamp = row.get("timestamp") or row.get("date_time") or row.get("validTime")
+            timestamp = (
+                row.get("timestamp")
+                or row.get("date_time")
+                or row.get("validTime")
+                or row.get("valid_time_gmt")
+            )
             temp = row.get("temp")
             if temp is None:
                 temp = row.get("value")
@@ -256,7 +330,8 @@ def series_from_raw(payload: Any) -> list[dict[str, Any]]:
             number = _number(temp)
             if timestamp in {None, ""} or number is None:
                 continue
-            points.append({"timestamp": str(timestamp), "temp": number})
+            parsed = parse_time(timestamp)
+            points.append({"timestamp": parsed.isoformat() if parsed else str(timestamp), "temp": number})
         if points:
             return points
     features = payload.get("features")
@@ -302,7 +377,7 @@ class WeatherSourceAdapter:
     """Poll one approved rule and return immutable source evidence."""
 
     def __init__(self, *, http: Optional[JsonHttp] = None, http_cache_ttl_s: float = 60.0):
-        self.http = http or JsonHttp()
+        self.http = http or JsonHttp(timeout=_WEATHER_HTTP_TIMEOUT_S)
         self.http_cache_ttl_s = max(0.0, float(http_cache_ttl_s))
         self._http_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._http_fail: dict[tuple[str, str], float] = {}
@@ -328,6 +403,26 @@ class WeatherSourceAdapter:
     def _cache_key(self, url: str, params: dict[str, Any]) -> tuple[str, str]:
         return (url, json.dumps(params or {}, sort_keys=True, default=str))
 
+    def _is_wunderground(self, rule: WeatherRule) -> bool:
+        source = rule.source
+        provider = str(source.get("provider") or "").lower()
+        url = str(source.get("url") or source.get("resolution_source") or "")
+        return provider == "wunderground" or "api.weather.com" in url or "wunderground.com" in url
+
+    def _cache_ttl_s(self, rule: WeatherRule, current_utc: datetime) -> float:
+        """WU often inserts :30 METARs after local midnight; do not keep a stale hour."""
+
+        if not self.http_cache_ttl_s:
+            return 0.0
+        if not self._is_wunderground(rule):
+            return self.http_cache_ttl_s
+        end = self._parse(rule, rule.observation_end)
+        if end is None or current_utc < end:
+            return self.http_cache_ttl_s
+        if current_utc > end + timedelta(hours=_WU_POST_CLOSE_REFRESH_HOURS):
+            return self.http_cache_ttl_s
+        return min(self.http_cache_ttl_s, _WU_POST_CLOSE_CACHE_S)
+
     def _request_parts(self, rule: WeatherRule) -> tuple[str, dict[str, Any], Optional[dict[str, str]]]:
         source = rule.source
         url = str(source.get("url") or "").strip()
@@ -347,6 +442,7 @@ class WeatherSourceAdapter:
             params["units"] = _SYNOPTIC_PAGE_UNITS
             params["recent"] = _SYNOPTIC_PAGE_RECENT_MINUTES
             params["complete"] = 1
+            params["vars"] = _SYNOPTIC_VARS
             params["obtimezone"] = "local"
             params.pop("start", None)
             params.pop("end", None)
@@ -358,18 +454,20 @@ class WeatherSourceAdapter:
             headers.update(self._synoptic_headers(source, params))
         return url, params, headers or None
 
-    def _payload(self, rule: WeatherRule) -> tuple[Any, str]:
+    def _payload(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> tuple[Any, str]:
         source = rule.source
         if isinstance(source.get("static"), dict):
             payload = self._normalize_payload(rule, source["static"])
             return payload, str(source.get("url") or source.get("resolution_source") or "static://weather")
         url, params, headers = self._request_parts(rule)
         cache_key = self._cache_key(url, params)
+        current_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cache_ttl_s = self._cache_ttl_s(rule, current_utc)
         if self.http_cache_ttl_s:
             with self._http_lock:
                 hit = self._http_cache.get(cache_key)
                 failed_at = self._http_fail.get(cache_key)
-            if hit and (time.time() - hit[0]) < self.http_cache_ttl_s:
+            if hit and cache_ttl_s and (time.time() - hit[0]) < cache_ttl_s:
                 return hit[1], url
             if failed_at and (time.time() - failed_at) < 30.0:
                 raise SourceError("source recently timed out")
@@ -408,7 +506,8 @@ class WeatherSourceAdapter:
                     continue
             url = str(rule.source.get("url") or "")
             station = str(rule.source.get("station_id") or "")
-            key = (url, station)
+            params = dict(rule.source.get("params") or {}) if isinstance(rule.source.get("params"), dict) else {}
+            key = (url, station, json.dumps(params, sort_keys=True, default=str))
             if not url or key in seen:
                 continue
             seen.add(key)
@@ -429,7 +528,7 @@ class WeatherSourceAdapter:
                 if time.time() > deadline:
                     return
                 try:
-                    self._payload(item)
+                    self._payload(item, now=current)
                 except Exception:
                     return
 
@@ -442,17 +541,8 @@ class WeatherSourceAdapter:
         for worker in workers:
             remain = deadline - time.time()
             worker.join(timeout=max(0.05, remain))
-        # Do not let the serial poll loop spend 8s on every station prefetch missed.
-        now_ts = time.time()
-        for rule in unique:
-            try:
-                url, params, _headers = self._request_parts(rule)
-            except SourceError:
-                continue
-            key = self._cache_key(url, params)
-            with self._http_lock:
-                if key not in self._http_cache:
-                    self._http_fail.setdefault(key, now_ts)
+        # Stations the budget never reached stay uncached so poll() can still
+        # try them. Only real _payload failures enter _http_fail.
 
     def poll(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> ObservationEvidence:
         current = now or datetime.now(timezone.utc)
@@ -489,7 +579,7 @@ class WeatherSourceAdapter:
                     reason="observation_window_expired",
                 )
         try:
-            payload, url = self._payload(rule)
+            payload, url = self._payload(rule, now=current)
         except SourceError as exc:
             return ObservationEvidence(
                 status="unavailable",
@@ -606,7 +696,12 @@ class WeatherSourceAdapter:
             if not isinstance(times, list) or not isinstance(temps, list):
                 continue
             source_unit = _synoptic_air_temp_unit(payload, station)
-            for timestamp_raw, temp_raw in zip(times, temps):
+            slp_series = obs.get("sea_level_pressure_set_1")
+            if not isinstance(slp_series, list):
+                slp_series = obs.get("sea_level_pressure_set_1d")
+            metar_series = obs.get("metar_set_1")
+            network = _asos_network(station.get("SHORTNAME") or station.get("shortname"))
+            for index, (timestamp_raw, temp_raw) in enumerate(zip(times, temps)):
                 if timestamp_raw in {None, ""}:
                     continue
                 number = _number(temp_raw)
@@ -614,7 +709,14 @@ class WeatherSourceAdapter:
                     continue
                 if source_unit == "F":
                     number = _convert(number, "F", "C")
-                observations.append({"timestamp": timestamp_raw, "temp": number})
+                row: dict[str, Any] = {"timestamp": timestamp_raw, "temp": number}
+                if network:
+                    row["network"] = network
+                if isinstance(slp_series, list):
+                    row["slp"] = slp_series[index] if index < len(slp_series) else None
+                if isinstance(metar_series, list):
+                    row["metar"] = metar_series[index] if index < len(metar_series) else None
+                observations.append(row)
         return {"observations": observations}
 
     def _hko_observations(self, payload: Any) -> Any:
@@ -708,13 +810,40 @@ class WeatherSourceAdapter:
             values.append((timestamp, converted, row))
         return values
 
-    def _series_points(
+    def _counts_for_resolution(
+        self, rule: WeatherRule, stamp: datetime, row: dict[str, Any]
+    ) -> bool:
+        if sample_set_of(rule) != "hourly":
+            return True
+        return wrh_show_hourly_counts(
+            stamp=stamp,
+            row=row if isinstance(row, dict) else {},
+            zone=self._zone(rule),
+            window=hourly_window_of(rule),
+            station_id=str(rule.source.get("station_id") or ""),
+        )
+
+    def _resolution_values(
         self, rule: WeatherRule, values: list[tuple[datetime, float, dict[str, Any]]]
+    ) -> list[tuple[datetime, float, dict[str, Any]]]:
+        if sample_set_of(rule) != "hourly":
+            return values
+        return [item for item in values if self._counts_for_resolution(rule, item[0], item[2])]
+
+    def _series_points(
+        self,
+        rule: WeatherRule,
+        values: list[tuple[datetime, float, dict[str, Any]]],
+        resolution_values: Optional[list[tuple[datetime, float, dict[str, Any]]]] = None,
     ) -> list[dict[str, Any]]:
         zone = self._zone(rule)
         zone_name = getattr(zone, "key", None) or str(rule.timezone or "UTC")
+        source_values = values
+        if sample_set_of(rule) == "hourly" and resolution_values is not None:
+            source_values = resolution_values
+        counted = {item[0] for item in source_values}
         points: list[dict[str, Any]] = []
-        for stamp, temp, _row in sorted(values, key=lambda item: item[0]):
+        for stamp, temp, _row in sorted(source_values, key=lambda item: item[0]):
             utc = stamp.astimezone(timezone.utc)
             local = utc.astimezone(zone)
             points.append(
@@ -723,6 +852,7 @@ class WeatherSourceAdapter:
                     "local_time": local.strftime("%Y-%m-%d %H:%M"),
                     "timezone": zone_name,
                     "temp": round(float(temp), 1),
+                    "counts_for_resolution": stamp in counted,
                 }
             )
         return points
@@ -773,14 +903,30 @@ class WeatherSourceAdapter:
                 raw=payload,
                 evidence_hash=evidence_hash,
             )
+        resolution_values = self._resolution_values(rule, values)
+        series = self._series_points(rule, values, resolution_values)
+        if sample_set_of(rule) == "hourly" and not resolution_values:
+            return ObservationEvidence(
+                status="unavailable",
+                observed_at=now_iso(current),
+                source_url=url,
+                provider=str(rule.source.get("provider") or ""),
+                station_id=str(rule.source.get("station_id") or ""),
+                unit=rule.unit,
+                aggregation=rule.metric,
+                reason="hourly_filter_empty",
+                raw=payload,
+                evidence_hash=evidence_hash,
+                series=series,
+            )
         if rule.metric == "daily_max":
-            value = max(item[1] for item in values)
+            value = max(item[1] for item in resolution_values)
         elif rule.metric == "daily_min":
-            value = min(item[1] for item in values)
+            value = min(item[1] for item in resolution_values)
         elif rule.metric == "daily_sum":
-            value = sum(item[1] for item in values)
+            value = sum(item[1] for item in resolution_values)
         else:
-            value = sorted(values, key=lambda item: item[0])[-1][1]
+            value = sorted(resolution_values, key=lambda item: item[0])[-1][1]
         raw_aggregate = float(value)
         settled = apply_rounding(raw_aggregate, rule.rounding or ROUNDING_WHOLE)
         if settled is None:
@@ -796,16 +942,16 @@ class WeatherSourceAdapter:
                 raw=payload,
                 evidence_hash=evidence_hash,
                 raw_aggregate=raw_aggregate,
+                series=series,
             )
         value = settled
-        latest_timestamp = max(item[0] for item in values)
-        series = self._series_points(rule, values)
+        latest_timestamp = max(item[0] for item in resolution_values)
         following = self._following_values(rule, payload)
         final_path = str(rule.source.get("final_path") or "").strip()
         explicit_final = _boolean(json_path(payload, final_path)) if final_path else False
         if not final_path and isinstance(payload, dict):
             explicit_final = _boolean(payload.get("final"))
-        for _, _, row in values:
+        for _, _, row in resolution_values:
             if isinstance(row, dict) and _boolean(row.get("final")):
                 explicit_final = True
         requires_following = bool(

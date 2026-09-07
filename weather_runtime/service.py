@@ -270,6 +270,12 @@ def _slim_row(row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
+def _candidate_view(row: dict[str, Any]) -> dict[str, Any]:
+    item = _slim_row(row)
+    item["lock"] = _lock_snapshot(item)
+    return item
+
+
 def _slim_market_view(row: dict[str, Any]) -> dict[str, Any]:
     item = dict(row)
     book = item.get("book")
@@ -353,10 +359,12 @@ class RuntimeService:
             source_adapter=None,
             clob_client=None,
         )
-        # Keep all source/CLOB calls on the explicitly configured HTTP client.
-        from .sources import WeatherSourceAdapter
+        # Weather Synoptic payloads are large; keep a longer timeout than CLOB/Gamma.
+        from .sources import WeatherSourceAdapter, _WEATHER_HTTP_TIMEOUT_S
 
-        self.scanner.source_adapter = WeatherSourceAdapter(http=self.http)
+        self.scanner.source_adapter = WeatherSourceAdapter(
+            http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S)
+        )
         self.scanner.clob_client = ClobClient(http=self.http)
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -742,7 +750,7 @@ class RuntimeService:
             },
         )
         candidates = [
-            _slim_row(row)
+            _candidate_view(row)
             for row in result.get("rows") or []
             if isinstance(row, dict) and row.get("status") == "opportunity"
         ]
@@ -888,7 +896,7 @@ class RuntimeService:
     def candidates(self, *, limit: int = 200) -> list[dict[str, Any]]:
         with self.lock:
             rows = [
-                _slim_row(row)
+                _candidate_view(row)
                 for row in self.last_result.get("rows") or []
                 if isinstance(row, dict) and row.get("status") == "opportunity"
             ]

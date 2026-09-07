@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,12 @@ from weather_runtime.markets import (
     snapshot_payload,
     weather_markets,
 )
-from weather_runtime.discovery import discover_rules
+from weather_runtime.discovery import (
+    discover_rules,
+    hourly_window_for_timezone,
+    sample_set_from_description,
+    wrh_hourly_page_url,
+)
 from weather_runtime.rules import (
     ROUNDING_NONE,
     RuleError,
@@ -36,9 +42,11 @@ from weather_runtime.rules import (
     validate_buckets,
     validate_event_group_siblings,
 )
+from weather_runtime.cli import serve_argv
 from weather_runtime.scanner import WeatherScanner, WeatherScannerConfig
 from weather_runtime.service import RuntimeService, slim_board_groups
-from weather_runtime.sources import SourceError, WeatherSourceAdapter
+from weather_runtime.server import build_parser as build_board_parser, resolved_service_options
+from weather_runtime.sources import SourceError, WeatherSourceAdapter, series_from_raw
 from weather_runtime.storage import append_jsonl_dedup, load_json
 
 
@@ -53,6 +61,50 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(bucket_for_value(26, rules[0].buckets).outcome, "26")
         self.assertEqual(bucket_for_value(22, rules[0].buckets).outcome, "22 or below")
         self.assertEqual(bucket_for_value(40, rules[0].buckets).outcome, "32 or higher")
+
+    def test_cli_without_subcommand_starts_board_and_scanner(self) -> None:
+        self.assertEqual(serve_argv([]), [])
+        self.assertEqual(serve_argv(["--sync", "--interval", "30"]), ["--sync", "--interval", "30"])
+        self.assertEqual(serve_argv(["serve", "--no-open"]), ["--no-open"])
+        self.assertIsNone(serve_argv(["scan", "--fixture", "fixtures"]))
+        self.assertIsNone(serve_argv(["discover", "--sync"]))
+        self.assertIsNone(serve_argv(["take", "--event", "x"]))
+
+    def test_board_defaults_enable_live_dry_run_scan(self) -> None:
+        root = ROOT
+        live = resolved_service_options(build_board_parser().parse_args([]), root=root)
+        self.assertTrue(live["sync"])
+        self.assertEqual(live["data_dir"], (root / "data" / "pm-weather-live").resolve())
+        self.assertIsNone(live["fixture"])
+        fixture = resolved_service_options(
+            build_board_parser().parse_args(["--fixture", str(FIXTURES)]),
+            root=root,
+        )
+        self.assertFalse(fixture["sync"])
+        self.assertEqual(fixture["fixture"], FIXTURES.resolve())
+        off = resolved_service_options(build_board_parser().parse_args(["--no-sync"]), root=root)
+        self.assertFalse(off["sync"])
+        args = build_board_parser().parse_args([])
+        self.assertEqual(args.interval, 30.0)
+        self.assertFalse(args.no_open)
+        self.assertFalse(args.no_auto_start)
+
+    def test_candidate_desk_page_is_wired(self) -> None:
+        page = ROOT / "weather_board" / "public" / "candidates.html"
+        script = ROOT / "weather_board" / "src" / "candidates.js"
+        self.assertTrue(page.is_file())
+        self.assertTrue(script.is_file())
+        html = page.read_text(encoding="utf-8")
+        self.assertIn("/src/candidates.js", html)
+        self.assertIn("candidateRows", html)
+        self.assertIn("desk-table", html)
+        self.assertIn('href="/candidates"', html)
+        js = script.read_text(encoding="utf-8")
+        self.assertIn("fetchCandidates", js)
+        self.assertIn("net_edge", js)
+        module = json.loads((ROOT / "weather_board" / "module.json").read_text(encoding="utf-8"))
+        self.assertIn("GET /candidates", module["api"]["routes"])
+        self.assertIn("GET /api/candidates", module["api"]["routes"])
 
     def test_bucket_validation_rejects_gap(self) -> None:
         with self.assertRaises(RuleError):
@@ -99,9 +151,9 @@ class WeatherRuntimeTests(unittest.TestCase):
                 super().__init__()
                 self.payload_calls = 0
 
-            def _payload(self, rule):  # type: ignore[override]
+            def _payload(self, rule, **kwargs):  # type: ignore[override]
                 self.payload_calls += 1
-                return super()._payload(rule)
+                return super()._payload(rule, **kwargs)
 
         rule = load_rules(FIXTURES / "rules.json")[0]
         adapter = CountingAdapter()
@@ -133,7 +185,24 @@ class WeatherRuntimeTests(unittest.TestCase):
             adapter._synoptic_token()
         self.assertEqual(http.calls, 1)
 
-    def test_prefetch_fail_caches_stations_not_fetched(self) -> None:
+    def _live_source_rule(self, *, url: str, station_id: str = "TEST"):
+        rule = load_rules(FIXTURES / "rules.json")[0]
+        live = parse_rule(
+            {
+                **rule.to_dict(),
+                "source": {
+                    **dict(rule.source),
+                    "static": None,
+                    "url": url,
+                    "station_id": station_id,
+                    "provider": "NOAA",
+                },
+            }
+        )
+        live.source.pop("static", None)
+        return live
+
+    def test_prefetch_real_timeout_is_cached(self) -> None:
         class CountingHttp:
             def __init__(self) -> None:
                 self.calls = 0
@@ -142,20 +211,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 self.calls += 1
                 raise SourceError("timed out after 8s from {}".format(url))
 
-        rule = load_rules(FIXTURES / "rules.json")[0]
-        live = parse_rule(
-            {
-                **rule.to_dict(),
-                "source": {
-                    **dict(rule.source),
-                    "static": None,
-                    "url": "https://example.invalid/weather",
-                    "station_id": "TEST",
-                    "provider": "NOAA",
-                },
-            }
-        )
-        live.source.pop("static", None)
+        live = self._live_source_rule(url="https://example.invalid/weather")
         http = CountingHttp()
         adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
         adapter.prefetch([live], now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc), deadline_s=1.0)
@@ -165,6 +221,29 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "unavailable")
         self.assertIn("recently timed out", observation.reason)
         self.assertEqual(http.calls, first_calls)
+
+    def test_prefetch_miss_does_not_mark_unfetched_timed_out(self) -> None:
+        class GatedHttp:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+                self.block = threading.Event()
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                self.calls.append(str(url))
+                if "slow" in str(url):
+                    self.block.wait(2.0)
+                    raise SourceError("timed out after 8s from {}".format(url))
+                return {"observations": [{"timestamp": "2026-09-04T12:00:00Z", "value": 26}]}
+
+        slow = self._live_source_rule(url="https://example.invalid/slow", station_id="SLOW")
+        later = self._live_source_rule(url="https://example.invalid/later", station_id="LATER")
+        http = GatedHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        adapter.prefetch([slow, later], now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc), deadline_s=0.05)
+        http.block.set()
+        observation = adapter.poll(later, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
+        self.assertNotIn("recently timed out", observation.reason)
+        self.assertIn("https://example.invalid/later", http.calls)
 
     def test_source_intraday_ignores_points_after_now(self) -> None:
         raw = {
@@ -453,6 +532,8 @@ class WeatherRuntimeTests(unittest.TestCase):
         extra_source: Optional[dict] = None,
         start: str = "2026-09-06T00:00:00Z",
         end: str = "2026-09-06T23:59:59Z",
+        timezone_name: str = "UTC",
+        unit: str = "C",
     ):
         source_url = "fixture://weather/{}".format(event_id)
         source = {
@@ -498,11 +579,11 @@ class WeatherRuntimeTests(unittest.TestCase):
                     "market_id": market_id,
                     "event_group_id": event_id,
                     "source": source,
-                    "timezone": "UTC",
+                    "timezone": timezone_name,
                     "metric": metric,
                     "observation_start": start,
                     "observation_end": end,
-                    "unit": "C",
+                    "unit": unit,
                     "buckets": buckets,
                     "target_outcome": outcome,
                     "manual_approval": True,
@@ -673,9 +754,9 @@ class WeatherRuntimeTests(unittest.TestCase):
                 super().__init__()
                 self.payload_calls = 0
 
-            def _payload(self, rule):  # type: ignore[override]
+            def _payload(self, rule, **kwargs):  # type: ignore[override]
                 self.payload_calls += 1
-                return super()._payload(rule)
+                return super()._payload(rule, **kwargs)
 
         buckets = [
             {"outcome": "18 or below", "upper": 18, "upper_inclusive": True},
@@ -804,6 +885,14 @@ class WeatherRuntimeTests(unittest.TestCase):
             latest = json.loads((Path(temp) / "data" / "latest.json").read_text())
             self.assertEqual(latest["summary"]["bucket_match_rate"], 1.0)
             self.assertNotIn("source_evidence", latest)
+            cands = service.candidates()
+            self.assertEqual(len(cands), 1)
+            self.assertEqual(cands[0]["matched_outcome"], "26")
+            self.assertEqual(cands[0]["trade_side"], "YES")
+            self.assertIn("lock", cands[0])
+            self.assertIn("net_edge", cands[0].get("economics") or {})
+            self.assertIn("question", (cands[0].get("market") or {}))
+            self.assertTrue((cands[0].get("book") or {}).get("asks"))
             published = service.board_snapshot()
             self.assertIn("event_groups", published)
             self.assertNotIn("rows", published)
@@ -1789,6 +1878,8 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertNotIn("end", rule.source.get("params") or {})
         self.assertEqual(rule.source["params"]["obtimezone"], "local")
         self.assertEqual(rule.source["params"]["units"], "temp|F,speed|mph,english")
+        self.assertEqual(rule.source.get("sample_set"), "all")
+        self.assertNotIn("hourly_window", rule.source)
         self.assertNotIn("token", rule.source.get("params") or {})
         self.assertTrue(rule.enabled)
         self.assertTrue(rule.manual_approval)
@@ -1921,6 +2012,135 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 14)
         self.assertEqual(observation.station_id, "ZSJN")
+
+    def test_wunderground_half_hour_after_close_is_daily_min(self) -> None:
+        markets = self._temp_markets(
+            slug="lowest-temperature-in-taipei-on-september-7-2026",
+            source="https://www.wunderground.com/history/daily/tw/taipei/RCSS",
+            titles=[
+                "19°C or below",
+                "20°C",
+                "21°C",
+                "22°C",
+                "23°C",
+                "24°C",
+                "25°C",
+                "26°C",
+                "27°C",
+                "28°C",
+                "29°C or higher",
+            ],
+            metric_word="lowest",
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        from weather_runtime.rules import with_source_contract
+
+        rule = with_source_contract(
+            rule,
+            source={
+                **rule.source,
+                "static": {
+                    "observations": [
+                        {
+                            "temp": 23,
+                            "valid_time_gmt": int(datetime(2026, 9, 7, 15, tzinfo=timezone.utc).timestamp()),
+                        },
+                        {
+                            "temp": 22,
+                            "valid_time_gmt": int(datetime(2026, 9, 7, 15, 30, tzinfo=timezone.utc).timestamp()),
+                        },
+                        {
+                            "temp": 23,
+                            "valid_time_gmt": int(datetime(2026, 9, 7, 16, tzinfo=timezone.utc).timestamp()),
+                        },
+                    ]
+                },
+            },
+        )
+        observation = WeatherSourceAdapter().poll(
+            rule,
+            now=datetime(2026, 9, 7, 16, 10, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "final")
+        self.assertEqual(observation.value, 22)
+        self.assertEqual(observation.source_timestamp, "2026-09-07T15:30:00+00:00")
+        by_local = {point["local_time"]: point for point in observation.series}
+        self.assertEqual(by_local["2026-09-07 23:30"]["temp"], 22.0)
+        self.assertTrue(by_local["2026-09-07 23:30"]["counts_for_resolution"])
+        raw_points = series_from_raw(rule.source["static"])
+        self.assertEqual(raw_points[-2]["temp"], 22)
+        self.assertIn("2026-09-07T15:30:00", raw_points[-2]["timestamp"])
+
+    def test_wunderground_post_close_refreshes_late_half_hour(self) -> None:
+        markets = self._temp_markets(
+            slug="lowest-temperature-in-taipei-on-september-7-2026",
+            source="https://www.wunderground.com/history/daily/tw/taipei/RCSS",
+            titles=[
+                "19°C or below",
+                "20°C",
+                "21°C",
+                "22°C",
+                "23°C",
+                "24°C",
+                "25°C",
+                "26°C",
+                "27°C",
+                "28°C",
+                "29°C or higher",
+            ],
+            metric_word="lowest",
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        early = {
+            "observations": [
+                {
+                    "temp": 23,
+                    "valid_time_gmt": int(datetime(2026, 9, 7, 15, tzinfo=timezone.utc).timestamp()),
+                },
+                {
+                    "temp": 23,
+                    "valid_time_gmt": int(datetime(2026, 9, 7, 16, tzinfo=timezone.utc).timestamp()),
+                },
+            ]
+        }
+        late = {
+            "observations": [
+                {
+                    "temp": 23,
+                    "valid_time_gmt": int(datetime(2026, 9, 7, 15, tzinfo=timezone.utc).timestamp()),
+                },
+                {
+                    "temp": 22,
+                    "valid_time_gmt": int(datetime(2026, 9, 7, 15, 30, tzinfo=timezone.utc).timestamp()),
+                },
+                {
+                    "temp": 23,
+                    "valid_time_gmt": int(datetime(2026, 9, 7, 16, tzinfo=timezone.utc).timestamp()),
+                },
+            ]
+        }
+
+        class SequencingHttp:
+            def __init__(self) -> None:
+                self.payloads = [early, late]
+                self.calls = 0
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                index = min(self.calls, len(self.payloads) - 1)
+                self.calls += 1
+                return self.payloads[index]
+
+        http = SequencingHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        now = datetime(2026, 9, 7, 16, 10, tzinfo=timezone.utc)
+        first = adapter.poll(rule, now=now)
+        self.assertEqual(first.value, 23)
+        with adapter._http_lock:
+            for key, (stamp, payload) in list(adapter._http_cache.items()):
+                adapter._http_cache[key] = (stamp - 20.0, payload)
+        second = adapter.poll(rule, now=now)
+        self.assertEqual(second.value, 22)
+        self.assertEqual(http.calls, 2)
 
     def test_synoptic_observations_finalize_daily_max(self) -> None:
         markets = self._temp_markets(
@@ -2081,6 +2301,8 @@ class WeatherRuntimeTests(unittest.TestCase):
             metric_word="lowest",
         )
         rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        self.assertEqual(rule.source.get("sample_set"), "all")
+        self.assertNotIn("hourly_window", rule.source)
 
         class Recorder:
             def __init__(self) -> None:
@@ -2117,6 +2339,8 @@ class WeatherRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(http.params["units"], "temp|F,speed|mph,english")
         self.assertEqual(http.params["recent"], 4320)
+        self.assertEqual(http.params["complete"], 1)
+        self.assertEqual(http.params["vars"], "air_temp,sea_level_pressure,metar")
         self.assertNotIn("start", http.params or {})
         self.assertNotIn("end", http.params or {})
         self.assertEqual(http.params["token"], "test-token")
@@ -2126,6 +2350,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             "https://www.weather.gov/wrh/timeseries?site=zhcc",
         )
         self.assertIn("Mozilla/5.0", http.headers["User-Agent"])
+        self.assertEqual(WeatherSourceAdapter().http.timeout, 20.0)
         self.assertEqual(observation.status, "final")
         self.assertEqual(observation.value, 20)
         self.assertEqual(observation.station_id, "ZHCC")
@@ -2388,6 +2613,355 @@ class WeatherRuntimeTests(unittest.TestCase):
             kwargs = take.call_args.kwargs
             self.assertTrue(kwargs["live"])
             self.assertEqual(kwargs["target_outcome"], "74-75°F")
+
+    def test_sample_set_from_description_detects_hourly_button(self) -> None:
+        self.assertEqual(
+            sample_set_from_description(
+                'This market will resolve off of the Hourly Data provided using the "Show Hourly Data" button.'
+            ),
+            "hourly",
+        )
+        self.assertEqual(
+            sample_set_from_description(
+                "NOAA Temp column for all times on this day, available here: "
+                "https://www.weather.gov/wrh/timeseries?site=zhcc"
+            ),
+            "all",
+        )
+        self.assertEqual(hourly_window_for_timezone("America/Los_Angeles"), "nws_faa")
+        self.assertEqual(hourly_window_for_timezone("Pacific/Honolulu"), "nws_faa")
+        self.assertEqual(hourly_window_for_timezone("Asia/Shanghai"), "other")
+
+    def test_discover_ksfo_hourly_vs_zhengzhou_all_data(self) -> None:
+        titles_f = [
+            "53°F or below",
+            "54-55°F",
+            "56-57°F",
+            "58-59°F",
+            "60°F or higher",
+        ]
+        titles_c = [
+            "12°C or below",
+            "13°C",
+            "14°C",
+            "15°C",
+            "16°C",
+            "17°C",
+            "18°C",
+            "19°C",
+            "20°C",
+            "21°C",
+            "22°C or higher",
+        ]
+        ksfo = self._temp_markets(
+            slug="lowest-temperature-in-san-francisco-on-september-7-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=ksfo",
+            titles=titles_f,
+            metric_word="lowest",
+            description=(
+                'This market will resolve off of the Hourly Data provided using the '
+                '"Show Hourly Data" button. '
+                "https://www.weather.gov/wrh/timeseries?site=ksfo"
+            ),
+        )
+        ksfo_rule = parse_rule(discover_rules(ksfo)["generated_rules"][0])
+        self.assertEqual(ksfo_rule.source["sample_set"], "hourly")
+        self.assertEqual(ksfo_rule.source["hourly_window"], "nws_faa")
+        self.assertEqual(ksfo_rule.source["station_id"], "KSFO")
+        self.assertEqual(
+            ksfo_rule.source["url"],
+            "https://api.synopticdata.com/v2/stations/timeseries",
+        )
+        self.assertEqual(
+            ksfo_rule.source["resolution_source"],
+            "https://www.weather.gov/wrh/timeseries?site=ksfo",
+        )
+        self.assertEqual(
+            wrh_hourly_page_url("https://www.weather.gov/wrh/timeseries?site=ksfo"),
+            "https://www.weather.gov/wrh/timeseries?site=ksfo&hourly=true",
+        )
+        zhcc = self._temp_markets(
+            slug="lowest-temperature-in-zhengzhou-on-september-7-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=zhcc",
+            titles=titles_c,
+            metric_word="lowest",
+            description=(
+                "This market will resolve based on the NOAA timeseries page: "
+                "https://www.weather.gov/wrh/timeseries?site=zhcc"
+            ),
+        )
+        zhcc_rule = parse_rule(discover_rules(zhcc)["generated_rules"][0])
+        self.assertEqual(zhcc_rule.source["sample_set"], "all")
+        self.assertNotIn("hourly_window", zhcc_rule.source)
+        self.assertEqual(
+            zhcc_rule.source["resolution_source"],
+            "https://www.weather.gov/wrh/timeseries?site=zhcc",
+        )
+        self.assertEqual(
+            zhcc_rule.source["url"],
+            "https://api.synopticdata.com/v2/stations/timeseries",
+        )
+
+    def _ksfo_min_features(self) -> list:
+        return [
+            {
+                "value": 57.2,
+                "timestamp": "2026-09-07T09:53:00Z",
+                "slp": 1013.2,
+                "metar": "KSFO 071256Z AUTO 28008KT",
+                "network": "ASOS/AWOS",
+            },
+            {
+                "value": 55.4,
+                "timestamp": "2026-09-07T12:45:00Z",
+                "slp": None,
+                "metar": None,
+                "network": "ASOS/AWOS",
+            },
+        ]
+
+    def _ksfo_min_buckets(self) -> list:
+        return [
+            bucket.to_dict()
+            for bucket in buckets_from_outcomes(
+                [
+                    "53°F or below",
+                    "54-55°F",
+                    "56-57°F",
+                    "58-59°F",
+                    "60°F or higher",
+                ]
+            )
+        ]
+
+    def _ksfo_min_rule(self, sample_set: str, features: list, hourly_window: str = "nws_faa"):
+        source = {
+            "static": {"features": features},
+            "url": "fixture://weather/ksfo",
+            "resolution_source": "https://www.weather.gov/wrh/timeseries?site=ksfo",
+            "value_path": "value",
+            "timestamp_path": "timestamp",
+            "station_id": "KSFO",
+            "provider": "NOAA",
+            "sample_set": sample_set,
+            "value_unit": "F",
+        }
+        if sample_set == "hourly":
+            source["hourly_window"] = hourly_window
+        return parse_rule(
+            {
+                "market_id": "ksfo-56-57",
+                "event_group_id": "lowest-temperature-in-san-francisco-on-september-7-2026",
+                "timezone": "America/Los_Angeles",
+                "rounding": "whole_degree_as_published",
+                "source": source,
+                "metric": "daily_min",
+                "observation_start": "2026-09-07T00:00:00",
+                "observation_end": "2026-09-07T23:59:59",
+                "unit": "F",
+                "buckets": self._ksfo_min_buckets(),
+                "target_outcome": "56-57°F",
+                "manual_approval": True,
+            }
+        )
+
+    def test_hourly_min_ignores_ksfo_0545_all_data_includes_it(self) -> None:
+        now = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
+        hourly = WeatherSourceAdapter().poll(
+            self._ksfo_min_rule("hourly", self._ksfo_min_features()),
+            now=now,
+        )
+        self.assertEqual(hourly.status, "intraday")
+        self.assertEqual(hourly.raw_aggregate, 57.2)
+        self.assertEqual(hourly.value, 57)
+        by_local = {point["local_time"]: point for point in hourly.series}
+        self.assertTrue(by_local["2026-09-07 02:53"]["counts_for_resolution"])
+        self.assertNotIn("2026-09-07 05:45", by_local)
+
+        all_data = WeatherSourceAdapter().poll(
+            self._ksfo_min_rule("all", self._ksfo_min_features()),
+            now=now,
+        )
+        self.assertEqual(all_data.status, "intraday")
+        self.assertEqual(all_data.raw_aggregate, 55.4)
+        self.assertEqual(all_data.value, 55)
+        self.assertTrue(all(point["counts_for_resolution"] for point in all_data.series))
+
+    def test_hourly_filter_empty_does_not_fall_back_to_all_data(self) -> None:
+        observation = WeatherSourceAdapter().poll(
+            self._ksfo_min_rule(
+                "hourly",
+                [{"value": 55.4, "timestamp": "2026-09-07T12:45:00Z"}],
+            ),
+            now=datetime(2026, 9, 7, 18, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "unavailable")
+        self.assertEqual(observation.reason, "hourly_filter_empty")
+        self.assertIsNone(observation.value)
+        self.assertEqual(observation.series, [])
+
+    def test_hourly_ksfo_still_requests_same_synoptic_url(self) -> None:
+        markets = self._temp_markets(
+            slug="lowest-temperature-in-san-francisco-on-september-7-2026",
+            source="https://www.weather.gov/wrh/timeseries?site=ksfo",
+            titles=[
+                "53°F or below",
+                "54-55°F",
+                "56-57°F",
+                "58-59°F",
+                "60°F or higher",
+            ],
+            metric_word="lowest",
+            description=(
+                'This market will resolve off of the Hourly Data provided using the '
+                '"Show Hourly Data" button.'
+            ),
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        self.assertEqual(rule.source["url"], "https://api.synopticdata.com/v2/stations/timeseries")
+        self.assertEqual(
+            rule.source["resolution_source"],
+            "https://www.weather.gov/wrh/timeseries?site=ksfo",
+        )
+        self.assertEqual(rule.source.get("sample_set"), "hourly")
+
+        class Recorder:
+            def __init__(self) -> None:
+                self.url = None
+                self.params = None
+                self.headers = None
+
+            def get_json(self, url, params=None, headers=None):
+                self.url = url
+                self.params = params
+                self.headers = headers
+                return {
+                    "UNITS": {"air_temp": "Fahrenheit"},
+                    "STATION": [
+                        {
+                            "STID": "KSFO",
+                            "SHORTNAME": "ASOS/AWOS",
+                            "UNITS": {"air_temp": "Fahrenheit"},
+                            "OBSERVATIONS": {
+                                "date_time": [
+                                    "2026-09-07T02:53:00",
+                                    "2026-09-07T05:45:00",
+                                ],
+                                "air_temp_set_1": [57.2, 55.4],
+                                "sea_level_pressure_set_1": [1013.2, None],
+                                "metar_set_1": ["KSFO 071256Z AUTO", None],
+                            },
+                        }
+                    ],
+                }
+
+            def get_text(self, url, headers=None):
+                return "var mesoToken='test-token';"
+
+        http = Recorder()
+        observation = WeatherSourceAdapter(http=http, http_cache_ttl_s=0).poll(
+            rule,
+            now=datetime(2026, 9, 7, 18, tzinfo=timezone.utc),
+        )
+        self.assertEqual(http.url, "https://api.synopticdata.com/v2/stations/timeseries")
+        self.assertEqual(http.params["STID"], "KSFO")
+        self.assertNotIn("hourly", http.params or {})
+        self.assertIn("timeseries?site=ksfo", str(http.headers.get("Referer") or "").lower())
+        self.assertEqual(observation.status, "intraday")
+        self.assertEqual(observation.value, 57)
+        by_local = {point["local_time"]: point for point in observation.series}
+        self.assertTrue(by_local["2026-09-07 02:53"]["counts_for_resolution"])
+        self.assertNotIn("2026-09-07 05:45", by_local)
+
+    def test_asos_hourly_keeps_speci_not_five_minute_at_53(self) -> None:
+        observation = WeatherSourceAdapter().poll(
+            self._ksfo_min_rule(
+                "hourly",
+                [
+                    {
+                        "value": 57.2,
+                        "timestamp": "2026-09-07T09:12:00Z",
+                        "slp": None,
+                        "metar": "KSFO 071212Z AUTO 28008KT",
+                        "network": "ASOS/AWOS",
+                    },
+                    {
+                        "value": 55.4,
+                        "timestamp": "2026-09-07T12:53:00Z",
+                        "slp": None,
+                        "metar": None,
+                        "network": "ASOS/AWOS",
+                    },
+                ],
+            ),
+            now=datetime(2026, 9, 7, 18, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "intraday")
+        self.assertEqual(observation.raw_aggregate, 57.2)
+        self.assertEqual(observation.value, 57)
+        by_local = {point["local_time"]: point for point in observation.series}
+        self.assertTrue(by_local["2026-09-07 02:12"]["counts_for_resolution"])
+        self.assertNotIn("2026-09-07 05:53", by_local)
+
+    def test_scanner_hourly_does_not_lock_ksfo_56_57_no(self) -> None:
+        outcomes = [
+            "53°F or below",
+            "54-55°F",
+            "56-57°F",
+            "58-59°F",
+            "60°F or higher",
+        ]
+        now = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
+        hourly_markets, hourly_rules = self._event_with_static(
+            event_id="lowest-temperature-in-san-francisco-on-september-7-2026",
+            metric="daily_min",
+            outcomes=outcomes,
+            buckets=self._ksfo_min_buckets(),
+            features=self._ksfo_min_features(),
+            extra_source={"sample_set": "hourly", "hourly_window": "nws_faa", "station_id": "KSFO", "value_unit": "F"},
+            start="2026-09-07T00:00:00",
+            end="2026-09-07T23:59:59",
+            timezone_name="America/Los_Angeles",
+            unit="F",
+        )
+        hourly_result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            hourly_markets,
+            hourly_rules,
+            books=self._priced_books(hourly_markets, now, {"56-57°F", "58-59°F"}),
+            fetch_books=False,
+            now=now,
+        )
+        hourly_by = {row["target_outcome"]: row for row in hourly_result["rows"]}
+        self.assertEqual((hourly_by["56-57°F"].get("observation") or {}).get("value"), 57)
+        self.assertNotEqual(hourly_by["56-57°F"].get("reason"), "intraday_impossible_no")
+        self.assertNotEqual(hourly_by["56-57°F"].get("trade_side"), "NO")
+        self.assertEqual(hourly_by["58-59°F"]["status"], "opportunity")
+        self.assertEqual(hourly_by["58-59°F"]["trade_side"], "NO")
+        self.assertEqual(hourly_by["58-59°F"]["reason"], "intraday_impossible_no")
+
+        all_markets, all_rules = self._event_with_static(
+            event_id="lowest-temperature-in-san-francisco-all-data",
+            metric="daily_min",
+            outcomes=outcomes,
+            buckets=self._ksfo_min_buckets(),
+            features=self._ksfo_min_features(),
+            extra_source={"sample_set": "all", "station_id": "KSFO", "value_unit": "F"},
+            start="2026-09-07T00:00:00",
+            end="2026-09-07T23:59:59",
+            timezone_name="America/Los_Angeles",
+            unit="F",
+        )
+        all_result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            all_markets,
+            all_rules,
+            books=self._priced_books(all_markets, now, {"56-57°F", "58-59°F"}),
+            fetch_books=False,
+            now=now,
+        )
+        all_by = {row["target_outcome"]: row for row in all_result["rows"]}
+        self.assertEqual((all_by["56-57°F"].get("observation") or {}).get("value"), 55)
+        self.assertEqual(all_by["56-57°F"]["status"], "opportunity")
+        self.assertEqual(all_by["56-57°F"]["reason"], "intraday_impossible_no")
 
 
 if __name__ == "__main__":

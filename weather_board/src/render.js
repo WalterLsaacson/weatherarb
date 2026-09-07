@@ -10,6 +10,7 @@ function groupMeta(group) {
   const market = first.market || {};
   const rule = first.rule || {};
   const source = first.observation || {};
+  const sampleSet = String(rule.source?.sample_set || source.sample_set || "all").toLowerCase();
   return {
     market,
     rule,
@@ -18,7 +19,12 @@ function groupMeta(group) {
     date: rule.observation_start ? String(rule.observation_start).slice(0, 10) : group.local_date || "—",
     metric: source.aggregation || rule.metric || group.metric || "—",
     question: market.question || group.question || group.event_group_id,
+    sampleSet: sampleSet === "hourly" ? "hourly" : "all",
   };
+}
+
+function sampleSetLabel(meta) {
+  return meta.sampleSet === "hourly" ? "Hourly Data" : "All data";
 }
 
 export function renderMeta() {
@@ -127,13 +133,21 @@ export function renderCandidates() {
 }
 
 function seriesPoints(detail) {
-  if (Array.isArray(detail.source_series) && detail.source_series.length) return detail.source_series;
-  const rows = detail.rows || [];
-  for (const row of rows) {
-    const obs = row.observation || {};
-    if (Array.isArray(obs.series) && obs.series.length) return obs.series;
+  let points = [];
+  if (Array.isArray(detail.source_series) && detail.source_series.length) {
+    points = detail.source_series;
+  } else {
+    const rows = detail.rows || [];
+    for (const row of rows) {
+      const obs = row.observation || {};
+      if (Array.isArray(obs.series) && obs.series.length) {
+        points = obs.series;
+        break;
+      }
+    }
   }
-  return [];
+  if (groupMeta(detail).sampleSet !== "hourly") return points;
+  return points.filter((item) => item.counts_for_resolution !== false);
 }
 
 function observationEmptyMessage(detail) {
@@ -146,6 +160,9 @@ function observationEmptyMessage(detail) {
   if (reason === "no_observations_in_window") {
     return "窗口已开，源还没有返回这一天窗口内的观测点。";
   }
+  if (reason === "hourly_filter_empty") {
+    return "盘口按 Hourly Data 结算，但过滤后这一天还没有计入结算的观测点。";
+  }
   if (reason === "observation_window_open") {
     return "窗口已开，但这一轮没有拿到窗口内观测。";
   }
@@ -155,14 +172,30 @@ function observationEmptyMessage(detail) {
   return reason ? `当前没有小时序列：${reason}` : "当前没有小时序列。";
 }
 
+function wrhPageHref(meta) {
+  const page = String(meta.rule.source?.resolution_source || "");
+  if (!page) return "";
+  if (meta.sampleSet !== "hourly" || /[?&]hourly=/i.test(page)) return page;
+  return page + (page.includes("?") ? "&" : "?") + "hourly=true";
+}
+
 function renderObservationTable(detail) {
   const meta = groupMeta(detail);
   const tz = meta.rule.timezone || "";
   const values = seriesPoints(detail).slice(-96);
+  const page = wrhPageHref(meta);
+  const hourlyNote = meta.sampleSet === "hourly"
+    ? "（WRH Show Hourly Data，只列出计入结算的小时点）"
+    : /wunderground\.com|weather\.com/i.test(page)
+      ? "（Wunderground Daily Observations 全部观测点，含 :30）"
+      : "（同一 WRH 页全部观测点）";
+  const caption = `<p class="obs-caption">结算序列：<b>${escapeHtml(sampleSetLabel(meta))}</b>${hourlyNote}${
+    page ? `<br><span class="muted">${escapeHtml(page)}</span>` : ""
+  }</p>`;
   if (!values.length) {
-    return `<div class="empty">${escapeHtml(observationEmptyMessage(detail))}</div>`;
+    return caption + `<div class="empty">${escapeHtml(observationEmptyMessage(detail))}</div>`;
   }
-  return `<table class="compact"><thead><tr><th>站点当地时间${tz ? "（" + escapeHtml(tz) + "）" : ""}</th><th>温度</th></tr></thead><tbody>${
+  return `${caption}<table class="compact"><thead><tr><th>站点当地时间${tz ? "（" + escapeHtml(tz) + "）" : ""}</th><th>温度</th></tr></thead><tbody>${
     values.map((item) => {
       const when = item.local_time || fmtStationTime(item.timestamp, tz);
       const temp = fmtTemp(item.temp ?? item.value);
@@ -204,7 +237,7 @@ export function renderDetail(detail) {
     <section class="detail-card">
       <div class="detail-title"><span class="eyebrow">RULE / FINALITY</span>${badge(detail.source_status, detail.source_status)}</div>
       <p>${escapeHtml(meta.question)}</p>
-      <div class="facts"><span>station <b>${escapeHtml(meta.station)}</b></span><span>metric <b>${escapeHtml(meta.metric)}</b></span><span>unit <b>${escapeHtml(meta.rule.unit || meta.source.unit || "—")}</b></span><span>盘中 <b>${escapeHtml(runningText)}</b></span><span>bucket <b>${escapeHtml(detail.matched_bucket?.outcome || "—")}</b></span></div>
+      <div class="facts"><span>station <b>${escapeHtml(meta.station)}</b></span><span>metric <b>${escapeHtml(meta.metric)}</b></span><span>unit <b>${escapeHtml(meta.rule.unit || meta.source.unit || "—")}</b></span><span>sample_set <b>${escapeHtml(sampleSetLabel(meta))}</b></span><span>盘中 <b>${escapeHtml(runningText)}</b></span><span>bucket <b>${escapeHtml(detail.matched_bucket?.outcome || "—")}</b></span></div>
     </section>
     <section class="detail-card"><div class="section-head"><div><span class="eyebrow">SOURCE OBSERVATIONS</span><h3>实时数据</h3></div><span class="muted">${escapeHtml(meta.source.provider || "—")} · 扫描 ${escapeHtml(fmtTime(meta.source.observed_at))}${meta.rule.timezone ? " · " + escapeHtml(meta.rule.timezone) : ""}</span></div>${renderObservationTable(detail)}</section>
     <section class="detail-card"><div class="section-head"><div><span class="eyebrow">CLOB</span><h3>盘口深度</h3></div><span class="muted">先拉新死掉的 No，再拉其余交易盘，Yes 展示盘最后</span></div>${renderBooks(detail.markets || [])}</section>

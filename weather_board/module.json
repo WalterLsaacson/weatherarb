@@ -22,6 +22,7 @@
       "GET /api/events/{event_group_id}",
       "GET /api/events/{event_group_id}/source",
       "GET /api/events/{event_group_id}/books",
+      "GET /candidates",
       "GET /api/candidates",
       "GET /api/metrics",
       "GET /api/stream",
