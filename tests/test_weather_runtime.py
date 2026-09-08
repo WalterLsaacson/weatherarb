@@ -3194,5 +3194,164 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(all_by["56-57°F"]["reason"], "intraday_impossible_no")
 
 
+class SynopticPushAndWrhArchiveTests(unittest.TestCase):
+    def test_parse_synoptic_push_date(self) -> None:
+        from weather_runtime.synoptic_push import parse_synoptic_push_date
+
+        self.assertEqual(parse_synoptic_push_date(201801132220), "2018-01-13T22:20:00+00:00")
+        self.assertIsNone(parse_synoptic_push_date("bad"))
+
+    def test_synoptic_watch_from_rules_collects_active_stations(self) -> None:
+        from weather_runtime.models import Bucket, WeatherRule
+        from weather_runtime.synoptic_push import synoptic_watch_from_rules
+
+        now = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
+        rules = [
+            WeatherRule(
+                market_id="m1",
+                event_group_id="highest-temperature-in-san-francisco-on-september-8-2026",
+                adapter="weather_observation",
+                metric="daily_max",
+                unit="F",
+                timezone="America/Los_Angeles",
+                observation_start="2026-09-08T00:00:00",
+                observation_end="2026-09-08T23:59:59",
+                buckets=[Bucket(outcome="70+", lower=70, lower_inclusive=True)],
+                source={
+                    "provider": "noaa",
+                    "station_id": "KSFO",
+                    "url": "https://api.synopticdata.com/v2/stations/timeseries",
+                    "sample_set": "hourly",
+                },
+            ),
+            WeatherRule(
+                market_id="m2",
+                event_group_id="highest-temperature-in-austin-on-september-1-2026",
+                adapter="weather_observation",
+                metric="daily_max",
+                unit="F",
+                timezone="America/Chicago",
+                observation_start="2026-09-01T00:00:00",
+                observation_end="2026-09-01T23:59:59",
+                buckets=[Bucket(outcome="90+", lower=90, lower_inclusive=True)],
+                source={
+                    "provider": "noaa",
+                    "station_id": "KAUS",
+                    "url": "https://api.synopticdata.com/v2/stations/timeseries",
+                },
+            ),
+        ]
+        watches = synoptic_watch_from_rules(rules, now=now)
+        self.assertIn("KSFO", watches)
+        self.assertNotIn("KAUS", watches)
+        self.assertEqual(
+            watches["KSFO"]["event_group_ids"],
+            ["highest-temperature-in-san-francisco-on-september-8-2026"],
+        )
+
+    def test_push_recorder_writes_data_rows_with_received_at(self) -> None:
+        from weather_runtime.storage import read_jsonl
+        from weather_runtime.synoptic_push import SynopticPushRecorder
+
+        with tempfile.TemporaryDirectory() as temp:
+            recorder = SynopticPushRecorder(
+                Path(temp),
+                token_fn=lambda: "token",
+                enabled=False,
+            )
+            watches = {
+                "C4824": {
+                    "station_id": "C4824",
+                    "event_group_ids": ["evt-1"],
+                    "sample_sets": ["all"],
+                }
+            }
+            recorder.set_watch(watches)
+            recorder._handle_message(
+                json.dumps(
+                    {
+                        "type": "metadata",
+                        "units": [{"sensor": "air_temp", "unit": "Fahrenheit"}],
+                        "stations": [{"stid": "C4824"}],
+                    }
+                ),
+                watches,
+                track_session=True,
+            )
+            recorder._handle_message(
+                json.dumps(
+                    {
+                        "type": "data",
+                        "data": [
+                            {
+                                "set": 1,
+                                "stid": "C4824",
+                                "value": 72.5,
+                                "qc": [],
+                                "date": 202609081200,
+                                "sensor": "air_temp",
+                            }
+                        ],
+                    }
+                ),
+                watches,
+                track_session=True,
+            )
+            rows = read_jsonl(Path(temp) / "synoptic_push.jsonl")
+            data_rows = [row for row in rows if row.get("msg_type") == "data"]
+            self.assertEqual(len(data_rows), 1)
+            self.assertEqual(data_rows[0]["station_id"], "C4824")
+            self.assertAlmostEqual(data_rows[0]["value"], (72.5 - 32.0) * 5.0 / 9.0, places=4)
+            self.assertEqual(data_rows[0]["unit"], "C")
+            self.assertEqual(data_rows[0]["value_raw"], 72.5)
+            self.assertEqual(data_rows[0]["unit_raw"], "Fahrenheit")
+            self.assertEqual(data_rows[0]["obs_timestamp"], "2026-09-08T12:00:00+00:00")
+            self.assertTrue(data_rows[0].get("received_at"))
+            self.assertEqual(data_rows[0]["event_group_ids"], ["evt-1"])
+
+    def test_normalize_push_air_temp_to_celsius(self) -> None:
+        from weather_runtime.synoptic_push import normalize_push_value
+
+        value, unit, raw, unit_raw = normalize_push_value("air_temp", 32.0, "Fahrenheit")
+        self.assertEqual(value, 0.0)
+        self.assertEqual(unit, "C")
+        self.assertEqual(raw, 32.0)
+        self.assertEqual(unit_raw, "Fahrenheit")
+
+    def test_wrh_points_keep_first_seen_timestamp(self) -> None:
+        from weather_runtime.observation_archive import persist_wrh_observation_points
+        from weather_runtime.storage import read_jsonl
+
+        evidence = [
+            {
+                "event_group_id": "evt-1",
+                "station_id": "KSFO",
+                "provider": "noaa",
+                "sample_set": "hourly",
+                "evidence_hash": "abc",
+                "source_timestamp": "2026-09-08T12:00:00+00:00",
+                "series": [
+                    {
+                        "timestamp": "2026-09-08T19:00:00+00:00",
+                        "local_time": "2026-09-08 12:00",
+                        "timezone": "America/Los_Angeles",
+                        "temp": 72.0,
+                        "counts_for_resolution": True,
+                    }
+                ],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "wrh_observation_points.jsonl"
+            first = persist_wrh_observation_points(path, evidence, polled_at="2026-09-08T12:05:00+00:00")
+            second = persist_wrh_observation_points(path, evidence, polled_at="2026-09-08T12:10:00+00:00")
+            self.assertEqual(first, 1)
+            self.assertEqual(second, 0)
+            rows = read_jsonl(path)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["first_seen_at"], "2026-09-08T12:05:00+00:00")
+            self.assertEqual(rows[0]["obs_timestamp"], "2026-09-08T19:00:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ from .rules import (
     source_matches,
     validate_event_group_siblings,
 )
-from .sources import WeatherSourceAdapter
+from .sources import WeatherSourceAdapter, sample_set_of
 from .storage import sha256_json
 
 
@@ -742,6 +742,11 @@ class WeatherScanner:
                         "status": evidence.get("status"),
                         "source_timestamp": evidence.get("source_timestamp"),
                         "observed_at": evidence.get("observed_at"),
+                        "station_id": evidence.get("station_id")
+                        or rule.source.get("station_id"),
+                        "provider": evidence.get("provider")
+                        or rule.source.get("provider"),
+                        "sample_set": sample_set_of(rule),
                         "series": evidence.get("series") or [],
                         "raw": evidence.get("raw"),
                     },
