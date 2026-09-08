@@ -44,11 +44,50 @@ def quantize_buy(price: float, size: float, max_usdc: float) -> tuple[float, flo
     raise LiveOrderError("cannot_quantize_buy_amount")
 
 
+def quantize_sell(price: float, size: float, max_usdc: float) -> tuple[float, float]:
+    """FAK sells: size to 2 decimals; cap notional proceeds by max_usdc."""
+
+    return quantize_buy(price, size, max_usdc)
+
+
 def submit_fak_buy(
     *,
     token_id: str,
     price: float,
     size: float,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    return _submit_fak(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side="BUY",
+        config=config,
+    )
+
+
+def submit_fak_sell(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    return _submit_fak(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side="SELL",
+        config=config,
+    )
+
+
+def _submit_fak(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    side: str,
     config: Optional[dict[str, Any]] = None,
 ) -> Any:
     from .env import trading_config
@@ -73,7 +112,7 @@ def submit_fak_buy(
             token_id=str(token_id),
             price=float(price),
             size=float(size),
-            side="BUY",
+            side=str(side or "BUY").upper(),
         )
         signed = replace(signed, order_type="FAK")
         response = client.post_order(signed)

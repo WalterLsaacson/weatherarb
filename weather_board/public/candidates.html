@@ -17,7 +17,7 @@
         <span class="brand__mark">WX</span>
         <div>
           <h1>Candidate Desk</h1>
-          <p>只展示通过 source、规则、生命周期、盘口和经济门的候选 · 默认 dry-run</p>
+          <p>只展示通过 source、规则、生命周期、盘口和经济门的候选 · 默认 dry-run<br /><span class="muted">卖 Yes（死桶）仅展示；live 需钱包已有 Yes，当前不会自动下单</span></p>
         </div>
       </div>
       <div class="actions">
@@ -41,7 +41,7 @@
       <section class="toolbar panel">
         <div>
           <h2>当前候选</h2>
-          <p class="muted">按净边际排序。点一行看完整证据、费用拆解和盘口，不必翻 JSON。</p>
+          <p class="muted">按净边际排序。点一行看完整证据、费用拆解和盘口。卖 Yes 候选需要已有 Yes 仓位，live auto-take 不会提交。</p>
         </div>
         <div class="filters">
           <input id="search" type="search" placeholder="站点、城市、桶、原因…" />
@@ -55,6 +55,8 @@
             <option value="intraday_impossible_no">盘中已死 No</option>
             <option value="provisional_loser_no">暂定输家 No</option>
             <option value="source_final_loser_no">源已终局 No</option>
+            <option value="intraday_impossible_sell_yes">盘中已死卖 Yes</option>
+            <option value="provisional_loser_sell_yes">暂定输家卖 Yes</option>
             <option value="dry_run_candidate_only">匹配 Yes</option>
           </select>
         </div>

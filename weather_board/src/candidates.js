@@ -6,6 +6,10 @@ const REASON_LABEL = {
   intraday_impossible_no: "盘中已死，买 No",
   provisional_loser_no: "暂定输家 No",
   source_final_loser_no: "源已终局，输家 No",
+  intradaily_impossible_sell_yes: "盘中已死，卖 Yes",
+  intraday_impossible_sell_yes: "盘中已死，卖 Yes",
+  provisional_loser_sell_yes: "暂定输家，卖 Yes",
+  source_final_loser_sell_yes: "源已终局，卖 Yes",
   dry_run_candidate_only: "匹配 Yes（dry-run）",
 };
 
@@ -135,21 +139,30 @@ function renderTable() {
       const eco = row.economics || {};
       const obs = row.observation || {};
       const side = String(row.trade_side || "YES").toUpperCase();
+      const orderSide = String(row.order_side || (row.economics || {}).order_side || "BUY").toUpperCase();
       const locked = Boolean(row.lock && row.lock.locked);
-      const selected = state.selected && state.selected.market_id === row.market_id;
+      const selected =
+        state.selected
+        && state.selected.market_id === row.market_id
+        && String(state.selected.order_side || "BUY") === orderSide;
+      const sideLabel =
+        orderSide === "SELL" ? side + " SELL" : side;
+      const lockLabel = locked
+        ? (orderSide === "SELL" ? "锁定卖 Yes" : "锁定 No")
+        : "";
       return `<tr class="event-row desk-row${selected ? " is-selected" : ""}" data-market-id="${escapeHtml(
         row.market_id || "",
-      )}" tabindex="0">
+      )}" data-order-side="${escapeHtml(orderSide)}" tabindex="0">
         <td><strong>${escapeHtml(station(row))}</strong><small>${escapeHtml(question(row))}</small></td>
         <td>${escapeHtml(obsDate(row))}<small>${escapeHtml(metric(row))} · ${escapeHtml(obs.status || "—")}</small></td>
         <td><strong class="side side--${side === "NO" ? "no" : "yes"}">${escapeHtml(
-          (row.target_outcome || row.matched_outcome || "—") + " " + side,
-        )}</strong>${locked ? "<small>锁定 No</small>" : ""}</td>
+          (row.target_outcome || row.matched_outcome || "—") + " " + sideLabel,
+        )}</strong>${lockLabel ? `<small>${escapeHtml(lockLabel)}</small>` : ""}</td>
         <td>${escapeHtml(reasonLabel(row.reason))}</td>
         <td class="mono">${escapeHtml(runningText(row))}</td>
         <td class="mono">${price(eco.execution_price)}</td>
         <td class="mono">${num(eco.net_edge, 4)}</td>
-        <td class="mono">${num(eco.ask_depth_at_limit, 1)}</td>
+        <td class="mono">${num(eco.ask_depth_at_limit ?? eco.bid_depth_at_floor, 1)}</td>
         <td><small>${escapeHtml(age((row.book || {}).fetched_at))}</small></td>
       </tr>`;
     })
@@ -157,7 +170,13 @@ function renderTable() {
   body.querySelectorAll(".desk-row").forEach((node) => {
     node.addEventListener("click", () => {
       const id = node.dataset.marketId || "";
-      state.selected = (state.candidates || []).find((row) => String(row.market_id || "") === id) || null;
+      const orderSide = node.dataset.orderSide || "BUY";
+      state.selected =
+        (state.candidates || []).find(
+          (row) =>
+            String(row.market_id || "") === id
+            && String(row.order_side || (row.economics || {}).order_side || "BUY") === orderSide,
+        ) || null;
       renderTable();
       renderDetail();
     });
@@ -183,12 +202,20 @@ function renderDetail() {
   const lock = row.lock || {};
   const asks = (book.asks || []).slice(0, 8);
   const side = String(row.trade_side || "YES").toUpperCase();
-  $("detailTitle").textContent = station(row) + " · " + (row.target_outcome || row.matched_outcome || "—") + " " + side;
+  const orderSide = String(row.order_side || eco.order_side || "BUY").toUpperCase();
+  $("detailTitle").textContent =
+    station(row)
+    + " · "
+    + (row.target_outcome || row.matched_outcome || "—")
+    + " "
+    + side
+    + (orderSide === "SELL" ? " SELL" : "");
   $("detailBody").innerHTML = `
     <section class="detail-card">
       <div class="detail-title"><span class="eyebrow">WHY</span>${escapeHtml(reasonLabel(row.reason))}</div>
       <p>${escapeHtml(question(row))}</p>
       <div class="facts">
+        ${fact("order", orderSide === "SELL" ? "SELL Yes（需持仓）" : "BUY " + side)}
         ${fact("station", station(row))}
         ${fact("metric", metric(row))}
         ${fact("盘中", runningText(row))}
@@ -249,7 +276,13 @@ function renderAll() {
   renderTable();
   if (state.selected) {
     const id = state.selected.market_id;
-    state.selected = (state.candidates || []).find((row) => row.market_id === id) || state.selected;
+    const orderSide = String(state.selected.order_side || "BUY");
+    state.selected =
+      (state.candidates || []).find(
+        (row) =>
+          row.market_id === id
+          && String(row.order_side || (row.economics || {}).order_side || "BUY") === orderSide,
+      ) || state.selected;
     renderDetail();
   }
 }

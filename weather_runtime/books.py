@@ -84,6 +84,45 @@ def ask_depth(book: Book, *, max_price: float) -> float:
     )
 
 
+def walk_bids(book: Book, *, min_price: float, target_shares: float) -> dict[str, Any]:
+    """Sell into bids at or above min_price (highest bid first)."""
+
+    target = max(0.0, float(target_shares))
+    remaining = target
+    filled = 0.0
+    proceeds = 0.0
+    worst: Optional[float] = None
+    for level in book.bids:
+        price = float(level["price"])
+        if price + 1e-12 < float(min_price):
+            break
+        take = min(remaining, float(level["size"]))
+        if take <= 0:
+            continue
+        filled += take
+        proceeds += take * price
+        worst = price
+        remaining -= take
+        if remaining <= 1e-12:
+            break
+    return {
+        "target_shares": target,
+        "filled_shares": filled,
+        "proceeds": proceeds,
+        "vwap": proceeds / filled if filled > 0 else None,
+        "worst_price": worst,
+        "complete": remaining <= 1e-12,
+    }
+
+
+def bid_depth(book: Book, *, min_price: float) -> float:
+    return sum(
+        float(level["size"])
+        for level in book.bids
+        if float(level["price"]) + 1e-12 >= float(min_price)
+    )
+
+
 class ClobClient:
     def __init__(
         self,

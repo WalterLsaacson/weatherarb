@@ -78,8 +78,28 @@ def _list_rows_for_board(group: dict[str, Any]) -> list[dict[str, Any]]:
     rows = [row for row in group.get("rows") or [] if isinstance(row, dict)]
     if not rows:
         return []
-    chosen = next((row for row in rows if row.get("status") == "opportunity"), rows[0])
+    opportunities = [row for row in rows if row.get("status") == "opportunity"]
+    if opportunities:
+        def _edge(row: dict[str, Any]) -> float:
+            eco = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+            try:
+                return float(eco.get("net_edge"))
+            except (TypeError, ValueError):
+                return -1.0
+
+        opportunities.sort(key=_edge, reverse=True)
+        chosen = opportunities[0]
+    else:
+        chosen = rows[0]
     return [_list_row(chosen)]
+
+
+def _side_label(row: dict[str, Any]) -> str:
+    side = str(row.get("trade_side") or "YES").upper()
+    order_side = str(row.get("order_side") or "BUY").upper()
+    if order_side == "SELL":
+        return side + " SELL"
+    return side
 
 
 def _compact_book(book: Any) -> dict[str, Any]:
@@ -100,18 +120,22 @@ def _list_row(row: dict[str, Any]) -> dict[str, Any]:
     rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
     source = rule.get("source") if isinstance(rule.get("source"), dict) else {}
     economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+    order_side = str(row.get("order_side") or economics.get("order_side") or "BUY").upper()
     return {
         "market_id": row.get("market_id"),
         "event_group_id": row.get("event_group_id"),
         "status": row.get("status"),
         "reason": row.get("reason"),
         "trade_side": row.get("trade_side"),
+        "order_side": order_side,
+        "side_label": _side_label({**row, "order_side": order_side}),
         "target_outcome": row.get("target_outcome"),
         "matched_outcome": row.get("matched_outcome"),
         "lifecycle": row.get("lifecycle"),
         "economics": {
             "execution_price": economics.get("execution_price"),
             "net_edge": economics.get("net_edge"),
+            "order_side": order_side,
         },
         "book": _compact_book(row.get("book")),
         "observation": {
@@ -169,16 +193,35 @@ def _take_matches(
             if actual != wanted_outcome:
                 continue
         found.append(row)
-    if wanted_outcome or len(found) <= 1:
+    if len(found) <= 1:
         return found
     opportunities = [row for row in found if row.get("status") == "opportunity"]
-    return opportunities or found
+    if not opportunities:
+        return found
+    if len(opportunities) == 1:
+        return opportunities
+
+    def _edge(row: dict[str, Any]) -> float:
+        eco = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+        try:
+            return float(eco.get("net_edge"))
+        except (TypeError, ValueError):
+            return -1.0
+
+    opportunities.sort(key=_edge, reverse=True)
+    return [opportunities[0]]
 
 
 _LOCKED_NO_REASONS = {
     "intraday_impossible_no",
     "provisional_loser_no",
     "source_final_loser_no",
+}
+
+_LOCKED_SELL_YES_REASONS = {
+    "intraday_impossible_sell_yes",
+    "provisional_loser_sell_yes",
+    "source_final_loser_sell_yes",
 }
 
 
@@ -203,11 +246,19 @@ def _lock_snapshot(row: dict[str, Any]) -> dict[str, Any]:
     )
     reason = str(row.get("reason") or "")
     side = str(row.get("trade_side") or "").upper()
+    order_side = str(row.get("order_side") or "BUY").upper()
+    locked_no = side == "NO" and reason in _LOCKED_NO_REASONS and impossible
+    locked_sell_yes = (
+        order_side == "SELL"
+        and side == "YES"
+        and reason in _LOCKED_SELL_YES_REASONS
+        and impossible
+    )
     return {
-        "locked": bool(
-            side == "NO" and reason in _LOCKED_NO_REASONS and impossible
-        ),
+        "locked": bool(locked_no or locked_sell_yes),
+        "lock_kind": "sell_yes" if locked_sell_yes else ("buy_no" if locked_no else ""),
         "trade_side": side,
+        "order_side": order_side,
         "reason": reason,
         "metric": metric,
         "running_value": running,
@@ -273,6 +324,9 @@ def _slim_row(row: dict[str, Any]) -> dict[str, Any]:
 def _candidate_view(row: dict[str, Any]) -> dict[str, Any]:
     item = _slim_row(row)
     item["lock"] = _lock_snapshot(item)
+    order_side = str(item.get("order_side") or (item.get("economics") or {}).get("order_side") or "BUY").upper()
+    item["order_side"] = order_side
+    item["side_label"] = _side_label(item)
     return item
 
 
@@ -947,6 +1001,9 @@ class RuntimeService:
         for row in result.get("rows") or []:
             if not isinstance(row, dict) or row.get("status") != "opportunity":
                 continue
+            # Sell-Yes needs Yes inventory (no mint path yet). Never auto-take it.
+            if str(row.get("order_side") or "BUY").upper() == "SELL":
+                continue
             token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
             if not token_id:
                 continue
@@ -980,7 +1037,7 @@ class RuntimeService:
     ) -> dict[str, Any]:
         from .env import trading_config
         from .models import utc_now
-        from .orders import LiveOrderError, quantize_buy, submit_fak_buy
+        from .orders import LiveOrderError, quantize_buy, quantize_sell, submit_fak_buy, submit_fak_sell
 
         cfg = trading_config()
         wanted_event = str(event_group_id or "").strip()
@@ -1006,11 +1063,23 @@ class RuntimeService:
                         "event_group_id": row.get("event_group_id"),
                         "target_outcome": row.get("target_outcome"),
                         "status": row.get("status"),
+                        "order_side": row.get("order_side"),
                     }
                     for row in matches[:20]
                 ],
             }
         row = copy.deepcopy(matches[0])
+        order_side_hint = str(row.get("order_side") or "BUY").upper()
+        if live and order_side_hint == "SELL":
+            return {
+                "ok": False,
+                "error": "sell_yes_requires_inventory",
+                "hint": (
+                    "Dead-bucket sell Yes is dry-run only until inventory/mint is wired. "
+                    "Live FAK sells need Yes shares in the wallet; auto-take never submits them."
+                ),
+                "row": _slim_row(row),
+            }
         token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
         if not token_id:
             return {"ok": False, "error": "missing_token", "row": _slim_row(row)}
@@ -1055,6 +1124,7 @@ class RuntimeService:
                 "row": _slim_row(row),
             }
         economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+        order_side = str(row.get("order_side") or economics.get("order_side") or "BUY").upper()
         price = float(economics.get("worst_price") or economics.get("execution_price") or 0.0)
         size = float(economics.get("execution_shares") or 0.0)
         min_order = float(economics.get("min_order_size") or 0.0)
@@ -1063,7 +1133,10 @@ class RuntimeService:
         max_shares = float(cfg["max_order_usdc"]) / price
         size = min(size, max_shares)
         try:
-            price, size = quantize_buy(price, size, float(cfg["max_order_usdc"]))
+            if order_side == "SELL":
+                price, size = quantize_sell(price, size, float(cfg["max_order_usdc"]))
+            else:
+                price, size = quantize_buy(price, size, float(cfg["max_order_usdc"]))
         except LiveOrderError as exc:
             return {"ok": False, "error": str(exc), "price": price, "size": size}
         if min_order > 0 and size + 1e-12 < min_order:
@@ -1081,8 +1154,9 @@ class RuntimeService:
             "market_id": row.get("market_id"),
             "target_outcome": row.get("target_outcome"),
             "trade_side": row.get("trade_side"),
+            "order_side": order_side,
             "token_id": token_id,
-            "side": "BUY",
+            "side": order_side,
             "order_type": "FAK",
             "price": price,
             "size": size,
@@ -1117,7 +1191,8 @@ class RuntimeService:
                     }
                 self._taken_tokens.update(fill_keys)
             try:
-                exchange = submit_fak_buy(
+                submit = submit_fak_sell if order_side == "SELL" else submit_fak_buy
+                exchange = submit(
                     token_id=token_id,
                     price=price,
                     size=size,

@@ -353,7 +353,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(result["summary"]["market_match_rate"], 1.0)
         self.assertEqual(result["summary"]["bucket_match_rate"], 1.0)
         self.assertEqual(result["summary"]["opportunities"], 1)
-        self.assertEqual(sum(1 for row in result["rows"] if row.get("book")), 11)
+        self.assertEqual(sum(1 for row in result["rows"] if row.get("book")), 21)
         self.assertTrue(all("raw" not in (row.get("market") or {}) for row in result["rows"]))
         self.assertTrue(all("raw" not in (row.get("observation") or {}) for row in result["rows"]))
         self.assertTrue(all("series" not in (row.get("observation") or {}) for row in result["rows"]))
@@ -363,11 +363,19 @@ class WeatherRuntimeTests(unittest.TestCase):
         candidate = next(row for row in result["rows"] if row["status"] == "opportunity")
         self.assertEqual(candidate["matched_outcome"], "26")
         self.assertEqual(candidate["trade_side"], "YES")
+        self.assertEqual(str(candidate.get("order_side") or "BUY"), "BUY")
         self.assertAlmostEqual(candidate["economics"]["net_edge"], 0.009505, places=6)
         losers = [row for row in result["rows"] if row.get("trade_side") == "NO"]
         self.assertEqual(len(losers), 10)
         self.assertTrue(all(row["status"] == "no_trade" for row in losers))
         self.assertTrue(all(row["reason"] == "ask_above_limit" for row in losers))
+        sell_yes = [
+            row
+            for row in result["rows"]
+            if str(row.get("order_side") or "") == "SELL"
+        ]
+        self.assertEqual(len(sell_yes), 10)
+        self.assertTrue(all(row["status"] == "no_trade" for row in sell_yes))
 
     def test_neg_risk_flag_does_not_block_winner_yes(self) -> None:
         raw_markets = load_market_rows(str(FIXTURES / "markets.json"))
@@ -621,6 +629,14 @@ class WeatherRuntimeTests(unittest.TestCase):
                 }
         return books
 
+    def _buy_rows_by_outcome(self, rows):
+        by_outcome = {}
+        for row in rows:
+            if str(row.get("order_side") or "BUY").upper() == "SELL":
+                continue
+            by_outcome[row["target_outcome"]] = row
+        return by_outcome
+
     def test_intraday_min_impossible_no_is_candidate(self) -> None:
         buckets = [
             {"outcome": "18 or below", "upper": 18, "upper_inclusive": True},
@@ -678,7 +694,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=now,
         )
-        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
         self.assertEqual(by_outcome["23"]["status"], "opportunity")
         self.assertEqual(by_outcome["23"]["trade_side"], "NO")
         self.assertEqual(by_outcome["23"]["reason"], "intraday_impossible_no")
@@ -688,7 +704,9 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertNotEqual(by_outcome["19"].get("trade_side"), "YES")
         self.assertFalse(
             any(
-                row.get("trade_side") == "YES" and row.get("target_outcome") == "19"
+                row.get("trade_side") == "YES"
+                and str(row.get("order_side") or "BUY") == "BUY"
+                and row.get("target_outcome") == "19"
                 for row in result["rows"]
             )
         )
@@ -740,13 +758,225 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=now,
         )
-        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
         self.assertEqual(by_outcome["30"]["status"], "opportunity")
         self.assertEqual(by_outcome["30"]["trade_side"], "NO")
         self.assertEqual(by_outcome["30"]["reason"], "intraday_impossible_no")
         self.assertEqual(by_outcome["33"]["status"], "waiting")
         self.assertEqual(by_outcome["34"]["status"], "waiting")
-        self.assertFalse(any(row.get("trade_side") == "YES" for row in result["rows"]))
+        self.assertFalse(
+            any(
+                row.get("trade_side") == "YES" and str(row.get("order_side") or "BUY") == "BUY"
+                for row in result["rows"]
+            )
+        )
+
+    def test_intraday_impossible_sell_yes_when_dead_yes_has_bids(self) -> None:
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "31",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 31,
+                "upper_inclusive": True,
+            },
+            {
+                "outcome": "32",
+                "lower": 31,
+                "lower_inclusive": False,
+                "upper": 32,
+                "upper_inclusive": True,
+            },
+            {"outcome": "33", "lower": 32, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="intraday-sell-yes-31",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[
+                {"value": 28, "timestamp": "2026-09-06T02:00:00Z"},
+                {"value": 32, "timestamp": "2026-09-06T08:00:00Z"},
+            ],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        stamp = now.isoformat()
+        books = {}
+        for market in markets:
+            no_token = market.no_token_id or market.token_ids[1]
+            yes_token = market.yes_token_id or market.token_ids[0]
+            # No asks gone (common live case); dead 31 Yes still has a bid.
+            books[no_token] = {
+                "token_id": no_token,
+                "asks": [],
+                "bids": [{"price": 0.999, "size": 50}],
+                "tick_size": 0.001,
+                "min_order_size": 1,
+                "fetched_at": stamp,
+            }
+            if str(market.outcome) == "31":
+                books[yes_token] = {
+                    "token_id": yes_token,
+                    "asks": [{"price": 0.05, "size": 10}],
+                    "bids": [{"price": 0.04, "size": 20}],
+                    "tick_size": 0.001,
+                    "min_order_size": 1,
+                    "fetched_at": stamp,
+                }
+            else:
+                books[yes_token] = {
+                    "token_id": yes_token,
+                    "asks": [{"price": 0.99, "size": 10}],
+                    "tick_size": 0.001,
+                    "min_order_size": 1,
+                    "fetched_at": stamp,
+                }
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets,
+            rules,
+            books=books,
+            fetch_books=False,
+            now=now,
+        )
+        sell_rows = [
+            row
+            for row in result["rows"]
+            if row.get("target_outcome") == "31" and str(row.get("order_side") or "") == "SELL"
+        ]
+        self.assertEqual(len(sell_rows), 1)
+        sell = sell_rows[0]
+        self.assertEqual(sell["status"], "opportunity")
+        self.assertEqual(sell["trade_side"], "YES")
+        self.assertEqual(sell["reason"], "intraday_impossible_sell_yes")
+        self.assertGreaterEqual(float((sell.get("economics") or {}).get("net_edge") or 0), 0.0075)
+        no_rows = [
+            row
+            for row in result["rows"]
+            if row.get("target_outcome") == "31" and str(row.get("order_side") or "BUY") == "BUY"
+        ]
+        self.assertEqual(no_rows[0]["status"], "no_trade")
+        self.assertEqual(no_rows[0]["reason"], "book_missing")
+
+    def test_sell_yes_skipped_when_buy_no_already_opportunity(self) -> None:
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "31",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 31,
+                "upper_inclusive": True,
+            },
+            {"outcome": "32", "lower": 31, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="prefer-buy-no",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[{"value": 32, "timestamp": "2026-09-06T08:00:00Z"}],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        stamp = now.isoformat()
+        books = self._priced_books(markets, now, {"30", "31"})
+        for market in markets:
+            yes_token = market.yes_token_id or market.token_ids[0]
+            books[yes_token] = {
+                "token_id": yes_token,
+                "asks": [{"price": 0.05, "size": 10}],
+                "bids": [{"price": 0.04, "size": 20}],
+                "tick_size": 0.001,
+                "min_order_size": 1,
+                "fetched_at": stamp,
+            }
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets, rules, books=books, fetch_books=False, now=now
+        )
+        sell_30 = next(
+            row
+            for row in result["rows"]
+            if row.get("target_outcome") == "30" and str(row.get("order_side") or "") == "SELL"
+        )
+        self.assertEqual(sell_30["status"], "no_trade")
+        self.assertEqual(sell_30["reason"], "buy_no_preferred")
+        buy_30 = next(
+            row
+            for row in result["rows"]
+            if row.get("target_outcome") == "30" and str(row.get("order_side") or "BUY") == "BUY"
+        )
+        self.assertEqual(buy_30["status"], "opportunity")
+
+    def test_live_take_refuses_sell_yes_without_inventory_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service.last_result = {
+                "summary": {},
+                "rows": [
+                    {
+                        "event_group_id": "dead-bucket-event",
+                        "target_outcome": "30",
+                        "trade_side": "YES",
+                        "order_side": "SELL",
+                        "status": "opportunity",
+                        "reason": "intraday_impossible_sell_yes",
+                        "book_token_id": "yes-token",
+                        "market_id": "m1",
+                        "market": {"id": "m1"},
+                    }
+                ],
+            }
+            result = service.take_opportunity(
+                event_group_id="dead-bucket-event",
+                target_outcome="30",
+                live=True,
+            )
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "sell_yes_requires_inventory")
+
+    def test_auto_take_skips_sell_yes_rows(self) -> None:
+        from unittest.mock import patch
+
+        sell_row = {
+            "event_group_id": "dead-bucket-event",
+            "target_outcome": "30",
+            "trade_side": "YES",
+            "order_side": "SELL",
+            "status": "opportunity",
+            "reason": "intraday_impossible_sell_yes",
+            "book_token_id": "yes-token",
+            "market_id": "m1",
+            "market": {"id": "m1"},
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service.last_result = {"summary": {}, "rows": [sell_row]}
+            with patch.dict("os.environ", {"LIVE_ORDERS": "true"}, clear=False):
+                with patch.object(service, "take_opportunity") as take:
+                    takes = service._auto_take_opportunities(service.last_result)
+            self.assertEqual(takes, [])
+            take.assert_not_called()
+
+    def test_walk_bids_consumes_highest_levels_first(self) -> None:
+        from weather_runtime.books import normalize_book, walk_bids
+
+        book = normalize_book(
+            "tok",
+            {
+                "bids": [
+                    {"price": "0.03", "size": "10"},
+                    {"price": "0.05", "size": "3"},
+                    {"price": "0.04", "size": "4"},
+                ],
+                "fetched_at": "2026-09-07T00:00:00+00:00",
+            },
+        )
+        self.assertEqual([level["price"] for level in book.bids], [0.05, 0.04, 0.03])
+        fill = walk_bids(book, min_price=0.035, target_shares=5)
+        self.assertTrue(fill["complete"])
+        self.assertAlmostEqual(fill["filled_shares"], 5)
+        self.assertAlmostEqual(fill["worst_price"], 0.04)
+        self.assertAlmostEqual(fill["proceeds"], 3 * 0.05 + 2 * 0.04)
 
     def test_intraday_before_local_midnight_does_not_fetch(self) -> None:
         class CountingAdapter(WeatherSourceAdapter):
@@ -818,7 +1048,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=now,
         )
-        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
         self.assertEqual((by_outcome["19"].get("observation") or {}).get("status"), "provisional")
         self.assertEqual(by_outcome["19"]["status"], "waiting")
         self.assertNotEqual(by_outcome["19"].get("trade_side"), "YES")
@@ -1138,7 +1368,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             config=WeatherScannerConfig(),
             clob_client=FakeClob(),
         ).scan(markets, rules, fetch_books=True, now=now)
-        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
         waiting_yes = next(item.yes_token_id for item in markets if item.outcome == "33")
         impossible_no = next(item.no_token_id for item in markets if item.outcome == "30")
         self.assertTrue(calls)
@@ -1274,7 +1504,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             config=WeatherScannerConfig(),
             clob_client=FakeClob(),
         ).scan(markets, rules, fetch_books=True)
-        by_outcome = {row["target_outcome"]: row for row in result["rows"]}
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
         self.assertEqual(by_outcome["30"]["status"], "opportunity")
         self.assertNotEqual(by_outcome["30"].get("reason"), "book_stale")
 
@@ -2931,7 +3161,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=now,
         )
-        hourly_by = {row["target_outcome"]: row for row in hourly_result["rows"]}
+        hourly_by = self._buy_rows_by_outcome(hourly_result["rows"])
         self.assertEqual((hourly_by["56-57°F"].get("observation") or {}).get("value"), 57)
         self.assertNotEqual(hourly_by["56-57°F"].get("reason"), "intraday_impossible_no")
         self.assertNotEqual(hourly_by["56-57°F"].get("trade_side"), "NO")
@@ -2958,7 +3188,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=now,
         )
-        all_by = {row["target_outcome"]: row for row in all_result["rows"]}
+        all_by = self._buy_rows_by_outcome(all_result["rows"])
         self.assertEqual((all_by["56-57°F"].get("observation") or {}).get("value"), 55)
         self.assertEqual(all_by["56-57°F"]["status"], "opportunity")
         self.assertEqual(all_by["56-57°F"]["reason"], "intraday_impossible_no")

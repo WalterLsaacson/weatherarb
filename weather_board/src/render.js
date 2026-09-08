@@ -100,7 +100,7 @@ export function renderEvents() {
       <td>${badge(row.rule?.manual_approval ? "approved" : "review", row.rule?.manual_approval ? "approved" : "review")}</td>
       <td>${badge(observation.status || group.source_status, observation.provider || "source")}<small>${escapeHtml(sourceAge)}</small></td>
       <td><strong>${escapeHtml(bucket)}</strong><small>${group.matched_market_count ?? 0}/${group.market_count ?? 0} target${(group.candidate_count || 0) ? " · " + group.candidate_count + " cand" : ""}</small></td>
-      <td><span class="mono">${price(economics.execution_price || book.best_ask)}</span><small>${escapeHtml(row.trade_side || "VWAP")} · ${num(economics.net_edge, 4)}</small></td>
+      <td><span class="mono">${price(economics.execution_price || book.best_ask)}</span><small>${escapeHtml(row.side_label || row.trade_side || "VWAP")} · ${num(economics.net_edge, 4)}</small></td>
       <td>${badge(lifecycle)}<small>${escapeHtml(row.reason || "")}</small></td>
       <td><span class="mono">${escapeHtml(bookState)}</span><small>${escapeHtml(fmtTime(observation.observed_at))}</small></td>
     </tr>`;
@@ -117,16 +117,19 @@ export function renderCandidates() {
     ? rows.map((row) => {
         const eco = row.economics || {};
         const source = row.observation || {};
+        const orderSide = String(row.order_side || eco.order_side || "BUY").toUpperCase();
+        const sideLabel = row.side_label || ((row.trade_side || "YES") + (orderSide === "SELL" ? " SELL" : ""));
+        const inventoryNote = orderSide === "SELL" ? "需持有 Yes · live 不下单" : "DRY-RUN";
         return `<article class="candidate">
-          <div class="candidate__head"><span>${escapeHtml(source.station_id || row.event_group_id)}</span>${badge("opportunity", "dry-run")}</div>
-          <strong>${escapeHtml((row.target_outcome || row.matched_outcome || "—") + " " + (row.trade_side || "YES"))}</strong>
+          <div class="candidate__head"><span>${escapeHtml(source.station_id || row.event_group_id)}</span>${badge("opportunity", inventoryNote)}</div>
+          <strong>${escapeHtml((row.target_outcome || row.matched_outcome || "—") + " " + sideLabel)}</strong>
           <div class="candidate__grid">
             <span>VWAP <b>${price(eco.execution_price)}</b></span>
             <span>Net <b>${num(eco.net_edge, 4)}</b></span>
             <span>Fee <b>${num(eco.fee_rate, 3)}</b></span>
-            <span>Depth <b>${num(eco.ask_depth_at_limit, 2)}</b></span>
+            <span>Depth <b>${num(eco.ask_depth_at_limit ?? eco.bid_depth_at_floor, 2)}</b></span>
           </div>
-          <small>${escapeHtml(row.event_group_id)} · ${escapeHtml(fmtTime(row.created_at))}</small>
+          <small>${escapeHtml(row.reason || "")} · ${escapeHtml(row.event_group_id)} · ${escapeHtml(fmtTime(row.created_at))}</small>
         </article>`;
       }).join("")
     : `<div class="empty">当前没有通过盘口经济门的候选</div>`;
