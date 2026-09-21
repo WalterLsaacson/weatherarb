@@ -1,4 +1,4 @@
-"""Optional live FAK buys. Dry-run never imports the signer."""
+"""Optional live FAK and GTC buys. Dry-run never imports the signer."""
 
 from __future__ import annotations
 
@@ -50,6 +50,25 @@ def quantize_sell(price: float, size: float, max_usdc: float) -> tuple[float, fl
     return quantize_buy(price, size, max_usdc)
 
 
+def quantize_limit_buy(price: float, size: float, max_usdc: float) -> tuple[float, float]:
+    """GTC buys: fixed min shares, refuse if notional exceeds max_usdc."""
+
+    cent = Decimal("0.01")
+    px = Decimal(str(price)).quantize(cent, rounding=ROUND_DOWN)
+    shares = Decimal(str(size)).quantize(cent, rounding=ROUND_DOWN)
+    if px <= 0:
+        raise LiveOrderError("invalid_price")
+    if shares <= 0:
+        raise LiveOrderError("invalid_size")
+    budget = Decimal(str(max_usdc)).quantize(cent, rounding=ROUND_DOWN)
+    if px * shares > budget:
+        raise LiveOrderError("limit_order_exceeds_usdc")
+    maker = px * shares
+    if maker != maker.quantize(cent, rounding=ROUND_DOWN):
+        raise LiveOrderError("cannot_quantize_limit_buy_amount")
+    return float(px), float(shares)
+
+
 def submit_fak_buy(
     *,
     token_id: str,
@@ -57,11 +76,12 @@ def submit_fak_buy(
     size: float,
     config: Optional[dict[str, Any]] = None,
 ) -> Any:
-    return _submit_fak(
+    return _submit_order(
         token_id=token_id,
         price=price,
         size=size,
         side="BUY",
+        order_type="FAK",
         config=config,
     )
 
@@ -73,11 +93,29 @@ def submit_fak_sell(
     size: float,
     config: Optional[dict[str, Any]] = None,
 ) -> Any:
-    return _submit_fak(
+    return _submit_order(
         token_id=token_id,
         price=price,
         size=size,
         side="SELL",
+        order_type="FAK",
+        config=config,
+    )
+
+
+def submit_gtc_buy(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    return _submit_order(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side="BUY",
+        order_type="GTC",
         config=config,
     )
 
@@ -88,6 +126,25 @@ def _submit_fak(
     price: float,
     size: float,
     side: str,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    return _submit_order(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side=side,
+        order_type="FAK",
+        config=config,
+    )
+
+
+def _submit_order(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    side: str,
+    order_type: str,
     config: Optional[dict[str, Any]] = None,
 ) -> Any:
     from .env import trading_config
@@ -114,7 +171,7 @@ def _submit_fak(
             size=float(size),
             side=str(side or "BUY").upper(),
         )
-        signed = replace(signed, order_type="FAK")
+        signed = replace(signed, order_type=str(order_type or "FAK").upper())
         response = client.post_order(signed)
     except Exception as exc:  # noqa: BLE001
         raise LiveOrderError(str(exc)) from exc

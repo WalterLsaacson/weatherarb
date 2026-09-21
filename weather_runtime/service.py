@@ -41,9 +41,7 @@ from .rules import (
 )
 from .scanner import WeatherScanner, WeatherScannerConfig, extrema_from_rows
 from .sources import JsonHttp, series_from_raw
-from .observation_archive import persist_wrh_observation_points
 from .storage import append_jsonl, append_jsonl_dedup, load_json, write_json_atomic
-from .synoptic_push import SynopticPushRecorder, synoptic_watch_from_rules
 
 
 def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
@@ -224,6 +222,11 @@ _LOCKED_SELL_YES_REASONS = {
     "intraday_impossible_sell_yes",
     "provisional_loser_sell_yes",
     "source_final_loser_sell_yes",
+}
+
+_LIMIT_ORDER_REASONS = {
+    "source_final_winner_yes",
+    "source_final_loser_no",
 }
 
 
@@ -422,13 +425,6 @@ class RuntimeService:
             http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S)
         )
         self.scanner.clob_client = ClobClient(http=self.http)
-        self.synoptic_push = SynopticPushRecorder(
-            self.data_dir,
-            token_fn=self.scanner.source_adapter._synoptic_token,
-            enabled=False if self.fixture else None,
-            proxy=proxy if proxy is not None else self.http.proxy,
-        )
-        self._push_desired = False
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -462,6 +458,7 @@ class RuntimeService:
         self.scan_in_progress = False
         self._extrema: dict[str, dict[str, Any]] = {}
         self._taken_tokens: set[str] = set()
+        self._limit_taken_tokens: set[str] = set()
         self._hydrate_last_result()
         self._hydrate_taken()
 
@@ -496,7 +493,12 @@ class RuntimeService:
                     except ValueError:
                         continue
                     keys = _fill_keys(record)
-                    if keys:
+                    if not keys:
+                        continue
+                    order_type = str(record.get("order_type") or "FAK").upper()
+                    if order_type == "GTC":
+                        self._limit_taken_tokens.update(keys)
+                    else:
                         self._taken_tokens.update(keys)
         except OSError:
             return
@@ -740,20 +742,7 @@ class RuntimeService:
                 row.get("event_group_id"), row.get("evidence_hash"), row.get("source_timestamp")
             ),
         )
-        wrh_path = self.data_dir / "wrh_observation_points.jsonl"
-        # Do not rotate this file: first_seen_at dedupe needs the full history.
-        persist_wrh_observation_points(wrh_path, evidence, polled_at=stamp)
         self._series_index = None
-
-    def _sync_synoptic_push(self, rules: list[Any], *, now: Optional[datetime] = None) -> None:
-        if self.fixture or not self.synoptic_push.enabled:
-            return
-        if self.stop_event.is_set() or not self._push_desired:
-            return
-        watches = synoptic_watch_from_rules(rules, now=now)
-        self.synoptic_push.set_watch(watches)
-        if self._push_desired and not self.stop_event.is_set():
-            self.synoptic_push.start()
 
     def scan_once(self) -> dict[str, Any]:
         self.scan_in_progress = True
@@ -784,7 +773,6 @@ class RuntimeService:
         with self.lock:
             previous_extrema = dict(self._extrema)
         scan_now = self._scan_now()
-        self._sync_synoptic_push(rules, now=scan_now)
         result = self.scanner.scan(
             markets,
             rules,
@@ -839,7 +827,8 @@ class RuntimeService:
             },
         )
         takes = self._auto_take_opportunities(result)
-        if takes:
+        limits = self._auto_place_limit_orders(result)
+        if takes or limits:
             self._publish("health_update", self.status())
         return result
 
@@ -860,12 +849,9 @@ class RuntimeService:
             if self.running:
                 return self.status()
             self.stop_event.clear()
-            self._push_desired = True
             self.running = True
             self.thread = threading.Thread(target=self._loop, name="weather-scan", daemon=True)
             self.thread.start()
-        if not self.fixture and self._push_desired:
-            self.synoptic_push.start()
         if scan_now:
             # The loop performs its own scan; waiting briefly here makes the
             # start endpoint useful for a local operator without blocking long.
@@ -874,9 +860,7 @@ class RuntimeService:
         return self.status()
 
     def stop(self) -> dict[str, Any]:
-        self._push_desired = False
         self.stop_event.set()
-        self.synoptic_push.stop()
         with self.lock:
             thread = self.thread
             self.running = False
@@ -1009,7 +993,7 @@ class RuntimeService:
                 "summary": summary,
                 "trading": self.trading_status(),
                 "taken_tokens": len(self._taken_tokens),
-                "synoptic_push": self.synoptic_push.status(),
+                "limit_taken_tokens": len(self._limit_taken_tokens),
             }
 
     def trading_status(self) -> dict[str, Any]:
@@ -1017,6 +1001,7 @@ class RuntimeService:
 
         status = public_trading_status()
         status["taken_tokens"] = len(self._taken_tokens)
+        status["limit_taken_tokens"] = len(self._limit_taken_tokens)
         return status
 
     def _auto_take_opportunities(self, result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1055,6 +1040,120 @@ class RuntimeService:
                 )
             )
         return takes
+
+    def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        """GTC buy on source-final winner Yes and loser No (min shares, fixed price band)."""
+
+        from .env import trading_config
+        from .models import utc_now
+        from .orders import LiveOrderError, quantize_limit_buy, submit_gtc_buy
+
+        cfg = trading_config()
+        if not cfg.get("limit_orders") or self.fixture:
+            return []
+        price = float(cfg["limit_order_price"])
+        min_price = float(cfg["limit_order_min_price"])
+        max_price = float(cfg["limit_order_max_price"])
+        max_usdc = float(cfg["limit_order_usdc"])
+        if price < min_price or price > max_price:
+            return []
+        live = bool(cfg.get("live_orders"))
+        placed: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in result.get("rows") or []:
+            if not isinstance(row, dict) or row.get("status") != "opportunity":
+                continue
+            reason = str(row.get("reason") or "")
+            if reason not in _LIMIT_ORDER_REASONS:
+                continue
+            if str(row.get("order_side") or "BUY").upper() != "BUY":
+                continue
+            token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
+            if not token_id:
+                continue
+            keys = _instrument_keys(row, token_id)
+            if keys & self._limit_taken_tokens or token_id in seen:
+                continue
+            economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+            book = row.get("book") if isinstance(row.get("book"), dict) else {}
+            min_order = float(
+                economics.get("min_order_size")
+                or book.get("min_order_size")
+                or 0.0
+            )
+            if min_order <= 0:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": "missing_min_order_size",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                    }
+                )
+                continue
+            try:
+                px, size = quantize_limit_buy(price, min_order, max_usdc)
+            except LiveOrderError as exc:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                        "price": price,
+                        "size": min_order,
+                    }
+                )
+                continue
+            seen.add(token_id)
+            stamp = utc_now().isoformat()
+            record: dict[str, Any] = {
+                "ok": True,
+                "dry_run": not live,
+                "status": "simulated_gtc" if not live else "submitted",
+                "order_type": "GTC",
+                "limit_orders": True,
+                "token_id": token_id,
+                "price": px,
+                "size": size,
+                "usdc": round(px * size, 4),
+                "trade_side": row.get("trade_side"),
+                "order_side": "BUY",
+                "reason": reason,
+                "event_group_id": row.get("event_group_id"),
+                "target_outcome": row.get("target_outcome"),
+                "market_id": row.get("market_id"),
+                "created_at": stamp,
+            }
+            if live:
+                try:
+                    exchange = submit_gtc_buy(token_id=token_id, price=px, size=size, config=cfg)
+                    record["exchange"] = exchange
+                    record["status"] = "submitted"
+                    self._limit_taken_tokens.update(keys)
+                except LiveOrderError as exc:
+                    record.update({"ok": False, "status": "error", "error": str(exc)})
+            else:
+                # Session dedupe even in dry-run so we do not spam simulations each tick.
+                self._limit_taken_tokens.update(keys)
+            append_jsonl(self.data_dir / "orders.jsonl", [record])
+            print(
+                "LIMIT {} {} {} {} @ {} x {}".format(
+                    "LIVE" if live else "DRY",
+                    row.get("event_group_id"),
+                    row.get("target_outcome"),
+                    row.get("trade_side"),
+                    px,
+                    size,
+                ),
+                flush=True,
+            )
+            placed.append(record)
+        return placed
 
     def take_opportunity(
         self,

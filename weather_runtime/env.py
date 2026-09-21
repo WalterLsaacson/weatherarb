@@ -41,6 +41,7 @@ def _first_env(*names: str) -> str:
 
 def trading_config() -> dict[str, Any]:
     live = as_bool(os.environ.get("LIVE_ORDERS"), False)
+    limit_orders = as_bool(os.environ.get("LIMIT_ORDERS"), False)
     return {
         "private_key": _first_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY"),
         "address": _first_env("POLY_ADDRESS", "POLYMARKET_WALLET_ADDRESS"),
@@ -53,6 +54,11 @@ def trading_config() -> dict[str, Any]:
         "api_passphrase": _first_env("POLY_API_PASSPHRASE", "POLYMARKET_API_PASSPHRASE"),
         "live_orders": bool(live),
         "max_order_usdc": float(as_float(os.environ.get("MAX_ORDER_USDC"), 5.0) or 5.0),
+        "limit_orders": bool(limit_orders),
+        "limit_order_usdc": float(as_float(os.environ.get("LIMIT_ORDER_USDC"), 5.0) or 5.0),
+        "limit_order_price": float(as_float(os.environ.get("LIMIT_ORDER_PRICE"), 0.99) or 0.99),
+        "limit_order_min_price": float(as_float(os.environ.get("LIMIT_ORDER_MIN_PRICE"), 0.01) or 0.01),
+        "limit_order_max_price": float(as_float(os.environ.get("LIMIT_ORDER_MAX_PRICE"), 0.99) or 0.99),
         "has_private_key": bool(_first_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY")),
         "has_api_creds": bool(
             _first_env("POLY_API_KEY", "POLYMARKET_API_KEY")
@@ -73,4 +79,9 @@ def public_trading_status() -> dict[str, Any]:
         "chain_id": cfg["chain_id"],
         "clob_host": cfg["clob_host"],
         "max_order_usdc": cfg["max_order_usdc"],
+        "limit_orders": cfg["limit_orders"],
+        "limit_order_usdc": cfg["limit_order_usdc"],
+        "limit_order_price": cfg["limit_order_price"],
+        "limit_order_min_price": cfg["limit_order_min_price"],
+        "limit_order_max_price": cfg["limit_order_max_price"],
     }

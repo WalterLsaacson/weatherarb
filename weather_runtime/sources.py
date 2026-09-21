@@ -436,7 +436,7 @@ class WeatherSourceAdapter:
                 os.environ.get("WEATHER_COM_API_KEY") or os.environ.get("WU_API_KEY") or _WU_WEB_API_KEY,
             )
         if "synopticdata.com" in url:
-            params.setdefault("token", self._synoptic_token())
+            params.setdefault("token", self._wrh_page_token())
             params["STID"] = params.get("STID") or source.get("station_id")
             params["showemptystations"] = 1
             params["units"] = _SYNOPTIC_PAGE_UNITS
@@ -477,6 +477,17 @@ class WeatherSourceAdapter:
             with self._http_lock:
                 self._http_fail[cache_key] = time.time()
             raise
+        # WRH timeseries requests english/temp|F; if Synoptic omits UNITS, treat as F.
+        if "synopticdata.com" in url and isinstance(payload, dict):
+            units = payload.get("UNITS") or payload.get("units")
+            has_air = isinstance(units, dict) and bool(
+                units.get("air_temp") or units.get("air_temp_set_1")
+            )
+            if not has_air:
+                payload = dict(payload)
+                merged = dict(units) if isinstance(units, dict) else {}
+                merged.setdefault("air_temp", "Fahrenheit")
+                payload["UNITS"] = merged
         payload = self._normalize_payload(rule, payload)
         if self.http_cache_ttl_s:
             with self._http_lock:
@@ -517,7 +528,7 @@ class WeatherSourceAdapter:
         unique.sort(key=lambda item: 0 if self._window_open(item, current_utc) else 1)
         try:
             if any("synopticdata.com" in str(rule.source.get("url") or "") for rule in unique):
-                self._synoptic_token()
+                self._wrh_page_token()
         except Exception:
             pass
         gate = threading.Semaphore(8)
@@ -610,17 +621,23 @@ class WeatherSourceAdapter:
                 evidence_hash=evidence_hash,
             )
 
-    def _synoptic_token(self) -> str:
-        env = (
+    def _synoptic_account_token(self) -> str:
+        return (
             os.environ.get("SYNOPTIC_API_TOKEN")
             or os.environ.get("MESOWEST_TOKEN")
             or ""
         ).strip()
-        if env:
-            return env
+
+    def _wrh_page_token(self) -> str:
+        """Token used by weather.gov WRH timeseries (page scrape), not the account API token."""
+
         now = time.time()
         with self._http_lock:
             if self._synoptic_token_error_at and (now - self._synoptic_token_error_at) < 60.0:
+                # Fall back to account token so scans keep working if page JS is down.
+                account = self._synoptic_account_token()
+                if account:
+                    return account
                 raise SourceError("synoptic token recently failed")
             cached = self._synoptic_token_cache
             if cached and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S and cached[1]:
@@ -630,12 +647,18 @@ class WeatherSourceAdapter:
         except SourceError:
             with self._http_lock:
                 self._synoptic_token_error_at = time.time()
+            account = self._synoptic_account_token()
+            if account:
+                return account
             raise
         match = _SYNOPTIC_TOKEN_RE.search(raw)
         token = (match.group(1) if match else "").strip()
         if not token:
             with self._http_lock:
                 self._synoptic_token_error_at = time.time()
+            account = self._synoptic_account_token()
+            if account:
+                return account
             raise SourceError("synoptic token missing")
         with self._http_lock:
             self._synoptic_token_cache = (now, token)

@@ -179,10 +179,11 @@ class WeatherRuntimeTests(unittest.TestCase):
 
         http = BoomHttp()
         adapter = WeatherSourceAdapter(http=http)
-        with self.assertRaises(SourceError):
-            adapter._synoptic_token()
-        with self.assertRaises(SourceError):
-            adapter._synoptic_token()
+        with patch.dict("os.environ", {"SYNOPTIC_API_TOKEN": "", "MESOWEST_TOKEN": ""}, clear=False):
+            with self.assertRaises(SourceError):
+                adapter._wrh_page_token()
+            with self.assertRaises(SourceError):
+                adapter._wrh_page_token()
         self.assertEqual(http.calls, 1)
 
     def _live_source_rule(self, *, url: str, station_id: str = "TEST"):
@@ -1500,10 +1501,11 @@ class WeatherRuntimeTests(unittest.TestCase):
                     for token_id in token_ids
                 }
 
+        now = datetime(2026, 9, 7, 12, 0, tzinfo=timezone.utc)
         result = WeatherScanner(
             config=WeatherScannerConfig(),
             clob_client=FakeClob(),
-        ).scan(markets, rules, fetch_books=True)
+        ).scan(markets, rules, fetch_books=True, now=now)
         by_outcome = self._buy_rows_by_outcome(result["rows"])
         self.assertEqual(by_outcome["30"]["status"], "opportunity")
         self.assertNotEqual(by_outcome["30"].get("reason"), "book_stale")
@@ -1946,7 +1948,19 @@ class WeatherRuntimeTests(unittest.TestCase):
             service.markets_file = FIXTURES / "markets.json"
             service.rules_file = FIXTURES / "rules.json"
             service.books_file = FIXTURES / "books.json"
-            result = service.scan_once()
+            # Fixture event dates are early September 2026; freeze horizon clock
+            # so catalog merge stays inside the window as wall time moves on.
+            with patch.object(
+                service,
+                "_horizon_now",
+                return_value=datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc),
+            ):
+                with patch.object(
+                    service,
+                    "_scan_now",
+                    return_value=datetime(2026, 9, 6, 12, 0, tzinfo=timezone.utc),
+                ):
+                    result = service.scan_once()
             extra = next(
                 group
                 for group in result["event_groups"]
@@ -3193,164 +3207,199 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(all_by["56-57°F"]["status"], "opportunity")
         self.assertEqual(all_by["56-57°F"]["reason"], "intraday_impossible_no")
 
+    def test_trading_config_parses_limit_order_knobs(self) -> None:
+        from weather_runtime.env import public_trading_status, trading_config
 
-class SynopticPushAndWrhArchiveTests(unittest.TestCase):
-    def test_parse_synoptic_push_date(self) -> None:
-        from weather_runtime.synoptic_push import parse_synoptic_push_date
+        env = {
+            "LIMIT_ORDERS": "true",
+            "LIMIT_ORDER_USDC": "7.5",
+            "LIMIT_ORDER_PRICE": "0.95",
+            "LIMIT_ORDER_MIN_PRICE": "0.02",
+            "LIMIT_ORDER_MAX_PRICE": "0.98",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            cfg = trading_config()
+            pub = public_trading_status()
+        self.assertTrue(cfg["limit_orders"])
+        self.assertAlmostEqual(cfg["limit_order_usdc"], 7.5)
+        self.assertAlmostEqual(cfg["limit_order_price"], 0.95)
+        self.assertAlmostEqual(cfg["limit_order_min_price"], 0.02)
+        self.assertAlmostEqual(cfg["limit_order_max_price"], 0.98)
+        self.assertTrue(pub["limit_orders"])
+        self.assertAlmostEqual(pub["limit_order_price"], 0.95)
 
-        self.assertEqual(parse_synoptic_push_date(201801132220), "2018-01-13T22:20:00+00:00")
-        self.assertIsNone(parse_synoptic_push_date("bad"))
+    def test_quantize_limit_buy_refuses_over_usdc(self) -> None:
+        from weather_runtime.orders import LiveOrderError, quantize_limit_buy
 
-    def test_synoptic_watch_from_rules_collects_active_stations(self) -> None:
-        from weather_runtime.models import Bucket, WeatherRule
-        from weather_runtime.synoptic_push import synoptic_watch_from_rules
+        px, size = quantize_limit_buy(0.99, 5.0, 5.0)
+        self.assertAlmostEqual(px, 0.99)
+        self.assertAlmostEqual(size, 5.0)
+        with self.assertRaises(LiveOrderError) as raised:
+            quantize_limit_buy(0.99, 6.0, 5.0)
+        self.assertEqual(str(raised.exception), "limit_order_exceeds_usdc")
 
-        now = datetime(2026, 9, 8, 12, tzinfo=timezone.utc)
-        rules = [
-            WeatherRule(
-                market_id="m1",
-                event_group_id="highest-temperature-in-san-francisco-on-september-8-2026",
-                adapter="weather_observation",
-                metric="daily_max",
-                unit="F",
-                timezone="America/Los_Angeles",
-                observation_start="2026-09-08T00:00:00",
-                observation_end="2026-09-08T23:59:59",
-                buckets=[Bucket(outcome="70+", lower=70, lower_inclusive=True)],
-                source={
-                    "provider": "noaa",
-                    "station_id": "KSFO",
-                    "url": "https://api.synopticdata.com/v2/stations/timeseries",
-                    "sample_set": "hourly",
-                },
-            ),
-            WeatherRule(
-                market_id="m2",
-                event_group_id="highest-temperature-in-austin-on-september-1-2026",
-                adapter="weather_observation",
-                metric="daily_max",
-                unit="F",
-                timezone="America/Chicago",
-                observation_start="2026-09-01T00:00:00",
-                observation_end="2026-09-01T23:59:59",
-                buckets=[Bucket(outcome="90+", lower=90, lower_inclusive=True)],
-                source={
-                    "provider": "noaa",
-                    "station_id": "KAUS",
-                    "url": "https://api.synopticdata.com/v2/stations/timeseries",
-                },
-            ),
-        ]
-        watches = synoptic_watch_from_rules(rules, now=now)
-        self.assertIn("KSFO", watches)
-        self.assertNotIn("KAUS", watches)
-        self.assertEqual(
-            watches["KSFO"]["event_group_ids"],
-            ["highest-temperature-in-san-francisco-on-september-8-2026"],
-        )
+    def test_submit_gtc_buy_sets_order_type_gtc(self) -> None:
+        from dataclasses import dataclass
+        from unittest.mock import MagicMock
 
-    def test_push_recorder_writes_data_rows_with_received_at(self) -> None:
-        from weather_runtime.storage import read_jsonl
-        from weather_runtime.synoptic_push import SynopticPushRecorder
+        from weather_runtime.orders import submit_gtc_buy
 
-        with tempfile.TemporaryDirectory() as temp:
-            recorder = SynopticPushRecorder(
-                Path(temp),
-                token_fn=lambda: "token",
-                enabled=False,
-            )
-            watches = {
-                "C4824": {
-                    "station_id": "C4824",
-                    "event_group_ids": ["evt-1"],
-                    "sample_sets": ["all"],
-                }
-            }
-            recorder.set_watch(watches)
-            recorder._handle_message(
-                json.dumps(
-                    {
-                        "type": "metadata",
-                        "units": [{"sensor": "air_temp", "unit": "Fahrenheit"}],
-                        "stations": [{"stid": "C4824"}],
-                    }
-                ),
-                watches,
-                track_session=True,
-            )
-            recorder._handle_message(
-                json.dumps(
-                    {
-                        "type": "data",
-                        "data": [
-                            {
-                                "set": 1,
-                                "stid": "C4824",
-                                "value": 72.5,
-                                "qc": [],
-                                "date": 202609081200,
-                                "sensor": "air_temp",
-                            }
-                        ],
-                    }
-                ),
-                watches,
-                track_session=True,
-            )
-            rows = read_jsonl(Path(temp) / "synoptic_push.jsonl")
-            data_rows = [row for row in rows if row.get("msg_type") == "data"]
-            self.assertEqual(len(data_rows), 1)
-            self.assertEqual(data_rows[0]["station_id"], "C4824")
-            self.assertAlmostEqual(data_rows[0]["value"], (72.5 - 32.0) * 5.0 / 9.0, places=4)
-            self.assertEqual(data_rows[0]["unit"], "C")
-            self.assertEqual(data_rows[0]["value_raw"], 72.5)
-            self.assertEqual(data_rows[0]["unit_raw"], "Fahrenheit")
-            self.assertEqual(data_rows[0]["obs_timestamp"], "2026-09-08T12:00:00+00:00")
-            self.assertTrue(data_rows[0].get("received_at"))
-            self.assertEqual(data_rows[0]["event_group_ids"], ["evt-1"])
+        @dataclass
+        class FakeSigned:
+            order_type: str = "FAK"
 
-    def test_normalize_push_air_temp_to_celsius(self) -> None:
-        from weather_runtime.synoptic_push import normalize_push_value
+        client = MagicMock()
+        client.create_limit_order.return_value = FakeSigned()
+        client.post_order.return_value = {"ok": True, "status": "live"}
+        cfg = {
+            "live_orders": True,
+            "private_key": "0xabc",
+            "funder": "0xfund",
+        }
+        with patch("polymarket.clients.secure.SecureClient") as secure:
+            secure.create.return_value = client
+            payload = submit_gtc_buy(token_id="tok-gtc", price=0.99, size=5.0, config=cfg)
 
-        value, unit, raw, unit_raw = normalize_push_value("air_temp", 32.0, "Fahrenheit")
-        self.assertEqual(value, 0.0)
-        self.assertEqual(unit, "C")
-        self.assertEqual(raw, 32.0)
-        self.assertEqual(unit_raw, "Fahrenheit")
-
-    def test_wrh_points_keep_first_seen_timestamp(self) -> None:
-        from weather_runtime.observation_archive import persist_wrh_observation_points
-        from weather_runtime.storage import read_jsonl
-
-        evidence = [
+        self.assertEqual(payload["ok"], True)
+        client.create_limit_order.assert_called_once()
+        client.post_order.assert_called_once()
+        posted = client.post_order.call_args.args[0]
+        self.assertEqual(posted.order_type, "GTC")
+        client.close.assert_called_once()
+    def _final_limit_rows(self) -> list[dict]:
+        return [
             {
-                "event_group_id": "evt-1",
-                "station_id": "KSFO",
-                "provider": "noaa",
-                "sample_set": "hourly",
-                "evidence_hash": "abc",
-                "source_timestamp": "2026-09-08T12:00:00+00:00",
-                "series": [
-                    {
-                        "timestamp": "2026-09-08T19:00:00+00:00",
-                        "local_time": "2026-09-08 12:00",
-                        "timezone": "America/Los_Angeles",
-                        "temp": 72.0,
-                        "counts_for_resolution": True,
-                    }
-                ],
-            }
+                "event_group_id": "highest-temperature-in-test-on-september-7-2026",
+                "target_outcome": "80°F or higher",
+                "trade_side": "YES",
+                "order_side": "BUY",
+                "status": "opportunity",
+                "reason": "source_final_winner_yes",
+                "book_token_id": "yes-winner-token",
+                "market_id": "m-yes",
+                "economics": {"min_order_size": 5},
+            },
+            {
+                "event_group_id": "highest-temperature-in-test-on-september-7-2026",
+                "target_outcome": "70-71°F",
+                "trade_side": "NO",
+                "order_side": "BUY",
+                "status": "opportunity",
+                "reason": "source_final_loser_no",
+                "book_token_id": "no-loser-token",
+                "market_id": "m-no",
+                "economics": {"min_order_size": 5},
+            },
+            {
+                "event_group_id": "highest-temperature-in-test-on-september-7-2026",
+                "target_outcome": "72-73°F",
+                "trade_side": "NO",
+                "order_side": "BUY",
+                "status": "opportunity",
+                "reason": "intraday_impossible_no",
+                "book_token_id": "intraday-token",
+                "market_id": "m-intra",
+                "economics": {"min_order_size": 5},
+            },
         ]
+
+    def test_auto_place_limit_orders_dry_run_both_final_sides(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "wrh_observation_points.jsonl"
-            first = persist_wrh_observation_points(path, evidence, polled_at="2026-09-08T12:05:00+00:00")
-            second = persist_wrh_observation_points(path, evidence, polled_at="2026-09-08T12:10:00+00:00")
-            self.assertEqual(first, 1)
-            self.assertEqual(second, 0)
-            rows = read_jsonl(path)
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(rows[0]["first_seen_at"], "2026-09-08T12:05:00+00:00")
-            self.assertEqual(rows[0]["obs_timestamp"], "2026-09-08T19:00:00+00:00")
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.submit_gtc_buy") as submit:
+                    placed = service._auto_place_limit_orders(result)
+            submit.assert_not_called()
+            self.assertEqual(len(placed), 2)
+            reasons = {row["reason"] for row in placed}
+            self.assertEqual(reasons, {"source_final_winner_yes", "source_final_loser_no"})
+            for row in placed:
+                self.assertTrue(row["ok"])
+                self.assertTrue(row["dry_run"])
+                self.assertEqual(row["status"], "simulated_gtc")
+                self.assertEqual(row["order_type"], "GTC")
+                self.assertAlmostEqual(row["price"], 0.99)
+                self.assertAlmostEqual(row["size"], 5.0)
+            orders_path = Path(temp) / "data" / "orders.jsonl"
+            lines = orders_path.read_text(encoding="utf-8").strip().splitlines()
+            self.assertEqual(len(lines), 2)
+            # Second pass session-dedupes.
+            with patch.dict("os.environ", env, clear=False):
+                again = service._auto_place_limit_orders(result)
+            self.assertEqual(again, [])
+
+    def test_auto_place_limit_orders_skips_when_disabled_or_out_of_band(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()}
+            with patch.dict("os.environ", {"LIMIT_ORDERS": "false"}, clear=False):
+                self.assertEqual(service._auto_place_limit_orders(result), [])
+            env_band = {
+                "LIMIT_ORDERS": "true",
+                "LIMIT_ORDER_PRICE": "0.005",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env_band, clear=False):
+                self.assertEqual(service._auto_place_limit_orders(result), [])
+
+    def test_auto_place_limit_orders_skips_over_usdc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            rows = self._final_limit_rows()[:1]
+            rows[0]["economics"] = {"min_order_size": 10}
+            result = {"summary": {}, "rows": rows}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(len(placed), 1)
+            self.assertFalse(placed[0]["ok"])
+            self.assertEqual(placed[0]["error"], "limit_order_exceeds_usdc")
+            self.assertFalse((Path(temp) / "data" / "orders.jsonl").exists())
+
+    def test_auto_place_limit_orders_live_calls_submit_gtc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()[:1]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch(
+                    "weather_runtime.orders.submit_gtc_buy",
+                    return_value={"ok": True, "status": "live"},
+                ) as submit:
+                    placed = service._auto_place_limit_orders(result)
+            submit.assert_called_once()
+            kwargs = submit.call_args.kwargs
+            self.assertEqual(kwargs["token_id"], "yes-winner-token")
+            self.assertAlmostEqual(kwargs["price"], 0.99)
+            self.assertAlmostEqual(kwargs["size"], 5.0)
+            self.assertEqual(len(placed), 1)
+            self.assertTrue(placed[0]["ok"])
+            self.assertEqual(placed[0]["status"], "submitted")
+            self.assertFalse(placed[0]["dry_run"])
+            self.assertIn("yes-winner-token", service._limit_taken_tokens)
 
 
 if __name__ == "__main__":
