@@ -7,7 +7,7 @@
 | P0 规则与数据 | 建 registry、解析器、NWS/WU adapter、证据存储 | 否 | 30 个事件无歧义解析；源证据可重放 |
 | P1 历史回放 | 100+ 已结算事件，测 bucket、finality、盘口、费用 | 否 | bucket 准确率 100%，无 false finality |
 | P2 Shadow / dry-run | 在线发现和候选生成，记录假设成交 | 否 | 连续 7–14 天；source/lifecycle/book 指标稳定 |
-| P3 小额 live | 只做赢家 Yes + FAK，白名单站点 | 是 | 逐周复盘；无 P0/P1 事故后才扩容 |
+| P3 小额 live | 只做已锁定 No + FAK，白名单站点；赢家 Yes 仍 dry-run | 是 | 逐周复盘；无 P0/P1 事故后才扩容 |
 
 P3 初始建议：每事件 $10–$50、全局天气仓不超过 $500、只允许 max_ask=0.995 以内、订单 TTL 3–5 秒；这些是保护性起始参数，不是收益承诺。
 
@@ -75,7 +75,9 @@ python3 -m weather.scan \
 - [ ] source finality 经过历史和在线 shadow 验证；
 - [ ] Gamma lifecycle 和 CLOB fee/tick/min size 在下单前二次刷新；
 - [ ] weather_executor 使用独立凭证/进程，默认资金上限已设置；
-- [ ] FAK、无 GTC、无 negRisk、多腿；
+- [ ] 已安装 `requirements-live.txt`（`polymarket-client==0.10.0`，Python 3.11+）；
+- [ ] FAK 默认开启；`LIMIT_ORDERS` 仅在已实现 GTD/撤单 reconcile 后开启，当前为长期 GTC rest；
+- [ ] 无 negRisk、多腿；
 - [ ] candidate/evidence 幂等和重启 reconcile 已验证；
 - [ ] P0/P1 告警接收人和人工停机命令已测试；
 - [ ] 先用单事件、单站点、单笔小额，完成一次结算/redeem 对账后再扩大范围。
@@ -127,4 +129,3 @@ market closed race / stale book / API errors:
 今日 P0/P1/P2/P3 告警:
 负责人结论：继续 / 降额 / 熔断 / 扩大白名单
 ~~~
-

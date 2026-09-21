@@ -67,6 +67,8 @@ def append_jsonl_dedup(
     rows: Iterable[Any],
     *,
     key_fn: Callable[[Any], str],
+    known_keys: Optional[set[str]] = None,
+    key_cache: Optional[dict[str, set[str]]] = None,
 ) -> int:
     incoming = list(rows)
     if not incoming:
@@ -76,19 +78,24 @@ def append_jsonl_dedup(
     with lock_path.open("a+", encoding="utf-8") as lock_handle:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
         try:
-            existing: set[str] = set()
-            if path.is_file():
-                try:
-                    with path.open("r", encoding="utf-8") as handle:
-                        for line in handle:
-                            if not line.strip():
-                                continue
-                            try:
-                                existing.add(key_fn(json.loads(line)))
-                            except (ValueError, TypeError, KeyError):
-                                continue
-                except OSError:
-                    pass
+            if known_keys is not None:
+                existing = known_keys
+            else:
+                existing = set()
+                if path.is_file():
+                    try:
+                        with path.open("r", encoding="utf-8") as handle:
+                            for line in handle:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    existing.add(key_fn(json.loads(line)))
+                                except (ValueError, TypeError, KeyError):
+                                    continue
+                    except OSError:
+                        pass
+                if key_cache is not None:
+                    key_cache[str(path)] = existing
             unique: list[Any] = []
             for row in incoming:
                 key = key_fn(row)
@@ -127,4 +134,3 @@ def read_jsonl(path: Path, *, limit: Optional[int] = None) -> list[dict[str, Any
     except OSError:
         return rows
     return rows
-

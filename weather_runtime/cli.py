@@ -129,16 +129,25 @@ def scan_command(args: argparse.Namespace) -> int:
 
 
 def take_command(args: argparse.Namespace) -> int:
-    from .env import load_dotenv, public_trading_status
+    from .env import load_dotenv, public_trading_status, trading_config
+    from .scanner import WeatherScannerConfig
     from .service import RuntimeService
 
     load_dotenv()
+    trading = trading_config()
     service = RuntimeService(
         root=ROOT,
         data_dir=args.data_dir.resolve(),
         proxy=args.proxy,
         sync=False,
         dry_run=not bool(args.live),
+        scanner_config=WeatherScannerConfig(
+            max_ask=float(trading["max_ask"]),
+            max_slippage=float(trading["max_slippage"]),
+            min_net_edge=float(trading["min_net_edge"]),
+            max_usdc=float(trading["max_order_usdc"]),
+            target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
+        ),
     )
     result = service.take_opportunity(
         event_group_id=args.event,

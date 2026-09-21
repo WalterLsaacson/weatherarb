@@ -58,7 +58,7 @@ for token in losing_yes_tokens:
 ```
 
 使用场景：赢家 Yes 盘口已接近 1，但多个其他桶的 No 仍显著低于 1。  
-代价：最多 10 个订单、更多 min-order 约束、更多 partial fill、资金占用更大；任何桶分组错误都会同时损失多腿。第一版只 dry-run，不建议作为首个 live 策略。
+代价：最多 10 个订单、更多 min-order 约束、更多 partial fill、资金占用更大；任何桶分组错误都会同时损失多腿。当前实现只在小额 live 白名单内自动 FAK 已锁定 No，仍按 P1 谨慎额度管理，赢家 Yes 不自动成交。
 
 ## 3.4 策略 C：完整集合 / Dutch book（P2）
 
@@ -120,16 +120,22 @@ def walk_asks(asks, max_usdc, max_price, max_slippage, tick):
 - 订单请求带 `decision_id` / `candidate_id`，以便幂等和审计；
 - 收到 order ack 后必须查询 fills，不把 ack 当成交。
 
-### 暂缓：GTC/GTD rest
+当前 `RuntimeService` 在 `LIVE_ORDERS=true` 时只自动 FAK 已锁定 No
+（`intraday_impossible_no`、`provisional_loser_no`、`source_final_loser_no`）；
+赢家 Yes 仍保持 dry-run，需单独审批后才可启用。
 
-天气事实一旦 final，窗口可能在几秒内关闭；长期 rest 会在规则变化或市场关闭后意外成交。除非后续回放证明有稳定未成交补单价值，否则保持关闭。
+### 默认关闭：GTC/GTD rest
+
+天气事实一旦 final，窗口可能在几秒内关闭；长期 rest 会在规则变化或市场关闭后意外成交。当前实现保留在 `LIMIT_ORDERS` 开关后，但默认必须为
+`false`；除非后续回放证明有稳定未成交补单价值，否则不进入 live 审批。
 
 ## 3.7 交易前硬门
 
 ```python
 def should_trade(candidate, market, book, account, cfg):
     return all([
-        candidate.source_status == "final",
+        candidate.source_status in {"final", "intraday", "provisional"},
+        candidate.lock_kind == "buy_no",
         candidate.rule_status == "matched",
         market.active and not market.closed,
         market.accepting_orders and market.enable_order_book,
@@ -164,4 +170,3 @@ max_ask, max_slippage, max_usdc, min_net_edge
 ```
 
 现有 rest ladder 还把足球 token 的 tick 约束为 0.01；[rest ladder](/home/guanyin/aosp/temp/dqdhook/.cursor/skills/polymarket-quote/scripts/rest_ladder.py:18)。天气路径必须绕开这一常量。
-

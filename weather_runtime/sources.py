@@ -896,6 +896,10 @@ class WeatherSourceAdapter:
             timestamp = self._parse(rule, json_path(row, timestamp_path) or row.get("timestamp"))
             number = _number(json_path(row, value_path))
             if timestamp is not None and number is not None and timestamp > end:
+                if sample_set_of(rule) == "hourly" and not self._counts_for_resolution(
+                    rule, timestamp, row
+                ):
+                    continue
                 result.append((timestamp, _convert(number, source_unit, rule.unit)))
         return sorted(result, key=lambda item: item[0])
 

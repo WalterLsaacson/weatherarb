@@ -87,9 +87,8 @@ class WeatherMarket:
 
     @property
     def tradable(self) -> bool:
-        # Exclusive temperature buckets are almost always Polymarket negRisk
-        # events. That is collateral wrapping, not a reason to skip a
-        # source-final winner Yes on the CLOB.
+        # CLOB-level tradability only. Strategy gates reject negRisk by
+        # default before any order is generated.
         return (
             self.active
             and not self.closed
@@ -188,4 +187,3 @@ class ScanResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
-

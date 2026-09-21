@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
@@ -69,6 +70,17 @@ def _unique_ids(ids: Iterable[str]) -> list[str]:
     return result
 
 
+_OPPORTUNITY_REASONS = {
+    "intraday_impossible_no",
+    "provisional_loser_no",
+    "source_final_loser_no",
+    "intraday_impossible_sell_yes",
+    "provisional_loser_sell_yes",
+    "source_final_loser_sell_yes",
+    "source_final_winner_yes",
+}
+
+
 def extrema_from_rows(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     extrema: dict[str, dict[str, Any]] = {}
     for row in rows:
@@ -95,10 +107,12 @@ class WeatherScannerConfig:
     max_usdc: float = 50.0
     max_slippage: float = 0.003
     book_ttl_s: float = 5.0
+    display_book_ttl_s: float = 60.0
+    weather_prefetch_deadline_s: float = 20.0
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True
-    reject_neg_risk: bool = False
+    reject_neg_risk: bool = True
 
 
 class WeatherScanner:
@@ -362,13 +376,7 @@ class WeatherScanner:
         match_reason = str(row.get("reason") or "")
         opportunity_reason = (
             match_reason
-            if match_reason in {
-                "intraday_impossible_no",
-                "provisional_loser_no",
-                "intraday_impossible_sell_yes",
-                "provisional_loser_sell_yes",
-                "source_final_loser_sell_yes",
-            }
+            if match_reason in _OPPORTUNITY_REASONS
             else "dry_run_candidate_only"
         )
         history = list((row.get("lifecycle") or {}).get("history") or [])
@@ -620,7 +628,9 @@ class WeatherScanner:
         now: Optional[datetime] = None,
         fetch_books: bool = True,
         previous_extrema: Optional[dict[str, Any]] = None,
+        display_books: Optional[dict[str, Book | dict[str, Any]]] = None,
     ) -> dict[str, Any]:
+        scan_started = time.monotonic()
         current = now or datetime.now(timezone.utc)
         market_list = [
             item if isinstance(item, WeatherMarket) else normalize_market(item)
@@ -663,7 +673,12 @@ class WeatherScanner:
         prior_extrema = previous_extrema if isinstance(previous_extrema, dict) else {}
         source_cache: dict[str, Any] = {}
         source_evidence: dict[str, dict[str, Any]] = {}
-        self.source_adapter.prefetch(rule_list, now=current, deadline_s=45.0)
+        self.source_adapter.prefetch(
+            rule_list,
+            now=current,
+            deadline_s=float(self.config.weather_prefetch_deadline_s),
+        )
+        weather_prefetch_done = time.monotonic()
 
         for rule in rule_list:
             market = market_map.get(rule.market_id)
@@ -951,8 +966,11 @@ class WeatherScanner:
                     ),
                 )
 
+        weather_process_done = time.monotonic()
         display_token_ids: list[str] = []
         for row in rows:
+            if row.get("book_token_id") and row.get("status") == "rule_matched":
+                continue
             status = str((row.get("observation") or {}).get("status") or "")
             if status not in {"intraday", "provisional", "final"}:
                 continue
@@ -972,13 +990,39 @@ class WeatherScanner:
             for token_id in display_token_ids
             if token_id and str(token_id) not in set(fetch_priority) and str(token_id) not in set(fetch_trade)
         )
+        display_cache_hits = 0
+        cached_display: dict[str, Any] = {}
         live_fetch = books is None and fetch_books
+        if live_fetch and display_books:
+            previous_books = display_books if isinstance(display_books, dict) else {}
+            for token_id in fetch_display:
+                value = previous_books.get(str(token_id))
+                if value is None:
+                    continue
+                book = self._book(value, str(token_id))
+                if book.book_missing or book.best_ask is None:
+                    continue
+                book_time = parse_time(book.fetched_at)
+                if book_time is None:
+                    continue
+                age_s = (current.astimezone(timezone.utc) - book_time).total_seconds()
+                if 0.0 <= age_s <= float(self.config.display_book_ttl_s):
+                    cached_display[str(token_id)] = value
+        display_cache_hits = len(cached_display)
+        fetch_display = _unique_ids(
+            token_id for token_id in fetch_display if str(token_id) not in cached_display
+        )
+        book_phase_started = time.monotonic()
+        book_fetch_elapsed = 0.0
         if live_fetch:
             books = {}
 
             def _pull(token_ids_batch: list[str]) -> None:
+                nonlocal book_fetch_elapsed
                 if token_ids_batch:
+                    started = time.monotonic()
                     books.update(self.clob_client.fetch_books(token_ids_batch))
+                    book_fetch_elapsed += time.monotonic() - started
 
             def _eval_at() -> datetime:
                 return utc_now()
@@ -997,6 +1041,7 @@ class WeatherScanner:
             ]
             if remaining_matched:
                 self._evaluate_tokens(rows, books, market_map, _eval_at(), remaining_matched)
+            books.update(cached_display)
             _pull(fetch_display)
             for row in rows:
                 self._bind_row_book(row, books)
@@ -1018,6 +1063,9 @@ class WeatherScanner:
                     self._evaluate_matched_row(row, books, market_map, eval_at)
                 elif not row.get("book"):
                     self._bind_row_book(row, books)
+
+        book_phase_s = time.monotonic() - book_phase_started
+        postprocess_started = time.monotonic()
 
         event_groups: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -1107,6 +1155,7 @@ class WeatherScanner:
                 }
             )
 
+        postprocess_s = time.monotonic() - postprocess_started
         eligible = len(rows)
         paired = sum(1 for row in rows if row.get("market_match_status") == "matched")
         matched = sum(1 for row in rows if row.get("rule_status") == "matched")
@@ -1149,8 +1198,23 @@ class WeatherScanner:
             "book_fetch_priority": len(fetch_priority),
             "book_fetch_trade": len(fetch_trade),
             "book_fetch_display": len(fetch_display),
+            "display_book_cache_hits": display_cache_hits,
             "dry_run": True,
             "live_orders_submitted": 0,
+            "timings": {
+                "total_s": round(time.monotonic() - scan_started, 3),
+                "weather_prefetch_s": round(
+                    weather_prefetch_done - scan_started, 3
+                ),
+                "weather_process_s": round(
+                    weather_process_done - weather_prefetch_done, 3
+                ),
+                "book_fetch_s": round(book_fetch_elapsed, 3),
+                "book_evaluate_and_resolve_s": round(
+                    max(0.0, book_phase_s - book_fetch_elapsed), 3
+                ),
+                "postprocess_s": round(postprocess_s, 3),
+            },
         }
         return {
             "summary": summary,

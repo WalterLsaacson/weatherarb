@@ -107,7 +107,15 @@ python3 run_weather.py --fixture fixtures --data-dir /tmp/polymarket-weather-poc
 python3 run_weather.py --sync --data-dir /tmp/polymarket-weather-online
 ~~~
 
-运行前请确认网络/代理和接口访问权限；在线模式会把市场、source 和 book 请求写入指定 data directory。测试命令：
+运行前请确认网络/代理和接口访问权限；在线模式会把市场、source 和 book 请求写入指定 data directory。
+
+Live 下单模式依赖官方 `polymarket-client` SDK（Python 3.11+）：
+
+```bash
+python3 -m pip install -r requirements-live.txt
+```
+
+只跑 dry-run/read-only 时不需要安装它。测试命令：
 
 ~~~bash
 python3 -m unittest discover -s tests -v
@@ -143,4 +151,5 @@ python3 -m weather_runtime.cli discover --sync \
 - `weather_board/`：8793 端口只读前端和 board server wrapper；
 - `fixtures/`：可重复的 11 桶伦敦温度事件；
 - `tests/`：规则、终局、费用门、扫描、持久化和 SSE 发布测试。
-- `requirements.txt`：空依赖清单，运行时只使用 Python 标准库。
+- `requirements.txt`：dry-run/read-only 空依赖清单，只使用 Python 标准库。
+- `requirements-live.txt`：live 下单路径所需的 `polymarket-client`。

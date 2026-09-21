@@ -365,6 +365,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(candidate["matched_outcome"], "26")
         self.assertEqual(candidate["trade_side"], "YES")
         self.assertEqual(str(candidate.get("order_side") or "BUY"), "BUY")
+        self.assertEqual(candidate["reason"], "source_final_winner_yes")
         self.assertAlmostEqual(candidate["economics"]["net_edge"], 0.009505, places=6)
         losers = [row for row in result["rows"] if row.get("trade_side") == "NO"]
         self.assertEqual(len(losers), 10)
@@ -378,7 +379,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(len(sell_yes), 10)
         self.assertTrue(all(row["status"] == "no_trade" for row in sell_yes))
 
-    def test_neg_risk_flag_does_not_block_winner_yes(self) -> None:
+    def test_neg_risk_default_blocks_winner_yes(self) -> None:
         raw_markets = load_market_rows(str(FIXTURES / "markets.json"))
         for row in raw_markets:
             row["negRisk"] = True
@@ -395,9 +396,10 @@ class WeatherRuntimeTests(unittest.TestCase):
             fetch_books=False,
             now=datetime(2026, 9, 5, 1, tzinfo=timezone.utc),
         )
-        self.assertEqual(result["summary"]["opportunities"], 1)
-        candidate = next(row for row in result["rows"] if row["status"] == "opportunity")
-        self.assertEqual(candidate["matched_outcome"], "26")
+        self.assertEqual(result["summary"]["opportunities"], 0)
+        target = next(row for row in result["rows"] if row["target_outcome"] == "26")
+        self.assertEqual(target["status"], "no_trade")
+        self.assertEqual(target["reason"], "neg_risk_rejected")
 
     def test_reject_neg_risk_opt_in_blocks_winner_yes(self) -> None:
         raw_markets = load_market_rows(str(FIXTURES / "markets.json"))
@@ -935,6 +937,47 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["error"], "sell_yes_requires_inventory")
 
+    def test_live_take_refreshes_gamma_lifecycle_before_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service.last_result = {
+                "summary": {},
+                "rows": [
+                    {
+                        "event_group_id": "lifecycle-event",
+                        "target_outcome": "30",
+                        "trade_side": "NO",
+                        "order_side": "BUY",
+                        "status": "opportunity",
+                        "reason": "source_final_loser_no",
+                        "book_token_id": "no-token",
+                        "market_id": "m1",
+                        "market": {"id": "m1"},
+                    }
+                ],
+            }
+            refreshed = {
+                "id": "m1",
+                "active": True,
+                "closed": False,
+                "acceptingOrders": False,
+                "enableOrderBook": True,
+                "clobTokenIds": ["yes-token", "no-token"],
+                "outcomes": ["Yes", "No"],
+            }
+            with patch(
+                "weather_runtime.markets.GammaClient.get_market",
+                return_value=refreshed,
+            ) as get_market:
+                result = service.take_opportunity(
+                    event_group_id="lifecycle-event",
+                    target_outcome="30",
+                    live=True,
+                )
+            get_market.assert_called_once_with("m1")
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "market_not_tradable")
+
     def test_auto_take_skips_sell_yes_rows(self) -> None:
         from unittest.mock import patch
 
@@ -957,6 +1000,40 @@ class WeatherRuntimeTests(unittest.TestCase):
                     takes = service._auto_take_opportunities(service.last_result)
             self.assertEqual(takes, [])
             take.assert_not_called()
+
+    def test_clob_client_batches_books_and_fails_closed(self) -> None:
+        from weather_runtime.books import ClobClient
+
+        class FakeHttp:
+            def __init__(self) -> None:
+                self.calls: list[list[dict[str, str]]] = []
+
+            def post_json(self, url: str, payload: list[dict[str, str]]):
+                self.calls.append(payload)
+                return [
+                    {
+                        "asset_id": item["token_id"],
+                        "asks": [{"price": "0.50", "size": "10"}],
+                        "bids": [],
+                    }
+                    for item in payload
+                ]
+
+        http = FakeHttp()
+        client = ClobClient(http=http, books_batch_size=3, books_max_workers=2)
+        books = client.fetch_books(["a", "b", "c", "d", "e"])
+        self.assertEqual([len(call) for call in http.calls], [3, 2])
+        self.assertEqual(set(books), {"a", "b", "c", "d", "e"})
+        self.assertTrue(all(not book.book_missing for book in books.values()))
+
+        class FailHttp:
+            def post_json(self, url: str, payload: list[dict[str, str]]):
+                raise SourceError("clob unavailable")
+
+        failed = ClobClient(http=FailHttp(), books_batch_size=2, books_max_workers=1)
+        failed_books = failed.fetch_books(["a", "b", "c"])
+        self.assertEqual(set(failed_books), {"a", "b", "c"})
+        self.assertTrue(all(book.book_missing for book in failed_books.values()))
 
     def test_walk_bids_consumes_highest_levels_first(self) -> None:
         from weather_runtime.books import normalize_book, walk_bids
@@ -1386,6 +1463,72 @@ class WeatherRuntimeTests(unittest.TestCase):
         waiting_view = next(item for item in group["markets"] if item.get("outcome") == "33")
         self.assertEqual((waiting_view.get("book") or {}).get("best_ask"), 0.01)
 
+    def test_display_book_cache_skips_fresh_waiting_books_only(self) -> None:
+        from weather_runtime.models import Book, utc_now
+
+        buckets = [
+            {"outcome": "30", "upper": 30, "upper_inclusive": True},
+            {
+                "outcome": "33",
+                "lower": 30,
+                "lower_inclusive": False,
+                "upper": 33,
+                "upper_inclusive": True,
+            },
+            {"outcome": "34", "lower": 33, "lower_inclusive": False},
+        ]
+        markets, rules = self._event_with_static(
+            event_id="display-book-cache",
+            metric="daily_max",
+            outcomes=[item["outcome"] for item in buckets],
+            buckets=buckets,
+            features=[
+                {"value": 28, "timestamp": "2026-09-06T02:00:00Z"},
+                {"value": 33, "timestamp": "2026-09-06T08:00:00Z"},
+            ],
+        )
+        now = datetime(2026, 9, 6, 12, tzinfo=timezone.utc)
+        waiting_yes = next(item.yes_token_id for item in markets if item.outcome == "33")
+        other_waiting_yes = next(item.yes_token_id for item in markets if item.outcome == "34")
+        impossible_no = next(item.no_token_id for item in markets if item.outcome == "30")
+        cached_book = Book(
+            token_id=waiting_yes,
+            best_ask=0.01,
+            asks=[{"price": 0.01, "size": 10}],
+            tick_size=0.001,
+            min_order_size=1,
+            fetched_at="2026-09-06T11:59:50+00:00",
+        )
+        calls: list[list[str]] = []
+
+        class FakeClob:
+            def fetch_books(self, token_ids):
+                calls.append([str(item) for item in token_ids])
+                stamp = utc_now().isoformat()
+                return {
+                    str(token_id): Book(
+                        token_id=str(token_id),
+                        best_ask=0.01 if str(token_id).endswith("-no") else 0.99,
+                        asks=[{"price": 0.01 if str(token_id).endswith("-no") else 0.99, "size": 10}],
+                        tick_size=0.001,
+                        min_order_size=1,
+                        fetched_at=stamp,
+                    )
+                    for token_id in token_ids
+                }
+
+        result = WeatherScanner(
+            config=WeatherScannerConfig(),
+            clob_client=FakeClob(),
+        ).scan(markets, rules, fetch_books=True, now=now, display_books={waiting_yes: cached_book})
+        recorded = [token for batch in calls for token in batch]
+        by_outcome = self._buy_rows_by_outcome(result["rows"])
+        self.assertIn(impossible_no, calls[0])
+        self.assertNotIn(waiting_yes, recorded)
+        self.assertIn(other_waiting_yes, recorded)
+        self.assertEqual(result["summary"]["display_book_cache_hits"], 1)
+        self.assertEqual((by_outcome["33"].get("book") or {}).get("best_ask"), 0.01)
+
     def test_new_extremum_no_tokens_fetched_before_prior_nos(self) -> None:
         from weather_runtime.models import Book, utc_now
 
@@ -1605,6 +1748,30 @@ class WeatherRuntimeTests(unittest.TestCase):
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertEqual([row["id"] for row in rows], ["a", "b", "c"])
             self.assertEqual(rows[0]["n"], 1)
+
+    def test_jsonl_dedup_can_reuse_in_memory_key_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "scan.jsonl"
+            cache: dict[str, set[str]] = {}
+            append_jsonl_dedup(
+                path,
+                [{"id": "a", "n": 1}],
+                key_fn=lambda row: str(row["id"]),
+                key_cache=cache,
+            )
+            self.assertIn(str(path), cache)
+            # Simulate rotation/external truncation: cached keys still prevent
+            # duplicates without re-reading the (now empty) file.
+            path.write_text("", encoding="utf-8")
+            append_jsonl_dedup(
+                path,
+                [{"id": "a", "n": 2}, {"id": "b", "n": 3}],
+                key_fn=lambda row: str(row["id"]),
+                known_keys=cache[str(path)],
+                key_cache=cache,
+            )
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual([row["id"] for row in rows], ["b"])
 
 
     def test_whole_degree_rounding_maps_26_4_to_26(self) -> None:
@@ -2766,15 +2933,23 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(fill["worst_price"], 0.95)
         self.assertAlmostEqual(fill["cost"], 3 * 0.94 + 2 * 0.95)
 
-    def test_quantize_buy_makes_two_decimal_usdc(self) -> None:
+    def test_quantize_buy_uses_tick_and_caps_usdc(self) -> None:
         from decimal import Decimal
 
         from weather_runtime.orders import quantize_buy
 
-        price, size = quantize_buy(0.58, 8.620689655172415, 5.0)
+        price, size = quantize_buy(0.58, 8.620689655172415, 5.0, tick_size=0.01)
         maker = Decimal(str(price)) * Decimal(str(size))
         self.assertLessEqual(maker, Decimal("5.0"))
-        self.assertEqual(maker, maker.quantize(Decimal("0.01")))
+        self.assertEqual(Decimal(str(price)), Decimal("0.58"))
+
+        price, size = quantize_buy(0.001, 5000.0, 5.0, tick_size=0.001)
+        self.assertEqual(Decimal(str(price)), Decimal("0.001"))
+        self.assertEqual(Decimal(str(size)), Decimal("5000.0"))
+
+        price, size = quantize_buy(0.001, 1.0, 5.0, tick_size=0.001)
+        self.assertEqual(Decimal(str(price)), Decimal("0.001"))
+        self.assertEqual(Decimal(str(size)), Decimal("1.0"))
 
     def test_live_take_skips_already_filled_token(self) -> None:
         from unittest.mock import patch
@@ -3044,6 +3219,40 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertIsNone(observation.value)
         self.assertEqual(observation.series, [])
 
+    def test_hourly_following_point_uses_resolution_filter(self) -> None:
+        raw = {
+            "market_id": "m-hourly-following",
+            "event_group_id": "e-hourly-following",
+            "source": {
+                "static": {
+                    "features": [
+                        {"value": 55, "timestamp": "2026-09-07T12:00:00Z"},
+                        {"value": 54, "timestamp": "2026-09-08T00:45:00Z"},
+                    ]
+                },
+                "url": "fixture://weather/hourly-following",
+                "resolution_source": "fixture://weather/hourly-following",
+                "value_path": "value",
+                "timestamp_path": "timestamp",
+                "finality_mode": "first_following_date_point",
+                "sample_set": "hourly",
+            },
+            "timezone": "UTC",
+            "metric": "daily_min",
+            "observation_start": "2026-09-07T00:00:00Z",
+            "observation_end": "2026-09-07T23:59:59Z",
+            "buckets": [
+                {"outcome": "low", "upper": 60},
+                {"outcome": "high", "lower": 60, "lower_inclusive": False},
+            ],
+        }
+        observation = WeatherSourceAdapter().poll(
+            parse_rule(raw),
+            now=datetime(2026, 9, 8, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual(observation.status, "provisional")
+        self.assertEqual(observation.value, 55)
+
     def test_hourly_ksfo_still_requests_same_synoptic_url(self) -> None:
         markets = self._temp_markets(
             slug="lowest-temperature-in-san-francisco-on-september-7-2026",
@@ -3238,6 +3447,19 @@ class WeatherRuntimeTests(unittest.TestCase):
             quantize_limit_buy(0.99, 6.0, 5.0)
         self.assertEqual(str(raised.exception), "limit_order_exceeds_usdc")
 
+    def test_quantize_limit_buy_keeps_exchange_min_order_precision(self) -> None:
+        from weather_runtime.orders import quantize_limit_buy
+
+        px, size = quantize_limit_buy(
+            0.99,
+            5.005,
+            5.0,
+            tick_size=0.001,
+            min_order=5.005,
+        )
+        self.assertAlmostEqual(px, 0.99)
+        self.assertAlmostEqual(size, 5.005)
+
     def test_submit_gtc_buy_sets_order_type_gtc(self) -> None:
         from dataclasses import dataclass
         from unittest.mock import MagicMock
@@ -3277,7 +3499,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "reason": "source_final_winner_yes",
                 "book_token_id": "yes-winner-token",
                 "market_id": "m-yes",
-                "economics": {"min_order_size": 5},
+                "economics": {"min_order_size": 5, "tick_size": 0.001},
             },
             {
                 "event_group_id": "highest-temperature-in-test-on-september-7-2026",
@@ -3288,7 +3510,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "reason": "source_final_loser_no",
                 "book_token_id": "no-loser-token",
                 "market_id": "m-no",
-                "economics": {"min_order_size": 5},
+                "economics": {"min_order_size": 5, "tick_size": 0.001},
             },
             {
                 "event_group_id": "highest-temperature-in-test-on-september-7-2026",
@@ -3299,7 +3521,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "reason": "intraday_impossible_no",
                 "book_token_id": "intraday-token",
                 "market_id": "m-intra",
-                "economics": {"min_order_size": 5},
+                "economics": {"min_order_size": 5, "tick_size": 0.001},
             },
         ]
 
@@ -3356,7 +3578,7 @@ class WeatherRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
             rows = self._final_limit_rows()[:1]
-            rows[0]["economics"] = {"min_order_size": 10}
+            rows[0]["economics"] = {"min_order_size": 10, "tick_size": 0.001}
             result = {"summary": {}, "rows": rows}
             env = {
                 "LIMIT_ORDERS": "true",
@@ -3370,6 +3592,47 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(len(placed), 1)
             self.assertFalse(placed[0]["ok"])
             self.assertEqual(placed[0]["error"], "limit_order_exceeds_usdc")
+            self.assertFalse((Path(temp) / "data" / "orders.jsonl").exists())
+
+    def test_auto_place_limit_orders_uses_fractional_min_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            rows = self._final_limit_rows()[:1]
+            rows[0]["economics"] = {"min_order_size": 5.005, "tick_size": 0.001}
+            result = {"summary": {}, "rows": rows}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(len(placed), 1)
+            self.assertTrue(placed[0]["ok"])
+            self.assertAlmostEqual(placed[0]["size"], 5.005)
+
+    def test_auto_place_limit_orders_rejects_price_below_band_after_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            rows = self._final_limit_rows()[:1]
+            rows[0]["economics"] = {"min_order_size": 5, "tick_size": 0.1}
+            result = {"summary": {}, "rows": rows}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.95",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(len(placed), 1)
+            self.assertFalse(placed[0]["ok"])
+            self.assertEqual(placed[0]["error"], "limit_price_outside_band_after_tick")
             self.assertFalse((Path(temp) / "data" / "orders.jsonl").exists())
 
     def test_auto_place_limit_orders_live_calls_submit_gtc(self) -> None:
@@ -3400,6 +3663,64 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(placed[0]["status"], "submitted")
             self.assertFalse(placed[0]["dry_run"])
             self.assertIn("yes-winner-token", service._limit_taken_tokens)
+
+    def test_auto_place_limit_orders_skips_fak_taken_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service._taken_tokens.add("yes-winner-token")
+            result = {"summary": {}, "rows": self._final_limit_rows()[:1]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(placed, [])
+
+    def test_auto_take_skips_gtc_taken_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            row = self._final_limit_rows()[1]
+            row["order_side"] = "BUY"
+            service._limit_taken_tokens.add("no-loser-token")
+            service.last_result = {"summary": {}, "rows": [row]}
+            with patch.dict("os.environ", {"LIVE_ORDERS": "true"}, clear=False):
+                with patch.object(service, "take_opportunity", return_value={"ok": True}) as take:
+                    takes = service._auto_take_opportunities(service.last_result)
+            self.assertEqual(takes, [])
+            take.assert_not_called()
+
+    def test_auto_place_limit_orders_uses_real_scanner_reason(self) -> None:
+        markets = weather_markets(load_market_rows(str(FIXTURES / "markets.json")))
+        rules = load_rules(FIXTURES / "rules.json")
+        books = load_json(FIXTURES / "books.json", {})
+        stamp = datetime(2026, 9, 5, 1, tzinfo=timezone.utc).isoformat()
+        books = {token: {**book, "fetched_at": stamp} for token, book in books.items()}
+        result = WeatherScanner(config=WeatherScannerConfig()).scan(
+            markets,
+            rules,
+            books=books,
+            fetch_books=False,
+            now=datetime(2026, 9, 5, 1, tzinfo=timezone.utc),
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(len(placed), 1)
+            self.assertEqual(placed[0]["reason"], "source_final_winner_yes")
 
 
 if __name__ == "__main__":

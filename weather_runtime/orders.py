@@ -25,47 +25,78 @@ def jsonable(value: Any) -> Any:
     return str(value)
 
 
-def quantize_buy(price: float, size: float, max_usdc: float) -> tuple[float, float]:
-    """FAK buys need maker USDC to 2 decimals and size to 2 decimals."""
+def _tick_quantum(tick_size: Optional[float]) -> Decimal:
+    tick = Decimal(str(tick_size if tick_size is not None else 0.01))
+    if tick <= 0:
+        raise LiveOrderError("invalid_tick_size")
+    return tick
+
+
+def quantize_buy(
+    price: float,
+    size: float,
+    max_usdc: float,
+    *,
+    tick_size: Optional[float] = None,
+) -> tuple[float, float]:
+    """FAK buys: snap price to market tick and cap size by USDC budget."""
 
     cent = Decimal("0.01")
-    px = Decimal(str(price)).quantize(cent, rounding=ROUND_DOWN)
+    tick = _tick_quantum(tick_size)
+    px = Decimal(str(price)).quantize(tick, rounding=ROUND_DOWN)
     if px <= 0:
         raise LiveOrderError("invalid_price")
     budget = Decimal(str(max_usdc)).quantize(cent, rounding=ROUND_DOWN)
     shares = Decimal(str(size)).quantize(cent, rounding=ROUND_DOWN)
+    if shares <= 0:
+        raise LiveOrderError("invalid_size")
     if px * shares > budget:
         shares = (budget / px).quantize(cent, rounding=ROUND_DOWN)
-    while shares > 0:
-        maker = px * shares
-        if maker == maker.quantize(cent, rounding=ROUND_DOWN):
-            return float(px), float(shares)
-        shares -= cent
-    raise LiveOrderError("cannot_quantize_buy_amount")
+    if shares <= 0:
+        raise LiveOrderError("cannot_quantize_buy_amount")
+    return float(px), float(shares)
 
 
-def quantize_sell(price: float, size: float, max_usdc: float) -> tuple[float, float]:
-    """FAK sells: size to 2 decimals; cap notional proceeds by max_usdc."""
+def quantize_sell(
+    price: float,
+    size: float,
+    max_usdc: float,
+    *,
+    tick_size: Optional[float] = None,
+) -> tuple[float, float]:
+    """FAK sells: snap price to market tick and cap proceeds by max_usdc."""
 
-    return quantize_buy(price, size, max_usdc)
+    return quantize_buy(price, size, max_usdc, tick_size=tick_size)
 
 
-def quantize_limit_buy(price: float, size: float, max_usdc: float) -> tuple[float, float]:
+def quantize_limit_buy(
+    price: float,
+    size: float,
+    max_usdc: float,
+    *,
+    tick_size: Optional[float] = None,
+    min_order: Optional[float] = None,
+) -> tuple[float, float]:
     """GTC buys: fixed min shares, refuse if notional exceeds max_usdc."""
 
     cent = Decimal("0.01")
-    px = Decimal(str(price)).quantize(cent, rounding=ROUND_DOWN)
+    tick = _tick_quantum(tick_size)
+    px = Decimal(str(price)).quantize(tick, rounding=ROUND_DOWN)
     shares = Decimal(str(size)).quantize(cent, rounding=ROUND_DOWN)
+    min_shares = Decimal(str(min_order)) if min_order is not None else shares
     if px <= 0:
         raise LiveOrderError("invalid_price")
     if shares <= 0:
         raise LiveOrderError("invalid_size")
+    if min_shares <= 0:
+        raise LiveOrderError("invalid_min_order_size")
+    if shares < min_shares:
+        # The exchange minimum is authoritative; do not round below it even
+        # when the configured minimum has finer precision than 0.01.
+        shares = min_shares
     budget = Decimal(str(max_usdc)).quantize(cent, rounding=ROUND_DOWN)
     if px * shares > budget:
         raise LiveOrderError("limit_order_exceeds_usdc")
-    maker = px * shares
-    if maker != maker.quantize(cent, rounding=ROUND_DOWN):
-        raise LiveOrderError("cannot_quantize_limit_buy_amount")
     return float(px), float(shares)
 
 
@@ -160,9 +191,19 @@ def _submit_order(
     except ImportError as exc:
         raise LiveOrderError("polymarket SDK is not installed") from exc
 
+    credentials = None
+    if cfg.get("api_key") and cfg.get("api_secret") and cfg.get("api_passphrase"):
+        from polymarket.models.clob import ApiKeyCreds
+
+        credentials = ApiKeyCreds(
+            key=str(cfg["api_key"]),
+            secret=str(cfg["api_secret"]),
+            passphrase=str(cfg["api_passphrase"]),
+        )
     client = SecureClient.create(
         private_key=key,
         wallet=str(cfg.get("funder") or "") or None,
+        credentials=credentials,
     )
     try:
         signed = client.create_limit_order(

@@ -308,9 +308,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not open the board in a browser",
     )
-    parser.add_argument("--min-net-edge", type=float, default=0.0075)
-    parser.add_argument("--max-ask", type=float, default=0.995)
-    parser.add_argument("--max-slippage", type=float, default=0.003)
+    parser.add_argument("--min-net-edge", type=float, default=None)
+    parser.add_argument("--max-ask", type=float, default=None)
+    parser.add_argument("--max-slippage", type=float, default=None)
     parser.add_argument("--allow-category-fee", action="store_true")
     parser.add_argument(
         "--horizon-hours",
@@ -358,9 +358,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     trading = trading_config()
     config = WeatherScannerConfig(
-        max_ask=args.max_ask,
-        max_slippage=args.max_slippage,
-        min_net_edge=args.min_net_edge,
+        max_ask=args.max_ask if args.max_ask is not None else float(trading["max_ask"]),
+        max_slippage=(
+            args.max_slippage
+            if args.max_slippage is not None
+            else float(trading["max_slippage"])
+        ),
+        min_net_edge=(
+            args.min_net_edge
+            if args.min_net_edge is not None
+            else float(trading["min_net_edge"])
+        ),
         require_explicit_fee=not args.allow_category_fee,
         max_usdc=float(trading["max_order_usdc"]),
         target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),

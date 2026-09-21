@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
@@ -129,44 +129,63 @@ class ClobClient:
         *,
         http: Optional[JsonHttp] = None,
         base_url: str = "https://clob.polymarket.com",
+        books_batch_size: int = 500,
+        books_max_workers: int = 4,
     ):
         self.http = http or JsonHttp()
         self.base_url = base_url.rstrip("/")
+        self.books_batch_size = max(1, int(books_batch_size))
+        self.books_max_workers = max(1, int(books_max_workers))
+
+    def _fetch_book_chunk(self, chunk: list[str]) -> dict[str, Book]:
+        """Fetch one /books chunk and normalize it fail-closed.
+
+        The CLOB endpoint accepts an array of token IDs; a larger chunk is
+        substantially cheaper than many serial 50-token requests.  A failed
+        chunk is represented as missing books rather than aborting the whole
+        scan, matching the previous serial behavior.
+        """
+
+        result: dict[str, Book] = {}
+        try:
+            payload = self.http.post_json(
+                self.base_url + "/books",
+                [{"token_id": token_id} for token_id in chunk],
+            )
+            if not isinstance(payload, list):
+                raise SourceError("CLOB /books returned a non-list payload")
+            captured_at = datetime.now(timezone.utc).isoformat()
+            for row in payload:
+                if not isinstance(row, dict):
+                    continue
+                token_id = str(row.get("asset_id") or row.get("token_id") or "")
+                if not token_id:
+                    continue
+                normalized = dict(row)
+                normalized.setdefault("fetched_at", captured_at)
+                result[token_id] = normalize_book(token_id, normalized)
+        except SourceError as exc:
+            for token_id in chunk:
+                result[token_id] = Book(token_id=token_id, book_missing=True, error=str(exc))
+        for token_id in chunk:
+            result.setdefault(
+                token_id,
+                Book(token_id=token_id, book_missing=True, error="token_missing_from_response"),
+            )
+        return result
 
     def fetch_books(self, token_ids: Iterable[str]) -> dict[str, Book]:
         ids = [str(token_id) for token_id in token_ids if str(token_id)]
-        result: dict[str, Book] = {}
-        stopped: Optional[SourceError] = None
-        for start in range(0, len(ids), 50):
-            chunk = ids[start : start + 50]
-            if stopped is not None:
-                for token_id in chunk:
-                    result[token_id] = Book(token_id=token_id, book_missing=True, error=str(stopped))
-                continue
-            try:
-                payload = self.http.post_json(
-                    self.base_url + "/books",
-                    [{"token_id": token_id} for token_id in chunk],
-                )
-                if not isinstance(payload, list):
-                    raise SourceError("CLOB /books returned a non-list payload")
-                captured_at = datetime.now(timezone.utc).isoformat()
-                for row in payload:
-                    if not isinstance(row, dict):
-                        continue
-                    token_id = str(row.get("asset_id") or row.get("token_id") or "")
-                    if not token_id:
-                        continue
-                    normalized = dict(row)
-                    normalized.setdefault("fetched_at", captured_at)
-                    result[token_id] = normalize_book(token_id, normalized)
-            except SourceError as exc:
-                stopped = exc
-                for token_id in chunk:
-                    result[token_id] = Book(token_id=token_id, book_missing=True, error=str(exc))
-            for token_id in chunk:
-                result.setdefault(
-                    token_id,
-                    Book(token_id=token_id, book_missing=True, error="token_missing_from_response"),
-                )
-        return result
+        if not ids:
+            return {}
+        chunks = [
+            ids[start : start + self.books_batch_size]
+            for start in range(0, len(ids), self.books_batch_size)
+        ]
+        if len(chunks) == 1:
+            return self._fetch_book_chunk(chunks[0])
+        merged: dict[str, Book] = {}
+        with ThreadPoolExecutor(max_workers=self.books_max_workers) as pool:
+            for chunk_result in pool.map(self._fetch_book_chunk, chunks):
+                merged.update(chunk_result)
+        return merged

@@ -113,6 +113,28 @@ class GammaClient:
             offset += len(batch)
         return rows
 
+    def get_market(self, market_id: str) -> dict[str, Any]:
+        """Fetch one Gamma market payload for a pre-order lifecycle refresh."""
+
+        wanted = str(market_id or "").strip()
+        if not wanted:
+            raise GammaError("market_id is required")
+        try:
+            payload = self.http.get_json(
+                self.base_url + "/markets/" + urllib.parse.quote(wanted, safe="")
+            )
+        except SourceError as exc:
+            raise GammaError(str(exc)) from exc
+        if not isinstance(payload, dict):
+            raise GammaError("Gamma /markets/{id} returned a non-object payload")
+        data = payload.get("data")
+        if isinstance(data, dict):
+            return data
+        market = payload.get("market")
+        if isinstance(market, dict):
+            return market
+        return payload
+
 
 def flatten_event_markets(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []

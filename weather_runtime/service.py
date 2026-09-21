@@ -27,7 +27,7 @@ from .markets import (
     weather_markets,
 )
 from .discovery import discover_rules
-from .models import WeatherMarket, parse_time
+from .models import WeatherMarket, as_float, parse_time
 from .rules import (
     RuleError,
     bucket_for_outcome,
@@ -390,6 +390,7 @@ class RuntimeService:
         sync: bool = False,
         scanner_config: Optional[WeatherScannerConfig] = None,
         horizon_hours: float = 24.0,
+        latest_persist_interval_s: float = 30.0,
     ):
         self.root = Path(root).resolve()
         self.data_dir = (data_dir or self.root / "data").resolve()
@@ -412,6 +413,9 @@ class RuntimeService:
         self.catalog_groups: list[dict[str, Any]] = []
         self._all_catalog_groups: list[dict[str, Any]] = []
         self._catalog_at = 0.0
+        self.latest_persist_interval_s = max(0.0, float(latest_persist_interval_s))
+        self._latest_persist_at = 0.0
+        self._jsonl_key_cache: dict[str, set[str]] = {}
         self.http = JsonHttp(proxy=proxy)
         self.scanner = WeatherScanner(
             config=scanner_config,
@@ -419,12 +423,17 @@ class RuntimeService:
             clob_client=None,
         )
         # Weather Synoptic payloads are large; keep a longer timeout than CLOB/Gamma.
+        from .env import trading_config
         from .sources import WeatherSourceAdapter, _WEATHER_HTTP_TIMEOUT_S
 
+        trading = trading_config()
         self.scanner.source_adapter = WeatherSourceAdapter(
             http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S)
         )
-        self.scanner.clob_client = ClobClient(http=self.http)
+        self.scanner.clob_client = ClobClient(
+            http=self.http,
+            base_url=str(trading.get("clob_host") or "https://clob.polymarket.com"),
+        )
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -683,7 +692,11 @@ class RuntimeService:
     def _persist(self, result: dict[str, Any]) -> None:
         stamp = (result.get("summary") or {}).get("scanned_at") or datetime.now(timezone.utc).isoformat()
         evidence = list(result.pop("source_evidence", []) or [])
-        write_json_atomic(self.data_dir / "latest.json", result)
+        latest_path = self.data_dir / "latest.json"
+        now_mono = time.monotonic()
+        if self._latest_persist_at <= 0.0 or now_mono - self._latest_persist_at >= self.latest_persist_interval_s:
+            write_json_atomic(latest_path, result)
+            self._latest_persist_at = now_mono
         write_json_atomic(
             self.data_dir / "health.json",
             {
@@ -716,9 +729,12 @@ class RuntimeService:
                 },
                 sort_keys=True,
             ),
+            known_keys=self._jsonl_key_cache.get(str(scan_path)),
+            key_cache=self._jsonl_key_cache,
         )
+        candidates_path = self.data_dir / "candidates.jsonl"
         append_jsonl_dedup(
-            self.data_dir / "candidates.jsonl",
+            candidates_path,
             [
                 {"scan_at": stamp, **row}
                 for row in rows
@@ -733,14 +749,19 @@ class RuntimeService:
                 },
                 sort_keys=True,
             ),
+            known_keys=self._jsonl_key_cache.get(str(candidates_path)),
+            key_cache=self._jsonl_key_cache,
         )
-        self._rotate_jsonl(self.data_dir / "source_observations.jsonl")
+        source_path = self.data_dir / "source_observations.jsonl"
+        self._rotate_jsonl(source_path)
         append_jsonl_dedup(
-            self.data_dir / "source_observations.jsonl",
+            source_path,
             [{"scan_at": stamp, **item} for item in evidence],
             key_fn=lambda row: "{}|{}|{}".format(
                 row.get("event_group_id"), row.get("evidence_hash"), row.get("source_timestamp")
             ),
+            known_keys=self._jsonl_key_cache.get(str(source_path)),
+            key_cache=self._jsonl_key_cache,
         )
         self._series_index = None
 
@@ -752,6 +773,7 @@ class RuntimeService:
             self.scan_in_progress = False
 
     def _scan_once(self) -> dict[str, Any]:
+        scan_started = time.monotonic()
         try:
             raw_markets = self._load_markets()
             markets = weather_markets(raw_markets)
@@ -772,6 +794,8 @@ class RuntimeService:
             raise
         with self.lock:
             previous_extrema = dict(self._extrema)
+            previous_books = (self.last_result or {}).get("books")
+        display_books = previous_books if isinstance(previous_books, dict) else None
         scan_now = self._scan_now()
         result = self.scanner.scan(
             markets,
@@ -780,7 +804,9 @@ class RuntimeService:
             now=scan_now,
             fetch_books=books is None,
             previous_extrema=previous_extrema,
+            display_books=display_books,
         )
+        result["summary"]["service_scan_s"] = round(time.monotonic() - scan_started, 3)
         result["summary"]["proxy"] = self.http.proxy or "direct"
         result["summary"]["data_dir"] = str(self.data_dir)
         catalog = [] if self.fixture else list(self.catalog_groups)
@@ -805,7 +831,10 @@ class RuntimeService:
             self.last_scan_at = str((result.get("summary") or {}).get("scanned_at") or "")
             self.last_result = result
             self._extrema = extrema_from_rows(result.get("rows") or [])
+        persist_started = time.monotonic()
         self._persist(result)
+        result["summary"]["persist_s"] = round(time.monotonic() - persist_started, 3)
+        result["summary"]["service_scan_and_persist_s"] = round(time.monotonic() - scan_started, 3)
         self._publish("snapshot", self.board_snapshot())
         self._publish(
             "source_update",
@@ -830,6 +859,7 @@ class RuntimeService:
         limits = self._auto_place_limit_orders(result)
         if takes or limits:
             self._publish("health_update", self.status())
+        result["summary"]["service_total_s"] = round(time.monotonic() - scan_started, 3)
         return result
 
     def _loop(self) -> None:
@@ -1022,7 +1052,7 @@ class RuntimeService:
             if not token_id:
                 continue
             keys = _instrument_keys(row, token_id)
-            if keys & self._taken_tokens or token_id in seen:
+            if keys & self._taken_tokens or keys & self._limit_taken_tokens or token_id in seen:
                 continue
             seen.add(token_id)
             event_id = str(row.get("event_group_id") or "")
@@ -1072,10 +1102,23 @@ class RuntimeService:
             if not token_id:
                 continue
             keys = _instrument_keys(row, token_id)
-            if keys & self._limit_taken_tokens or token_id in seen:
+            if keys & self._taken_tokens or keys & self._limit_taken_tokens or token_id in seen:
                 continue
             economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
             book = row.get("book") if isinstance(row.get("book"), dict) else {}
+            tick_size = as_float(economics.get("tick_size")) or as_float(book.get("tick_size"))
+            if tick_size is None or tick_size <= 0:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": "missing_tick_size",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                    }
+                )
+                continue
             min_order = float(
                 economics.get("min_order_size")
                 or book.get("min_order_size")
@@ -1094,7 +1137,13 @@ class RuntimeService:
                 )
                 continue
             try:
-                px, size = quantize_limit_buy(price, min_order, max_usdc)
+                px, size = quantize_limit_buy(
+                    price,
+                    min_order,
+                    max_usdc,
+                    tick_size=tick_size,
+                    min_order=min_order,
+                )
             except LiveOrderError as exc:
                 placed.append(
                     {
@@ -1106,6 +1155,36 @@ class RuntimeService:
                         "reason": reason,
                         "price": price,
                         "size": min_order,
+                    }
+                )
+                continue
+            if px < min_price or px > max_price:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": "limit_price_outside_band_after_tick",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                        "price": px,
+                        "min_price": min_price,
+                        "max_price": max_price,
+                    }
+                )
+                continue
+            if size + 1e-12 < min_order:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": "limit_size_below_min_order",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                        "price": px,
+                        "size": size,
+                        "min_order_size": min_order,
                     }
                 )
                 continue
@@ -1211,7 +1290,9 @@ class RuntimeService:
         token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
         if not token_id:
             return {"ok": False, "error": "missing_token", "row": _slim_row(row)}
-        if live and (_instrument_keys(row, token_id) & self._taken_tokens):
+        if live and (
+            _instrument_keys(row, token_id) & (self._taken_tokens | self._limit_taken_tokens)
+        ):
             return {
                 "ok": False,
                 "error": "already_taken",
@@ -1224,6 +1305,26 @@ class RuntimeService:
             market = normalize_market(market_payload)
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": "invalid_market", "detail": str(exc)}
+        if live and not self.fixture:
+            if not market.market_id:
+                return {"ok": False, "error": "invalid_market", "detail": "missing_market_id"}
+            try:
+                market = normalize_market(
+                    GammaClient(http=self.http).get_market(market.market_id)
+                )
+                row["market"] = market.to_dict()
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "ok": False,
+                    "error": "gamma_refresh_failed",
+                    "detail": str(exc),
+                }
+            if not market.tradable:
+                return {
+                    "ok": False,
+                    "error": "market_not_tradable",
+                    "market_id": market.market_id,
+                }
         books = self.scanner.clob_client.fetch_books([token_id])
         row["status"] = "rule_matched"
         original_max_usdc = float(self.scanner.config.max_usdc)
@@ -1252,6 +1353,14 @@ class RuntimeService:
                 "row": _slim_row(row),
             }
         economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+        book = row.get("book") if isinstance(row.get("book"), dict) else {}
+        tick_size = (
+            as_float(economics.get("tick_size"))
+            or as_float(book.get("tick_size"))
+            or as_float(market.tick_size)
+        )
+        if tick_size is None or tick_size <= 0:
+            return {"ok": False, "error": "missing_tick_size", "row": _slim_row(row)}
         order_side = str(row.get("order_side") or economics.get("order_side") or "BUY").upper()
         price = float(economics.get("worst_price") or economics.get("execution_price") or 0.0)
         size = float(economics.get("execution_shares") or 0.0)
@@ -1262,9 +1371,19 @@ class RuntimeService:
         size = min(size, max_shares)
         try:
             if order_side == "SELL":
-                price, size = quantize_sell(price, size, float(cfg["max_order_usdc"]))
+                price, size = quantize_sell(
+                    price,
+                    size,
+                    float(cfg["max_order_usdc"]),
+                    tick_size=tick_size,
+                )
             else:
-                price, size = quantize_buy(price, size, float(cfg["max_order_usdc"]))
+                price, size = quantize_buy(
+                    price,
+                    size,
+                    float(cfg["max_order_usdc"]),
+                    tick_size=tick_size,
+                )
         except LiveOrderError as exc:
             return {"ok": False, "error": str(exc), "price": price, "size": size}
         if min_order > 0 and size + 1e-12 < min_order:
