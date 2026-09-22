@@ -5,12 +5,13 @@ from __future__ import annotations
 import copy
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
 from .books import ClobClient, ask_depth, bid_depth, normalize_book, walk_asks, walk_bids
-from .models import Book, WeatherMarket, WeatherRule, as_float, parse_time, utc_now
+from .models import Book, ObservationEvidence, WeatherMarket, WeatherRule, as_float, parse_time, utc_now
 from .rules import (
     bucket_for_outcome,
     bucket_for_value,
@@ -108,7 +109,8 @@ class WeatherScannerConfig:
     max_slippage: float = 0.003
     book_ttl_s: float = 5.0
     display_book_ttl_s: float = 60.0
-    weather_prefetch_deadline_s: float = 20.0
+    weather_prefetch_deadline_s: float = 90.0
+    weather_prefetch_workers: int = 16
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True
@@ -679,7 +681,47 @@ class WeatherScanner:
             rule_list,
             now=current,
             deadline_s=float(self.config.weather_prefetch_deadline_s),
+            workers=int(self.config.weather_prefetch_workers),
         )
+        # Parallel observation poll so cold stations never serialize the rule loop.
+        obs_jobs: dict[str, WeatherRule] = {}
+        for rule in rule_list:
+            obs_key = sha256_json(
+                {
+                    "event_group_id": rule.event_group_id,
+                    "source": rule.source,
+                    "start": rule.observation_start,
+                    "end": rule.observation_end,
+                    "metric": rule.metric,
+                    "timezone": rule.timezone,
+                    "rounding": rule.rounding,
+                }
+            )
+            if obs_key not in obs_jobs:
+                obs_jobs[obs_key] = rule
+
+        def _poll_job(item: tuple[str, WeatherRule]) -> tuple[str, Any]:
+            key, rule = item
+            try:
+                return key, self.source_adapter.poll(rule, now=current)
+            except Exception as exc:  # noqa: BLE001
+                return key, ObservationEvidence(
+                    status="error",
+                    observed_at=_iso(current),
+                    provider=str(rule.source.get("provider") or ""),
+                    station_id=str(rule.source.get("station_id") or ""),
+                    unit=rule.unit,
+                    aggregation=rule.metric,
+                    reason="weather_poll_error:{}".format(exc),
+                )
+
+        worker_count = max(1, min(int(self.config.weather_prefetch_workers), max(1, len(obs_jobs))))
+        if obs_jobs:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="wx-poll") as pool:
+                futures = [pool.submit(_poll_job, item) for item in obs_jobs.items()]
+                for future in as_completed(futures):
+                    key, observation = future.result()
+                    source_cache[key] = observation
         weather_prefetch_done = time.monotonic()
 
         for rule in rule_list:

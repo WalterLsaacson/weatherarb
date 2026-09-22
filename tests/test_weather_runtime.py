@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from unittest.mock import ANY, patch
 
 from weather_runtime.markets import (
@@ -245,6 +246,101 @@ class WeatherRuntimeTests(unittest.TestCase):
         observation = adapter.poll(later, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
         self.assertNotIn("recently timed out", observation.reason)
         self.assertIn("https://example.invalid/later", http.calls)
+
+    def test_payload_singleflight_coalesces_parallel_fetches(self) -> None:
+        class SlowHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.lock = threading.Lock()
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                with self.lock:
+                    self.calls += 1
+                self.started.set()
+                self.release.wait(2.0)
+                return {"observations": [{"timestamp": "2026-09-04T12:00:00Z", "value": 26}]}
+
+        live = self._live_source_rule(url="https://example.invalid/coalesce", station_id="ONE")
+        http = SlowHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        results: list[Any] = []
+
+        def worker() -> None:
+            results.append(adapter._payload(live, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc)))
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(http.started.wait(1.0))
+        time.sleep(0.05)
+        http.release.set()
+        for thread in threads:
+            thread.join(timeout=2.0)
+        self.assertEqual(http.calls, 1)
+        self.assertEqual(len(results), 6)
+
+    def test_payload_singleflight_releases_waiters_on_unexpected_error(self) -> None:
+        class BoomHttp:
+            def __init__(self) -> None:
+                self.started = threading.Event()
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                self.started.set()
+                raise RuntimeError("boom")
+
+        live = self._live_source_rule(url="https://example.invalid/boom", station_id="BOOM")
+        http = BoomHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            try:
+                adapter._payload(live, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(http.started.wait(1.0))
+        for thread in threads:
+            thread.join(timeout=2.0)
+        self.assertTrue(all(thread.is_alive() is False for thread in threads))
+        self.assertGreaterEqual(len(errors), 1)
+        self.assertEqual(adapter._http_inflight, {})
+
+    def test_data_dir_cleanup_every_36h(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            (data / "scan.jsonl").write_text("old-scan\n", encoding="utf-8")
+            (data / "scan.jsonl.old").write_text("rotated\n", encoding="utf-8")
+            (data / "source_observations.jsonl").write_text("obs\n", encoding="utf-8")
+            (data / "orders.jsonl").write_text('{"ok":true}\n', encoding="utf-8")
+            (data / "latest.json").write_text('{"event_groups":[]}\n', encoding="utf-8")
+            service = RuntimeService(root=ROOT, data_dir=data, sync=False)
+            # Constructor may already clean once; force another pass after rewriting bulk.
+            (data / "scan.jsonl").write_text("again\n", encoding="utf-8")
+            (data / "scan.jsonl.old").write_text("rotated-again\n", encoding="utf-8")
+            report = service._maybe_cleanup_data_dir(force=True)
+            self.assertTrue(report.get("ok"))
+            self.assertEqual((data / "scan.jsonl").read_text(encoding="utf-8"), "")
+            self.assertFalse((data / "scan.jsonl.old").exists())
+            self.assertTrue((data / "orders.jsonl").is_file())
+            self.assertIn("ok", (data / "orders.jsonl").read_text(encoding="utf-8"))
+            self.assertTrue((data / ".cleanup_at").is_file())
+            skipped = service._maybe_cleanup_data_dir(force=False)
+            self.assertEqual(skipped.get("skipped"), "not_due")
+
+    def test_schedule_trading_skips_when_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            service.running = False
+            service.stop_event.set()
+            service._schedule_trading({"rows": [], "summary": {}})
+            self.assertIsNone(service._trade_thread)
 
     def test_source_intraday_ignores_points_after_now(self) -> None:
         raw = {

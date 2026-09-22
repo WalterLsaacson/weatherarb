@@ -31,7 +31,11 @@ _SYNOPTIC_PAGE_UNITS = "temp|F,speed|mph,english"
 _SYNOPTIC_PAGE_RECENT_MINUTES = 72 * 60
 _SYNOPTIC_VARS = "air_temp,sea_level_pressure,metar"
 _SYNOPTIC_TIMESERIES_URL = "https://api.synopticdata.com/v2/stations/timeseries"
-_WEATHER_HTTP_TIMEOUT_S = 20.0
+# Keep per-station waits short so a slow Synoptic host cannot serialize the scan.
+_WEATHER_HTTP_TIMEOUT_S = 10.0
+_HTTP_FAIL_COOLDOWN_S = 120.0
+_DEFAULT_HTTP_CACHE_TTL_S = 300.0
+_DEFAULT_PREFETCH_WORKERS = 16
 _WU_POST_CLOSE_REFRESH_HOURS = 3.0
 _WU_POST_CLOSE_CACHE_S = 15.0
 # Do not mark source-final if the last in-window sample is too far from local midnight.
@@ -379,11 +383,17 @@ def _synoptic_air_temp_unit(payload: Any, station: dict[str, Any]) -> str:
 class WeatherSourceAdapter:
     """Poll one approved rule and return immutable source evidence."""
 
-    def __init__(self, *, http: Optional[JsonHttp] = None, http_cache_ttl_s: float = 60.0):
-        self.http = http or JsonHttp(timeout=_WEATHER_HTTP_TIMEOUT_S)
+    def __init__(
+        self,
+        *,
+        http: Optional[JsonHttp] = None,
+        http_cache_ttl_s: float = _DEFAULT_HTTP_CACHE_TTL_S,
+    ):
+        self.http = http or JsonHttp(timeout=_WEATHER_HTTP_TIMEOUT_S, retries=0)
         self.http_cache_ttl_s = max(0.0, float(http_cache_ttl_s))
         self._http_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._http_fail: dict[tuple[str, str], float] = {}
+        self._http_inflight: dict[tuple[str, str], threading.Event] = {}
         self._http_lock = threading.Lock()
         self._synoptic_token_cache: Optional[tuple[float, str]] = None
         self._synoptic_token_error_at = 0.0
@@ -470,46 +480,91 @@ class WeatherSourceAdapter:
         cache_key = self._cache_key(url, params)
         current_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
         cache_ttl_s = self._cache_ttl_s(rule, current_utc)
+        owner = False
+        wait_event: Optional[threading.Event] = None
         if self.http_cache_ttl_s:
+            while True:
+                with self._http_lock:
+                    hit = self._http_cache.get(cache_key)
+                    failed_at = self._http_fail.get(cache_key)
+                    if hit and cache_ttl_s and (time.time() - hit[0]) < cache_ttl_s:
+                        return hit[1], url
+                    if failed_at and (time.time() - failed_at) < _HTTP_FAIL_COOLDOWN_S:
+                        raise SourceError("source recently timed out")
+                    inflight = self._http_inflight.get(cache_key)
+                    if inflight is None:
+                        wait_event = threading.Event()
+                        self._http_inflight[cache_key] = wait_event
+                        owner = True
+                        break
+                    wait_event = inflight
+                # Another thread is fetching this station; wait then re-check cache.
+                wait_event.wait(timeout=max(1.0, float(getattr(self.http, "timeout", 10.0)) + 1.0))
+        else:
+            owner = True
+        if not owner:
             with self._http_lock:
                 hit = self._http_cache.get(cache_key)
                 failed_at = self._http_fail.get(cache_key)
             if hit and cache_ttl_s and (time.time() - hit[0]) < cache_ttl_s:
                 return hit[1], url
-            if failed_at and (time.time() - failed_at) < 30.0:
+            if failed_at and (time.time() - failed_at) < _HTTP_FAIL_COOLDOWN_S:
                 raise SourceError("source recently timed out")
+            # Leader failed without publishing fail/cache; fall through and fetch.
+            with self._http_lock:
+                if cache_key not in self._http_inflight:
+                    wait_event = threading.Event()
+                    self._http_inflight[cache_key] = wait_event
+                    owner = True
+                else:
+                    raise SourceError("source recently timed out")
         try:
-            payload = self.http.get_json(url, params=params or None, headers=headers)
-        except SourceError:
-            with self._http_lock:
-                self._http_fail[cache_key] = time.time()
-            raise
-        # WRH timeseries requests english/temp|F; if Synoptic omits UNITS, treat as F.
-        if "synopticdata.com" in url and isinstance(payload, dict):
-            units = payload.get("UNITS") or payload.get("units")
-            has_air = isinstance(units, dict) and bool(
-                units.get("air_temp") or units.get("air_temp_set_1")
-            )
-            if not has_air:
-                payload = dict(payload)
-                merged = dict(units) if isinstance(units, dict) else {}
-                merged.setdefault("air_temp", "Fahrenheit")
-                payload["UNITS"] = merged
-        payload = self._normalize_payload(rule, payload)
-        self._note_synoptic_watch(rule, payload)
-        if self.http_cache_ttl_s:
-            with self._http_lock:
-                self._http_cache[cache_key] = (time.time(), payload)
-                self._http_fail.pop(cache_key, None)
-        return payload, url
+            try:
+                payload = self.http.get_json(url, params=params or None, headers=headers)
+            except SourceError:
+                with self._http_lock:
+                    self._http_fail[cache_key] = time.time()
+                raise
+            except Exception:
+                # Any unexpected leader failure must still free waiters.
+                with self._http_lock:
+                    self._http_fail[cache_key] = time.time()
+                raise
+            # WRH timeseries requests english/temp|F; if Synoptic omits UNITS, treat as F.
+            if "synopticdata.com" in url and isinstance(payload, dict):
+                units = payload.get("UNITS") or payload.get("units")
+                has_air = isinstance(units, dict) and bool(
+                    units.get("air_temp") or units.get("air_temp_set_1")
+                )
+                if not has_air:
+                    payload = dict(payload)
+                    merged = dict(units) if isinstance(units, dict) else {}
+                    merged.setdefault("air_temp", "Fahrenheit")
+                    payload["UNITS"] = merged
+            payload = self._normalize_payload(rule, payload)
+            self._note_synoptic_watch(rule, payload)
+            if self.http_cache_ttl_s:
+                with self._http_lock:
+                    self._http_cache[cache_key] = (time.time(), payload)
+                    self._http_fail.pop(cache_key, None)
+            return payload, url
+        finally:
+            if owner and wait_event is not None:
+                with self._http_lock:
+                    if self._http_inflight.get(cache_key) is wait_event:
+                        self._http_inflight.pop(cache_key, None)
+                wait_event.set()
 
-    def prefetch(self, rules: Iterable[WeatherRule], *, now: Optional[datetime] = None, deadline_s: float = 20.0) -> None:
-        """Warm the HTTP cache for unique stations without blocking the scan on a hung host."""
-
+    def _unique_prefetch_rules(
+        self,
+        rules: Iterable[WeatherRule],
+        *,
+        now: Optional[datetime] = None,
+    ) -> list[WeatherRule]:
         current = now or datetime.now(timezone.utc)
         current_utc = current.astimezone(timezone.utc)
         unique: list[WeatherRule] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[tuple[str, str, str]] = set()
         for rule in rules:
             if not isinstance(rule, WeatherRule):
                 continue
@@ -531,15 +586,54 @@ class WeatherSourceAdapter:
                 continue
             seen.add(key)
             unique.append(rule)
+        unique.sort(key=lambda item: 0 if self._window_open(item, current_utc) else 1)
+        return unique
+
+    def _payload_cached_or_failed(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> bool:
+        if isinstance(rule.source.get("static"), dict):
+            return True
+        try:
+            url, params, _headers = self._request_parts(rule)
+        except Exception:
+            return False
+        cache_key = self._cache_key(url, params)
+        current_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cache_ttl_s = self._cache_ttl_s(rule, current_utc)
+        with self._http_lock:
+            hit = self._http_cache.get(cache_key)
+            failed_at = self._http_fail.get(cache_key)
+        if hit and cache_ttl_s and (time.time() - hit[0]) < cache_ttl_s:
+            return True
+        if failed_at and (time.time() - failed_at) < _HTTP_FAIL_COOLDOWN_S:
+            return True
+        return False
+
+    def prefetch(
+        self,
+        rules: Iterable[WeatherRule],
+        *,
+        now: Optional[datetime] = None,
+        deadline_s: float = 90.0,
+        workers: int = _DEFAULT_PREFETCH_WORKERS,
+    ) -> None:
+        """Warm the HTTP cache for unique stations in parallel.
+
+        Uses a wall-clock budget so a hung host cannot block the scan forever.
+        Stations never reached before the deadline stay uncached so a later
+        parallel wave (or poll) can still try them — they are not marked failed.
+        """
+
+        current = now or datetime.now(timezone.utc)
+        unique = self._unique_prefetch_rules(rules, now=current)
         if not unique:
             return
-        unique.sort(key=lambda item: 0 if self._window_open(item, current_utc) else 1)
         try:
             if any("synopticdata.com" in str(rule.source.get("url") or "") for rule in unique):
                 self._wrh_page_token()
         except Exception:
             pass
-        gate = threading.Semaphore(8)
+        worker_count = max(1, int(workers))
+        gate = threading.Semaphore(worker_count)
         deadline = time.time() + max(1.0, float(deadline_s))
 
         def _warm(item: WeatherRule) -> None:
@@ -551,17 +645,26 @@ class WeatherSourceAdapter:
                 except Exception:
                     return
 
-        workers = [
-            threading.Thread(target=_warm, args=(rule,), daemon=True, name="wx-prefetch")
-            for rule in unique
-        ]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            remain = deadline - time.time()
-            worker.join(timeout=max(0.05, remain))
-        # Stations the budget never reached stay uncached so poll() can still
-        # try them. Only real _payload failures enter _http_fail.
+        # Two waves: first fills most stations; second retries only misses so a
+        # short first-wave stall cannot force serial poll() afterwards.
+        pending = list(unique)
+        for _wave in range(2):
+            if not pending or time.time() >= deadline:
+                break
+            threads = [
+                threading.Thread(target=_warm, args=(rule,), daemon=True, name="wx-prefetch")
+                for rule in pending
+            ]
+            for worker in threads:
+                worker.start()
+            for worker in threads:
+                remain = deadline - time.time()
+                worker.join(timeout=max(0.05, remain))
+            pending = [
+                rule
+                for rule in pending
+                if not self._payload_cached_or_failed(rule, now=current)
+            ]
 
     def poll(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> ObservationEvidence:
         current = now or datetime.now(timezone.utc)

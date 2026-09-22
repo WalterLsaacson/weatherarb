@@ -44,6 +44,14 @@ from .sources import JsonHttp, series_from_raw
 from .storage import append_jsonl, append_jsonl_dedup, load_json, write_json_atomic
 
 
+_DATA_CLEANUP_INTERVAL_S = 36 * 3600.0
+_DATA_CLEANUP_TRUNCATE = (
+    "scan.jsonl",
+    "source_observations.jsonl",
+    "synoptic_watch.jsonl",
+    "candidates.jsonl",
+)
+_DATA_CLEANUP_DELETE_SUFFIXES = (".old", ".lock")
 def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
     """Compact groups for the event list and SSE. Detail still reads last_result."""
 
@@ -463,11 +471,16 @@ class RuntimeService:
         )
         # Weather Synoptic payloads are large; keep a longer timeout than CLOB/Gamma.
         from .env import trading_config
-        from .sources import WeatherSourceAdapter, _WEATHER_HTTP_TIMEOUT_S
+        from .sources import (
+            WeatherSourceAdapter,
+            _DEFAULT_HTTP_CACHE_TTL_S,
+            _WEATHER_HTTP_TIMEOUT_S,
+        )
 
         trading = trading_config()
         self.scanner.source_adapter = WeatherSourceAdapter(
-            http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S)
+            http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S, retries=0),
+            http_cache_ttl_s=_DEFAULT_HTTP_CACHE_TTL_S,
         )
         self.scanner.clob_client = ClobClient(
             http=self.http,
@@ -476,6 +489,8 @@ class RuntimeService:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
+        self._trade_thread: Optional[threading.Thread] = None
+        self._trade_lock = threading.Lock()
         self.running = False
         self.ticks = 0
         self.last_error = ""
@@ -509,8 +524,11 @@ class RuntimeService:
         self._limit_taken_tokens: set[str] = set()
         self._limit_attempted_tokens: set[str] = set()
         self._open_limit_orders: dict[str, dict[str, Any]] = {}
+        self._data_cleanup_interval_s = _DATA_CLEANUP_INTERVAL_S
+        self._last_data_cleanup_at = 0.0
         self._hydrate_last_result()
         self._hydrate_taken()
+        self._maybe_cleanup_data_dir(force=False)
 
     def _catalog_path(self) -> Path:
         return self.data_dir / "weather_catalog.json"
@@ -755,6 +773,115 @@ class RuntimeService:
                 except OSError:
                     pass
 
+    def _cleanup_stamp_path(self) -> Path:
+        return self.data_dir / ".cleanup_at"
+
+    def _read_cleanup_stamp(self) -> float:
+        path = self._cleanup_stamp_path()
+        if not path.is_file():
+            return 0.0
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                return 0.0
+            # Accept epoch seconds or ISO timestamps.
+            try:
+                return float(text)
+            except ValueError:
+                stamp = parse_time(text)
+                if stamp is None:
+                    return 0.0
+                return stamp.timestamp()
+        except OSError:
+            return 0.0
+
+    def _write_cleanup_stamp(self, when: Optional[float] = None) -> None:
+        stamp = float(when if when is not None else time.time())
+        try:
+            self._cleanup_stamp_path().write_text(
+                "{}\n{}".format(stamp, datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        self._last_data_cleanup_at = stamp
+
+    def _maybe_cleanup_data_dir(self, *, force: bool = False) -> dict[str, Any]:
+        """Drop rotated logs and truncate bulky jsonl every 36 hours.
+
+        Keeps orders.jsonl, rules, catalog, market snapshot and latest board
+        snapshot so trading hydrate and the UI still work after cleanup.
+        """
+
+        if self.fixture:
+            return {"ok": True, "skipped": "fixture"}
+        now = time.time()
+        last = self._last_data_cleanup_at or self._read_cleanup_stamp()
+        if not force and last > 0.0 and (now - last) < self._data_cleanup_interval_s:
+            return {"ok": True, "skipped": "not_due", "last_cleanup_at": last}
+        removed: list[str] = []
+        truncated: list[str] = []
+        freed = 0
+        try:
+            for path in sorted(self.data_dir.iterdir()):
+                if not path.is_file():
+                    continue
+                name = path.name
+                if name in {".cleanup_at", "orders.jsonl", "health.json", "latest.json"}:
+                    continue
+                if name.endswith(_DATA_CLEANUP_DELETE_SUFFIXES) or name.endswith(".jsonl.old"):
+                    try:
+                        size = path.stat().st_size
+                        path.unlink()
+                        removed.append(name)
+                        freed += size
+                    except OSError:
+                        continue
+            for name in _DATA_CLEANUP_TRUNCATE:
+                path = self.data_dir / name
+                if not path.is_file():
+                    continue
+                try:
+                    size = path.stat().st_size
+                    if size <= 0:
+                        continue
+                    path.write_text("", encoding="utf-8")
+                    truncated.append(name)
+                    freed += size
+                    self._jsonl_key_cache.pop(str(path), None)
+                except OSError:
+                    continue
+            # Drop stale HTTP payloads from RAM as part of the same budget.
+            adapter = getattr(self.scanner, "source_adapter", None)
+            if adapter is not None:
+                with getattr(adapter, "_http_lock", threading.Lock()):
+                    cache = getattr(adapter, "_http_cache", None)
+                    fail = getattr(adapter, "_http_fail", None)
+                    if isinstance(cache, dict):
+                        cache.clear()
+                    if isinstance(fail, dict):
+                        fail.clear()
+            self._series_index = None
+            self._write_cleanup_stamp(now)
+            report = {
+                "ok": True,
+                "removed": removed,
+                "truncated": truncated,
+                "freed_bytes": freed,
+                "cleaned_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+            }
+            print(
+                "DATA CLEANUP removed={} truncated={} freed_mb={:.1f}".format(
+                    len(removed),
+                    len(truncated),
+                    freed / (1024 * 1024),
+                ),
+                flush=True,
+            )
+            return report
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
     def _persist(self, result: dict[str, Any]) -> None:
         stamp = (result.get("summary") or {}).get("scanned_at") or datetime.now(timezone.utc).isoformat()
         evidence = list(result.pop("source_evidence", []) or [])
@@ -931,17 +1058,59 @@ class RuntimeService:
                 "candidates": candidates,
             },
         )
-        cancels = self._auto_cancel_stale_limit_orders(result)
-        takes = self._auto_take_opportunities(result)
-        limits = self._auto_place_limit_orders(result)
-        if takes or limits or cancels:
-            self._publish("health_update", self.status())
+        # Publish the board first; live cancel/place can take minutes and must
+        # not block the next scan interval or SSE refresh.
         result["summary"]["service_total_s"] = round(time.monotonic() - scan_started, 3)
+        self._schedule_trading(result)
         return result
+
+    def _schedule_trading(self, result: dict[str, Any]) -> None:
+        if self.fixture or self.stop_event.is_set() or not self.running:
+            return
+        payload = {
+            "rows": list(result.get("rows") or []),
+            "summary": dict(result.get("summary") or {}),
+        }
+
+        def _stopped() -> bool:
+            return self.stop_event.is_set() or not self.running
+
+        def runner() -> None:
+            if _stopped():
+                return
+            with self._trade_lock:
+                if _stopped():
+                    return
+                try:
+                    cancels = self._auto_cancel_stale_limit_orders(payload)
+                    if _stopped():
+                        return
+                    takes = self._auto_take_opportunities(payload)
+                    if _stopped():
+                        return
+                    limits = self._auto_place_limit_orders(payload)
+                    if takes or limits or cancels:
+                        self._publish("health_update", self.status())
+                except Exception as exc:  # noqa: BLE001
+                    with self.lock:
+                        self.last_error = "trading:{}".format(exc)
+                    self._publish("health_update", self.status())
+
+        prior = self._trade_thread
+        if prior is not None and prior.is_alive():
+            # Previous cancel/place still running; skip this tick's trading to
+            # avoid stacking CLOB storms on top of a slow scan.
+            return
+        if _stopped():
+            return
+        thread = threading.Thread(target=runner, name="weather-trade", daemon=True)
+        self._trade_thread = thread
+        thread.start()
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
             try:
+                self._maybe_cleanup_data_dir()
                 self.scan_once()
             except Exception:
                 self._publish("health_update", self.status())
@@ -970,9 +1139,14 @@ class RuntimeService:
         self.stop_event.set()
         with self.lock:
             thread = self.thread
+            trade = self._trade_thread
             self.running = False
         if thread and thread.is_alive():
             thread.join(timeout=2.0)
+        if trade and trade.is_alive():
+            # Live cancel/place can take a while; wait longer than the scan
+            # thread, but do not block shutdown indefinitely.
+            trade.join(timeout=30.0)
         self._publish("health_update", self.status())
         return self.status()
 
