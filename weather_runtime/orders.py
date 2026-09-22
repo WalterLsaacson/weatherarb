@@ -169,13 +169,9 @@ def _submit_fak(
     )
 
 
-def _submit_order(
+def cancel_order(
     *,
-    token_id: str,
-    price: float,
-    size: float,
-    side: str,
-    order_type: str,
+    order_id: str,
     config: Optional[dict[str, Any]] = None,
 ) -> Any:
     from .env import trading_config
@@ -183,6 +179,20 @@ def _submit_order(
     cfg = dict(config or trading_config())
     if not cfg.get("live_orders"):
         raise LiveOrderError("LIVE_ORDERS is not true")
+    client = _secure_client(cfg)
+    try:
+        response = client.cancel_order(order_id=str(order_id))
+    except Exception as exc:  # noqa: BLE001
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+    payload = jsonable(response)
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        raise LiveOrderError(str(payload.get("error") or payload.get("error_msg") or "cancel_rejected"))
+    return payload
+
+
+def _secure_client(cfg: dict[str, Any]) -> Any:
     key = str(cfg.get("private_key") or "")
     if not key:
         raise LiveOrderError("PRIVATE_KEY is empty")
@@ -200,11 +210,28 @@ def _submit_order(
             secret=str(cfg["api_secret"]),
             passphrase=str(cfg["api_passphrase"]),
         )
-    client = SecureClient.create(
+    return SecureClient.create(
         private_key=key,
         wallet=str(cfg.get("funder") or "") or None,
         credentials=credentials,
     )
+
+
+def _submit_order(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    side: str,
+    order_type: str,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    if not cfg.get("live_orders"):
+        raise LiveOrderError("LIVE_ORDERS is not true")
+    client = _secure_client(cfg)
     try:
         signed = client.create_limit_order(
             token_id=str(token_id),

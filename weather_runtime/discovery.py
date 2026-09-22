@@ -149,15 +149,12 @@ def _noaa_template_reasons(first: WeatherMarket, group: list[WeatherMarket]) -> 
         source = {
             "provider": "NOAA",
             "station_id": station,
+            # The WRH timeseries page has no observation feed of its own.
+            # obs.js loads this Synoptic URL with the page token; Show Hourly
+            # Data only filters those rows. The page token is attached at
+            # request time and is not stored on the rule.
             "url": "https://api.synopticdata.com/v2/stations/timeseries",
-            "params": {
-                "STID": station,
-                "showemptystations": 1,
-                "units": "temp|F,speed|mph,english",
-                "recent": 4320,
-                "complete": 1,
-                "obtimezone": "local",
-            },
+            "params": {},
             "resolution_source": first.resolution_source,
             "value_path": "temp",
             "timestamp_path": "timestamp",

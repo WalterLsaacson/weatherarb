@@ -227,6 +227,13 @@ _LOCKED_SELL_YES_REASONS = {
 _LIMIT_ORDER_REASONS = {
     "source_final_winner_yes",
     "source_final_loser_no",
+    "intraday_impossible_no",
+    "provisional_loser_no",
+}
+_SKIP_LIMIT_REASONS = {
+    "market_not_tradable",
+    "missing_yes_token",
+    "missing_no_token",
 }
 
 
@@ -278,6 +285,38 @@ def _lock_snapshot(row: dict[str, Any]) -> dict[str, Any]:
 
 
 _FILL_STATUSES = {"submitted", "matched", "live"}
+
+
+def _exchange_order_id(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("order_id", "orderID", "id"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    nested = payload.get("order")
+    if isinstance(nested, dict):
+        found = _exchange_order_id(nested)
+        if found:
+            return found
+    exchange = payload.get("exchange")
+    if isinstance(exchange, dict):
+        return _exchange_order_id(exchange)
+    return ""
+
+
+def _limit_lock_token(row: dict[str, Any]) -> str:
+    if not isinstance(row, dict):
+        return ""
+    if str(row.get("order_side") or "BUY").upper() != "BUY":
+        return ""
+    current_reason = str(row.get("reason") or "")
+    if current_reason in _SKIP_LIMIT_REASONS:
+        return ""
+    reason = str(row.get("match_reason") or current_reason)
+    if reason not in _LIMIT_ORDER_REASONS:
+        return ""
+    return str(row.get("book_token_id") or row.get("winning_token_id") or "")
 
 
 def _fill_keys(record: Any) -> set[str]:
@@ -468,6 +507,8 @@ class RuntimeService:
         self._extrema: dict[str, dict[str, Any]] = {}
         self._taken_tokens: set[str] = set()
         self._limit_taken_tokens: set[str] = set()
+        self._limit_attempted_tokens: set[str] = set()
+        self._open_limit_orders: dict[str, dict[str, Any]] = {}
         self._hydrate_last_result()
         self._hydrate_taken()
 
@@ -501,12 +542,37 @@ class RuntimeService:
                         record = json.loads(line)
                     except ValueError:
                         continue
+                    order_type = str(record.get("order_type") or "FAK").upper()
+                    token_id = str(record.get("token_id") or "")
+                    if order_type == "CANCEL":
+                        status = str(record.get("status") or "")
+                        if record.get("ok") and status in {
+                            "cancelled",
+                            "canceled",
+                            "simulated_cancel",
+                        }:
+                            info = self._open_limit_orders.pop(token_id, {})
+                            keys = set(info.get("keys") or [])
+                            if token_id:
+                                keys.add(token_id)
+                            event_id = str(record.get("event_group_id") or info.get("event_group_id") or "")
+                            outcome = str(record.get("target_outcome") or info.get("target_outcome") or "")
+                            if event_id and outcome:
+                                keys.add(event_id + "|" + outcome)
+                            self._limit_taken_tokens.difference_update(keys)
+                        continue
                     keys = _fill_keys(record)
                     if not keys:
                         continue
-                    order_type = str(record.get("order_type") or "FAK").upper()
                     if order_type == "GTC":
                         self._limit_taken_tokens.update(keys)
+                        if token_id and not record.get("dry_run"):
+                            self._open_limit_orders[token_id] = {
+                                "order_id": _exchange_order_id(record),
+                                "keys": keys,
+                                "event_group_id": record.get("event_group_id"),
+                                "target_outcome": record.get("target_outcome"),
+                            }
                     else:
                         self._taken_tokens.update(keys)
         except OSError:
@@ -763,6 +829,16 @@ class RuntimeService:
             known_keys=self._jsonl_key_cache.get(str(source_path)),
             key_cache=self._jsonl_key_cache,
         )
+        watch_path = self.data_dir / "synoptic_watch.jsonl"
+        adapter = getattr(self.scanner, "source_adapter", None)
+        watch_rows = adapter.drain_synoptic_watch() if adapter is not None else []
+        append_jsonl_dedup(
+            watch_path,
+            watch_rows,
+            key_fn=lambda row: "{}|{}".format(row.get("station_id"), row.get("obs_timestamp")),
+            known_keys=self._jsonl_key_cache.get(str(watch_path)),
+            key_cache=self._jsonl_key_cache,
+        )
         self._series_index = None
 
     def scan_once(self) -> dict[str, Any]:
@@ -855,9 +931,10 @@ class RuntimeService:
                 "candidates": candidates,
             },
         )
+        cancels = self._auto_cancel_stale_limit_orders(result)
         takes = self._auto_take_opportunities(result)
         limits = self._auto_place_limit_orders(result)
-        if takes or limits:
+        if takes or limits or cancels:
             self._publish("health_update", self.status())
         result["summary"]["service_total_s"] = round(time.monotonic() - scan_started, 3)
         return result
@@ -1024,6 +1101,7 @@ class RuntimeService:
                 "trading": self.trading_status(),
                 "taken_tokens": len(self._taken_tokens),
                 "limit_taken_tokens": len(self._limit_taken_tokens),
+                "open_limit_orders": len(self._open_limit_orders),
             }
 
     def trading_status(self) -> dict[str, Any]:
@@ -1032,6 +1110,7 @@ class RuntimeService:
         status = public_trading_status()
         status["taken_tokens"] = len(self._taken_tokens)
         status["limit_taken_tokens"] = len(self._limit_taken_tokens)
+        status["open_limit_orders"] = len(self._open_limit_orders)
         return status
 
     def _auto_take_opportunities(self, result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1072,7 +1151,7 @@ class RuntimeService:
         return takes
 
     def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
-        """GTC buy on source-final winner Yes and loser No (min shares, fixed price band)."""
+        """GTC buy at LIMIT_ORDER_PRICE on every locked Yes/No token."""
 
         from .env import trading_config
         from .models import utc_now
@@ -1091,22 +1170,26 @@ class RuntimeService:
         placed: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in result.get("rows") or []:
-            if not isinstance(row, dict) or row.get("status") != "opportunity":
-                continue
-            reason = str(row.get("reason") or "")
-            if reason not in _LIMIT_ORDER_REASONS:
-                continue
-            if str(row.get("order_side") or "BUY").upper() != "BUY":
-                continue
-            token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
+            token_id = _limit_lock_token(row)
             if not token_id:
                 continue
+            reason = str(row.get("match_reason") or row.get("reason") or "")
             keys = _instrument_keys(row, token_id)
-            if keys & self._taken_tokens or keys & self._limit_taken_tokens or token_id in seen:
+            if (
+                keys & self._taken_tokens
+                or keys & self._limit_taken_tokens
+                or keys & self._limit_attempted_tokens
+                or token_id in seen
+            ):
                 continue
             economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
             book = row.get("book") if isinstance(row.get("book"), dict) else {}
-            tick_size = as_float(economics.get("tick_size")) or as_float(book.get("tick_size"))
+            market = row.get("market") if isinstance(row.get("market"), dict) else {}
+            tick_size = (
+                as_float(economics.get("tick_size"))
+                or as_float(book.get("tick_size"))
+                or as_float(market.get("tick_size"))
+            )
             if tick_size is None or tick_size <= 0:
                 placed.append(
                     {
@@ -1122,6 +1205,7 @@ class RuntimeService:
             min_order = float(
                 economics.get("min_order_size")
                 or book.get("min_order_size")
+                or market.get("min_order_size")
                 or 0.0
             )
             if min_order <= 0:
@@ -1209,30 +1293,114 @@ class RuntimeService:
                 "created_at": stamp,
             }
             if live:
+                self._limit_attempted_tokens.update(keys)
                 try:
                     exchange = submit_gtc_buy(token_id=token_id, price=px, size=size, config=cfg)
                     record["exchange"] = exchange
                     record["status"] = "submitted"
+                    order_id = _exchange_order_id(exchange)
+                    if order_id:
+                        record["order_id"] = order_id
                     self._limit_taken_tokens.update(keys)
+                    self._open_limit_orders[token_id] = {
+                        "order_id": order_id,
+                        "keys": keys,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                    }
                 except LiveOrderError as exc:
                     record.update({"ok": False, "status": "error", "error": str(exc)})
             else:
                 # Session dedupe even in dry-run so we do not spam simulations each tick.
                 self._limit_taken_tokens.update(keys)
+                self._open_limit_orders[token_id] = {
+                    "order_id": "",
+                    "keys": keys,
+                    "event_group_id": row.get("event_group_id"),
+                    "target_outcome": row.get("target_outcome"),
+                }
+            append_jsonl(self.data_dir / "orders.jsonl", [record])
+            if record.get("ok"):
+                print(
+                    "LIMIT {} {} {} {} @ {} x {}".format(
+                        "LIVE" if live else "DRY",
+                        row.get("event_group_id"),
+                        row.get("target_outcome"),
+                        row.get("trade_side"),
+                        px,
+                        size,
+                    ),
+                    flush=True,
+                )
+            placed.append(record)
+        return placed
+
+    def _locked_limit_tokens(self, result: dict[str, Any]) -> set[str]:
+        tokens: set[str] = set()
+        for row in result.get("rows") or []:
+            token_id = _limit_lock_token(row)
+            if token_id:
+                tokens.add(token_id)
+        return tokens
+
+    def _auto_cancel_stale_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
+        """Cancel resting GTCs whose lock is no longer present."""
+
+        from .env import trading_config
+        from .models import utc_now
+        from .orders import LiveOrderError, cancel_order
+
+        if self.fixture or not self._open_limit_orders:
+            return []
+        cfg = trading_config()
+        live = bool(cfg.get("live_orders"))
+        locked = self._locked_limit_tokens(result)
+        cancelled: list[dict[str, Any]] = []
+        for token_id, info in list(self._open_limit_orders.items()):
+            if token_id in locked:
+                continue
+            keys = set(info.get("keys") or [])
+            keys.add(token_id)
+            stamp = utc_now().isoformat()
+            record: dict[str, Any] = {
+                "ok": True,
+                "dry_run": not live,
+                "status": "cancelled" if live else "simulated_cancel",
+                "order_type": "CANCEL",
+                "token_id": token_id,
+                "order_id": str(info.get("order_id") or ""),
+                "event_group_id": info.get("event_group_id"),
+                "target_outcome": info.get("target_outcome"),
+                "created_at": stamp,
+            }
+            if live:
+                order_id = str(info.get("order_id") or "")
+                if not order_id:
+                    record.update({"ok": False, "status": "error", "error": "missing_order_id"})
+                    append_jsonl(self.data_dir / "orders.jsonl", [record])
+                    cancelled.append(record)
+                    continue
+                try:
+                    exchange = cancel_order(order_id=order_id, config=cfg)
+                    record["exchange"] = exchange
+                except LiveOrderError as exc:
+                    record.update({"ok": False, "status": "error", "error": str(exc)})
+                    append_jsonl(self.data_dir / "orders.jsonl", [record])
+                    cancelled.append(record)
+                    continue
+            self._open_limit_orders.pop(token_id, None)
+            self._limit_taken_tokens.difference_update(keys)
             append_jsonl(self.data_dir / "orders.jsonl", [record])
             print(
-                "LIMIT {} {} {} {} @ {} x {}".format(
+                "LIMIT CANCEL {} {} {}".format(
                     "LIVE" if live else "DRY",
-                    row.get("event_group_id"),
-                    row.get("target_outcome"),
-                    row.get("trade_side"),
-                    px,
-                    size,
+                    info.get("event_group_id"),
+                    token_id,
                 ),
                 flush=True,
             )
-            placed.append(record)
-        return placed
+            cancelled.append(record)
+        return cancelled
 
     def take_opportunity(
         self,

@@ -87,8 +87,8 @@ class WeatherMarket:
 
     @property
     def tradable(self) -> bool:
-        # CLOB-level tradability only. Strategy gates reject negRisk by
-        # default before any order is generated.
+        # CLOB-level tradability only. Weather buckets are negRisk/multi-outcome
+        # by construction; do not treat that flag as non-tradable.
         return (
             self.active
             and not self.closed

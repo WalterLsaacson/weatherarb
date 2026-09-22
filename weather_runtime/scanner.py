@@ -112,7 +112,7 @@ class WeatherScannerConfig:
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True
-    reject_neg_risk: bool = True
+    reject_neg_risk: bool = False
 
 
 class WeatherScanner:
@@ -165,6 +165,7 @@ class WeatherScanner:
                 "winning_side": trade_side,
                 "winning_token_id": trade_token,
                 "book_token_id": trade_token,
+                "match_reason": reason,
                 "lifecycle": {"state": "RULE_MATCHED", "history": list(history)},
             }
         )
@@ -274,6 +275,7 @@ class WeatherScanner:
         pending = _unique_ids(pending_tokens)
         if fetch and pending:
             books.update(self.clob_client.fetch_books(pending))
+            eval_at = utc_now()
         if pending:
             self._evaluate_tokens(rows, books, market_map, eval_at, pending)
         for row in rows:
@@ -883,7 +885,12 @@ class WeatherScanner:
                 continue
 
             if observation.status == "provisional":
-                if is_running:
+                if not bucket_impossible_while_open(
+                    rule.metric,
+                    observation.value,
+                    market_bucket,
+                    rounding=rule.rounding,
+                ):
                     base.update(
                         {
                             "status": "waiting",
