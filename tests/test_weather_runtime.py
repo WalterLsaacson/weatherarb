@@ -334,6 +334,21 @@ class WeatherRuntimeTests(unittest.TestCase):
             skipped = service._maybe_cleanup_data_dir(force=False)
             self.assertEqual(skipped.get("skipped"), "not_due")
 
+    def test_cleanup_stamp_ignores_iso_comment_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            data = Path(temp) / "data"
+            data.mkdir()
+            stamp = time.time()
+            (data / ".cleanup_at").write_text(
+                "{}\n{}\n".format(stamp, datetime.fromtimestamp(stamp, tz=timezone.utc).isoformat()),
+                encoding="utf-8",
+            )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=False)
+            (data / "scan.jsonl").write_text("keep-me\n", encoding="utf-8")
+            skipped = service._maybe_cleanup_data_dir(force=False)
+            self.assertEqual(skipped.get("skipped"), "not_due")
+            self.assertEqual((data / "scan.jsonl").read_text(encoding="utf-8"), "keep-me\n")
+
     def test_schedule_trading_skips_when_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)

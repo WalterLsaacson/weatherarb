@@ -781,10 +781,11 @@ class RuntimeService:
         if not path.is_file():
             return 0.0
         try:
-            text = path.read_text(encoding="utf-8").strip()
-            if not text:
+            raw = path.read_text(encoding="utf-8").strip()
+            if not raw:
                 return 0.0
-            # Accept epoch seconds or ISO timestamps.
+            # Stamp file may include an ISO comment on a second line.
+            text = raw.splitlines()[0].strip()
             try:
                 return float(text)
             except ValueError:
