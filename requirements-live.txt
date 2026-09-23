@@ -1,0 +1,2 @@
+# Live order path (Python 3.11+). Dry-run / read-only does not need this.
+polymarket-client==0.10.0

@@ -1,0 +1,19 @@
+[Unit]
+Description=weatherarb Polymarket weather board (live when LIVE_ORDERS=true)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/weatherarb
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/weatherarb/.venv/bin/python /opt/weatherarb/run_weather.py --sync --data-dir data/pm-weather-live --interval 30 --host 0.0.0.0 --port 8793 --no-open
+Restart=on-failure
+RestartSec=8
+TimeoutStopSec=40
+KillMode=mixed
+StandardOutput=append:/opt/weatherarb/data/run/weatherarb.log
+StandardError=append:/opt/weatherarb/data/run/weatherarb.log
+
+[Install]
+WantedBy=multi-user.target
