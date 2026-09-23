@@ -71,32 +71,33 @@ def quantize_sell(
 
 def quantize_limit_buy(
     price: float,
-    size: float,
     max_usdc: float,
     *,
     tick_size: Optional[float] = None,
     min_order: Optional[float] = None,
 ) -> tuple[float, float]:
-    """GTC buys: fixed min shares, refuse if notional exceeds max_usdc."""
+    """GTC buys: size shares from LIMIT_ORDER_USDC / price; refuse below exchange min."""
 
     cent = Decimal("0.01")
     tick = _tick_quantum(tick_size)
     px = Decimal(str(price)).quantize(tick, rounding=ROUND_DOWN)
-    shares = Decimal(str(size)).quantize(cent, rounding=ROUND_DOWN)
-    min_shares = Decimal(str(min_order)) if min_order is not None else shares
     if px <= 0:
         raise LiveOrderError("invalid_price")
+    budget = Decimal(str(max_usdc))
+    if budget <= 0:
+        raise LiveOrderError("invalid_max_usdc")
+    shares = (budget / px).quantize(cent, rounding=ROUND_DOWN)
     if shares <= 0:
-        raise LiveOrderError("invalid_size")
-    if min_shares <= 0:
-        raise LiveOrderError("invalid_min_order_size")
-    if shares < min_shares:
-        # The exchange minimum is authoritative; do not round below it even
-        # when the configured minimum has finer precision than 0.01.
-        shares = min_shares
-    budget = Decimal(str(max_usdc)).quantize(cent, rounding=ROUND_DOWN)
-    if px * shares > budget:
-        raise LiveOrderError("limit_order_exceeds_usdc")
+        raise LiveOrderError("cannot_quantize_buy_amount")
+    if min_order is not None:
+        min_shares = Decimal(str(min_order))
+        if min_shares <= 0:
+            raise LiveOrderError("invalid_min_order_size")
+        if shares < min_shares:
+            # Budget rounded below the exchange minimum; bump to min when affordable.
+            if px * min_shares > budget:
+                raise LiveOrderError("limit_order_exceeds_usdc")
+            shares = min_shares
     return float(px), float(shares)
 
 

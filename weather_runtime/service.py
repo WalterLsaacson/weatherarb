@@ -1326,7 +1326,7 @@ class RuntimeService:
         return takes
 
     def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
-        """GTC buy at LIMIT_ORDER_PRICE on every locked Yes/No token."""
+        """GTC buy at LIMIT_ORDER_PRICE sized by LIMIT_ORDER_USDC on locked Yes/No tokens."""
 
         from .env import trading_config
         from .models import utc_now
@@ -1398,7 +1398,6 @@ class RuntimeService:
             try:
                 px, size = quantize_limit_buy(
                     price,
-                    min_order,
                     max_usdc,
                     tick_size=tick_size,
                     min_order=min_order,
@@ -1413,7 +1412,8 @@ class RuntimeService:
                         "target_outcome": row.get("target_outcome"),
                         "reason": reason,
                         "price": price,
-                        "size": min_order,
+                        "max_usdc": max_usdc,
+                        "min_order_size": min_order,
                     }
                 )
                 continue
