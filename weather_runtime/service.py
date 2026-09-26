@@ -1326,11 +1326,11 @@ class RuntimeService:
         return takes
 
     def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
-        """GTC buy at LIMIT_ORDER_PRICE sized by LIMIT_ORDER_USDC on locked Yes/No tokens."""
+        """GTC buy at LIMIT_ORDER_PRICE sized by min(balance, LIMIT_ORDER_USDC)."""
 
         from .env import trading_config
         from .models import utc_now
-        from .orders import LiveOrderError, quantize_limit_buy, submit_gtc_buy
+        from .orders import LiveOrderError, fetch_collateral_usdc, quantize_limit_buy, submit_gtc_buy
 
         cfg = trading_config()
         if not cfg.get("limit_orders") or self.fixture:
@@ -1342,6 +1342,8 @@ class RuntimeService:
         if price < min_price or price > max_price:
             return []
         live = bool(cfg.get("live_orders"))
+        remaining_usdc: Optional[float] = None
+        balance_loaded = False
         placed: list[dict[str, Any]] = []
         seen: set[str] = set()
         for row in result.get("rows") or []:
@@ -1395,24 +1397,52 @@ class RuntimeService:
                     }
                 )
                 continue
+            if live and not balance_loaded:
+                try:
+                    remaining_usdc = float(fetch_collateral_usdc(cfg))
+                except LiveOrderError as exc:
+                    return [
+                        {
+                            "ok": False,
+                            "error": "balance_fetch_failed",
+                            "detail": str(exc),
+                        }
+                    ]
+                balance_loaded = True
+                print(
+                    "LIMIT balance {:.4f} USDC · cap {:.4f}".format(remaining_usdc, max_usdc),
+                    flush=True,
+                )
+            budget = float(max_usdc)
+            if remaining_usdc is not None:
+                budget = min(budget, max(0.0, float(remaining_usdc)))
             try:
                 px, size = quantize_limit_buy(
                     price,
-                    max_usdc,
+                    budget,
                     tick_size=tick_size,
                     min_order=min_order,
                 )
             except LiveOrderError as exc:
+                error = str(exc)
+                if remaining_usdc is not None and error in {
+                    "limit_order_exceeds_usdc",
+                    "cannot_quantize_buy_amount",
+                    "invalid_max_usdc",
+                }:
+                    error = "insufficient_balance"
                 placed.append(
                     {
                         "ok": False,
-                        "error": str(exc),
+                        "error": error,
                         "token_id": token_id,
                         "event_group_id": row.get("event_group_id"),
                         "target_outcome": row.get("target_outcome"),
                         "reason": reason,
                         "price": price,
                         "max_usdc": max_usdc,
+                        "budget_usdc": budget,
+                        "balance_usdc": remaining_usdc,
                         "min_order_size": min_order,
                     }
                 )
@@ -1447,6 +1477,7 @@ class RuntimeService:
                     }
                 )
                 continue
+            notional = round(px * size, 6)
             seen.add(token_id)
             stamp = utc_now().isoformat()
             record: dict[str, Any] = {
@@ -1458,7 +1489,9 @@ class RuntimeService:
                 "token_id": token_id,
                 "price": px,
                 "size": size,
-                "usdc": round(px * size, 4),
+                "usdc": round(notional, 4),
+                "budget_usdc": round(budget, 4),
+                "balance_usdc": None if remaining_usdc is None else round(float(remaining_usdc), 4),
                 "trade_side": row.get("trade_side"),
                 "order_side": "BUY",
                 "reason": reason,
@@ -1483,6 +1516,8 @@ class RuntimeService:
                         "event_group_id": row.get("event_group_id"),
                         "target_outcome": row.get("target_outcome"),
                     }
+                    if remaining_usdc is not None:
+                        remaining_usdc = max(0.0, float(remaining_usdc) - notional)
                 except LiveOrderError as exc:
                     record.update({"ok": False, "status": "error", "error": str(exc)})
             else:
@@ -1497,13 +1532,14 @@ class RuntimeService:
             append_jsonl(self.data_dir / "orders.jsonl", [record])
             if record.get("ok"):
                 print(
-                    "LIMIT {} {} {} {} @ {} x {}".format(
+                    "LIMIT {} {} {} {} @ {} x {} ({:.4f} USDC)".format(
                         "LIVE" if live else "DRY",
                         row.get("event_group_id"),
                         row.get("target_outcome"),
                         row.get("trade_side"),
                         px,
                         size,
+                        notional,
                     ),
                     flush=True,
                 )
@@ -1587,7 +1623,14 @@ class RuntimeService:
     ) -> dict[str, Any]:
         from .env import trading_config
         from .models import utc_now
-        from .orders import LiveOrderError, quantize_buy, quantize_sell, submit_fak_buy, submit_fak_sell
+        from .orders import (
+            LiveOrderError,
+            fetch_collateral_usdc,
+            quantize_buy,
+            quantize_sell,
+            submit_fak_buy,
+            submit_fak_sell,
+        )
 
         cfg = trading_config()
         wanted_event = str(event_group_id or "").strip()
@@ -1668,14 +1711,19 @@ class RuntimeService:
                     "error": "market_not_tradable",
                     "market_id": market.market_id,
                 }
+        order_budget = float(cfg["max_order_usdc"])
+        if live:
+            try:
+                balance_usdc = float(fetch_collateral_usdc(cfg))
+            except LiveOrderError as exc:
+                return {"ok": False, "error": "balance_fetch_failed", "detail": str(exc)}
+            order_budget = min(order_budget, max(0.0, balance_usdc))
         books = self.scanner.clob_client.fetch_books([token_id])
         row["status"] = "rule_matched"
         original_max_usdc = float(self.scanner.config.max_usdc)
         original_target = float(self.scanner.config.target_shares)
-        self.scanner.config.max_usdc = float(cfg["max_order_usdc"])
-        self.scanner.config.target_shares = max(
-            original_target, float(cfg["max_order_usdc"]) * 1000.0
-        )
+        self.scanner.config.max_usdc = order_budget
+        self.scanner.config.target_shares = max(original_target, order_budget * 1000.0)
         try:
             self.scanner._evaluate_matched_row(row, books, {market.market_id: market}, utc_now())
         finally:
@@ -1710,30 +1758,35 @@ class RuntimeService:
         min_order = float(economics.get("min_order_size") or 0.0)
         if price <= 0.0 or size <= 0.0:
             return {"ok": False, "error": "invalid_size_or_price", "row": _slim_row(row)}
-        max_shares = float(cfg["max_order_usdc"]) / price
+        max_shares = order_budget / price
         size = min(size, max_shares)
         try:
             if order_side == "SELL":
                 price, size = quantize_sell(
                     price,
                     size,
-                    float(cfg["max_order_usdc"]),
+                    order_budget,
                     tick_size=tick_size,
                 )
             else:
                 price, size = quantize_buy(
                     price,
                     size,
-                    float(cfg["max_order_usdc"]),
+                    order_budget,
                     tick_size=tick_size,
                 )
         except LiveOrderError as exc:
-            return {"ok": False, "error": str(exc), "price": price, "size": size}
+            error = str(exc)
+            if live and error in {"cannot_quantize_buy_amount", "invalid_max_usdc"}:
+                error = "insufficient_balance"
+            return {"ok": False, "error": error, "price": price, "size": size, "budget_usdc": order_budget}
         if min_order > 0 and size + 1e-12 < min_order:
+            below_balance = live and order_budget < float(cfg["max_order_usdc"])
             return {
                 "ok": False,
-                "error": "max_usdc_below_min_order",
+                "error": "insufficient_balance" if below_balance else "max_usdc_below_min_order",
                 "max_order_usdc": cfg["max_order_usdc"],
+                "budget_usdc": order_budget,
                 "min_order_size": min_order,
                 "price": price,
             }

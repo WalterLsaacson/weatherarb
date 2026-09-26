@@ -69,6 +69,35 @@ def quantize_sell(
     return quantize_buy(price, size, max_usdc, tick_size=tick_size)
 
 
+def fetch_collateral_usdc(config: Optional[dict[str, Any]] = None) -> float:
+    """Return available CLOB collateral balance in USDC (6-decimal base units)."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        payload = client.get_balance_allowance(asset_type="COLLATERAL")
+    except Exception as exc:  # noqa: BLE001
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+    raw = payload
+    if hasattr(payload, "model_dump"):
+        raw = payload.model_dump()
+    if isinstance(raw, dict):
+        balance = raw.get("balance")
+    else:
+        balance = getattr(payload, "balance", None)
+    try:
+        units = int(balance)
+    except (TypeError, ValueError) as exc:
+        raise LiveOrderError("invalid_collateral_balance") from exc
+    if units < 0:
+        raise LiveOrderError("invalid_collateral_balance")
+    return float(units) / 1_000_000.0
+
+
 def quantize_limit_buy(
     price: float,
     max_usdc: float,

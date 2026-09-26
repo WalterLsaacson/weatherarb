@@ -4007,11 +4007,12 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
             with patch.dict("os.environ", env, clear=False):
-                with patch(
-                    "weather_runtime.orders.submit_gtc_buy",
-                    return_value={"ok": True, "status": "live", "order_id": "gtc-1"},
-                ) as submit:
-                    placed = service._auto_place_limit_orders(result)
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=50.0):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        return_value={"ok": True, "status": "live", "order_id": "gtc-1"},
+                    ) as submit:
+                        placed = service._auto_place_limit_orders(result)
             submit.assert_called_once()
             kwargs = submit.call_args.kwargs
             self.assertEqual(kwargs["token_id"], "yes-winner-token")
@@ -4024,6 +4025,79 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(placed[0]["order_id"], "gtc-1")
             self.assertIn("yes-winner-token", service._limit_taken_tokens)
             self.assertEqual(service._open_limit_orders["yes-winner-token"]["order_id"], "gtc-1")
+
+    def test_auto_place_limit_orders_caps_by_balance(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()[:1]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "100",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=20.0):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        return_value={"ok": True, "status": "live", "order_id": "gtc-bal"},
+                    ) as submit:
+                        placed = service._auto_place_limit_orders(result)
+            submit.assert_called_once()
+            # min(100, 20) / 0.99 → 20.20 shares
+            self.assertAlmostEqual(submit.call_args.kwargs["size"], 20.20)
+            self.assertTrue(placed[0]["ok"])
+            self.assertAlmostEqual(placed[0]["budget_usdc"], 20.0)
+            self.assertAlmostEqual(placed[0]["balance_usdc"], 20.0)
+
+    def test_auto_place_limit_orders_skips_when_balance_below_min(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()[:1]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "100",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=1.0):
+                    with patch("weather_runtime.orders.submit_gtc_buy") as submit:
+                        placed = service._auto_place_limit_orders(result)
+            submit.assert_not_called()
+            self.assertEqual(len(placed), 1)
+            self.assertFalse(placed[0]["ok"])
+            self.assertEqual(placed[0]["error"], "insufficient_balance")
+
+    def test_auto_place_limit_orders_decrements_balance_across_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()[:2]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "100",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=25.0):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        return_value={"ok": True, "status": "live", "order_id": "gtc-x"},
+                    ) as submit:
+                        placed = service._auto_place_limit_orders(result)
+            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(len(placed), 2)
+            self.assertTrue(placed[0]["ok"])
+            self.assertAlmostEqual(placed[0]["size"], 25.25)  # 25 / 0.99
+            self.assertFalse(placed[1]["ok"])
+            self.assertEqual(placed[1]["error"], "insufficient_balance")
 
     def test_auto_place_limit_orders_skips_after_fak_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4057,12 +4131,13 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
             with patch.dict("os.environ", env, clear=False):
-                with patch(
-                    "weather_runtime.orders.submit_gtc_buy",
-                    side_effect=LiveOrderError("order_rejected"),
-                ) as submit:
-                    first = service._auto_place_limit_orders(result)
-                    second = service._auto_place_limit_orders(result)
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=50.0):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        side_effect=LiveOrderError("order_rejected"),
+                    ) as submit:
+                        first = service._auto_place_limit_orders(result)
+                        second = service._auto_place_limit_orders(result)
             submit.assert_called_once()
             self.assertEqual(len(first), 1)
             self.assertFalse(first[0]["ok"])

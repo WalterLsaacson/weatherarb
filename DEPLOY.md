@@ -112,7 +112,7 @@ chmod 600 .env
 | `LIMIT_ORDERS` | `true` 时对锁定桶挂 GTC |
 | `LIMIT_ORDER_PRICE` | 本机 `0.99` |
 | `MAX_ORDER_USDC` | FAK 吃单名义本金上限 |
-| `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金（`shares ≈ USDC / LIMIT_ORDER_PRICE`） |
+| `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金；live 时实际为 `min(可用余额, LIMIT_ORDER_USDC)` |
 | `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |
 | `POLY_API_KEY` / `SECRET` / `PASSPHRASE` | 可留空；缺省时由 SDK 用私钥派生 |
 
