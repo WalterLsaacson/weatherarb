@@ -98,6 +98,19 @@ def fetch_collateral_usdc(config: Optional[dict[str, Any]] = None) -> float:
     return float(units) / 1_000_000.0
 
 
+def limit_price_for_tick(
+    tick_size: Optional[float],
+    *,
+    price: float,
+    price_001: float,
+) -> float:
+    """0.001-tick books use LIMIT_ORDER_PRICE_001; other ticks use LIMIT_ORDER_PRICE."""
+
+    if tick_size is not None and abs(float(tick_size) - 0.001) <= 1e-9:
+        return float(price_001)
+    return float(price)
+
+
 def quantize_limit_buy(
     price: float,
     max_usdc: float,

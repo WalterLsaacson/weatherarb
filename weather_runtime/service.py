@@ -463,13 +463,14 @@ class RuntimeService:
         self.latest_persist_interval_s = max(0.0, float(latest_persist_interval_s))
         self._latest_persist_at = 0.0
         self._jsonl_key_cache: dict[str, set[str]] = {}
-        self.http = JsonHttp(proxy=proxy)
+        # Gamma catalog pages are several MB and can take well over the old 8s
+        # deadline on a slow VPN path. CLOB books share this client.
+        self.http = JsonHttp(proxy=proxy, timeout=60.0)
         self.scanner = WeatherScanner(
             config=scanner_config,
             source_adapter=None,
             clob_client=None,
         )
-        # Weather Synoptic payloads are large; keep a longer timeout than CLOB/Gamma.
         from .env import trading_config
         from .sources import (
             WeatherSourceAdapter,
@@ -1113,7 +1114,10 @@ class RuntimeService:
             try:
                 self._maybe_cleanup_data_dir()
                 self.scan_once()
-            except Exception:
+            except Exception as exc:
+                with self.lock:
+                    self.last_error = str(exc)
+                    self.last_scan_at = datetime.now(timezone.utc).isoformat()
                 self._publish("health_update", self.status())
             if self.stop_event.wait(self.interval_s):
                 break
@@ -1326,20 +1330,27 @@ class RuntimeService:
         return takes
 
     def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
-        """GTC buy at LIMIT_ORDER_PRICE sized by min(balance, LIMIT_ORDER_USDC)."""
+        """GTC buy at the tick's limit price, sized by min(balance, LIMIT_ORDER_USDC)."""
 
         from .env import trading_config
         from .models import utc_now
-        from .orders import LiveOrderError, fetch_collateral_usdc, quantize_limit_buy, submit_gtc_buy
+        from .orders import (
+            LiveOrderError,
+            fetch_collateral_usdc,
+            limit_price_for_tick,
+            quantize_limit_buy,
+            submit_gtc_buy,
+        )
 
         cfg = trading_config()
         if not cfg.get("limit_orders") or self.fixture:
             return []
-        price = float(cfg["limit_order_price"])
+        base_price = float(cfg["limit_order_price"])
+        price_001 = float(cfg["limit_order_price_001"])
         min_price = float(cfg["limit_order_min_price"])
         max_price = float(cfg["limit_order_max_price"])
         max_usdc = float(cfg["limit_order_usdc"])
-        if price < min_price or price > max_price:
+        if base_price < min_price or base_price > max_price:
             return []
         live = bool(cfg.get("live_orders"))
         remaining_usdc: Optional[float] = None
@@ -1416,6 +1427,23 @@ class RuntimeService:
             budget = float(max_usdc)
             if remaining_usdc is not None:
                 budget = min(budget, max(0.0, float(remaining_usdc)))
+            price = limit_price_for_tick(tick_size, price=base_price, price_001=price_001)
+            band_max = max(max_price, price_001) if abs(float(tick_size) - 0.001) <= 1e-9 else max_price
+            if price < min_price or price > band_max + 1e-12:
+                placed.append(
+                    {
+                        "ok": False,
+                        "error": "limit_price_outside_band",
+                        "token_id": token_id,
+                        "event_group_id": row.get("event_group_id"),
+                        "target_outcome": row.get("target_outcome"),
+                        "reason": reason,
+                        "price": price,
+                        "min_price": min_price,
+                        "max_price": band_max,
+                    }
+                )
+                continue
             try:
                 px, size = quantize_limit_buy(
                     price,
@@ -1447,7 +1475,7 @@ class RuntimeService:
                     }
                 )
                 continue
-            if px < min_price or px > max_price:
+            if px < min_price or px > band_max + 1e-12:
                 placed.append(
                     {
                         "ok": False,
@@ -1458,7 +1486,7 @@ class RuntimeService:
                         "reason": reason,
                         "price": px,
                         "min_price": min_price,
-                        "max_price": max_price,
+                        "max_price": band_max,
                     }
                 )
                 continue

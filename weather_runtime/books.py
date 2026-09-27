@@ -129,7 +129,7 @@ class ClobClient:
         *,
         http: Optional[JsonHttp] = None,
         base_url: str = "https://clob.polymarket.com",
-        books_batch_size: int = 500,
+        books_batch_size: int = 100,
         books_max_workers: int = 4,
     ):
         self.http = http or JsonHttp()
@@ -165,6 +165,13 @@ class ClobClient:
                 normalized.setdefault("fetched_at", captured_at)
                 result[token_id] = normalize_book(token_id, normalized)
         except SourceError as exc:
+            # A dropped VPN read used to blank the whole chunk. Split and retry
+            # so one reset does not mark hundreds of books missing.
+            if len(chunk) > 1:
+                mid = len(chunk) // 2
+                result.update(self._fetch_book_chunk(chunk[:mid]))
+                result.update(self._fetch_book_chunk(chunk[mid:]))
+                return result
             for token_id in chunk:
                 result[token_id] = Book(token_id=token_id, book_missing=True, error=str(exc))
         for token_id in chunk:

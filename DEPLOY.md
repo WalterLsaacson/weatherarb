@@ -110,7 +110,8 @@ chmod 600 .env
 | `CHAIN_ID` | `137`（Polygon） |
 | `LIVE_ORDERS` | `true` 才真实下单；否则 dry-run |
 | `LIMIT_ORDERS` | `true` 时对锁定桶挂 GTC |
-| `LIMIT_ORDER_PRICE` | 本机 `0.99` |
+| `LIMIT_ORDER_PRICE` | 0.01 档限价，本机 `0.99` |
+| `LIMIT_ORDER_PRICE_001` | 0.001 档限价，本机 `0.995` |
 | `MAX_ORDER_USDC` | FAK 吃单名义本金上限 |
 | `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金；live 时实际为 `min(可用余额, LIMIT_ORDER_USDC)` |
 | `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |

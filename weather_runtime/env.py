@@ -60,6 +60,7 @@ def trading_config() -> dict[str, Any]:
         "limit_orders": bool(limit_orders),
         "limit_order_usdc": float(as_float(os.environ.get("LIMIT_ORDER_USDC"), 5.0) or 5.0),
         "limit_order_price": float(as_float(os.environ.get("LIMIT_ORDER_PRICE"), 0.99) or 0.99),
+        "limit_order_price_001": float(as_float(os.environ.get("LIMIT_ORDER_PRICE_001"), 0.995) or 0.995),
         "limit_order_min_price": float(as_float(os.environ.get("LIMIT_ORDER_MIN_PRICE"), 0.01) or 0.01),
         "limit_order_max_price": float(as_float(os.environ.get("LIMIT_ORDER_MAX_PRICE"), 0.99) or 0.99),
         "has_private_key": bool(_first_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY")),
@@ -88,6 +89,7 @@ def public_trading_status() -> dict[str, Any]:
         "limit_orders": cfg["limit_orders"],
         "limit_order_usdc": cfg["limit_order_usdc"],
         "limit_order_price": cfg["limit_order_price"],
+        "limit_order_price_001": cfg["limit_order_price_001"],
         "limit_order_min_price": cfg["limit_order_min_price"],
         "limit_order_max_price": cfg["limit_order_max_price"],
     }

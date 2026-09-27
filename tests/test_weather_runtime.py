@@ -3725,6 +3725,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             "LIMIT_ORDERS": "true",
             "LIMIT_ORDER_USDC": "7.5",
             "LIMIT_ORDER_PRICE": "0.95",
+            "LIMIT_ORDER_PRICE_001": "0.997",
             "LIMIT_ORDER_MIN_PRICE": "0.02",
             "LIMIT_ORDER_MAX_PRICE": "0.98",
         }
@@ -3734,10 +3735,19 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertTrue(cfg["limit_orders"])
         self.assertAlmostEqual(cfg["limit_order_usdc"], 7.5)
         self.assertAlmostEqual(cfg["limit_order_price"], 0.95)
+        self.assertAlmostEqual(cfg["limit_order_price_001"], 0.997)
         self.assertAlmostEqual(cfg["limit_order_min_price"], 0.02)
         self.assertAlmostEqual(cfg["limit_order_max_price"], 0.98)
         self.assertTrue(pub["limit_orders"])
         self.assertAlmostEqual(pub["limit_order_price"], 0.95)
+        self.assertAlmostEqual(pub["limit_order_price_001"], 0.997)
+
+    def test_limit_price_for_tick_uses_001_price(self) -> None:
+        from weather_runtime.orders import limit_price_for_tick
+
+        self.assertAlmostEqual(limit_price_for_tick(0.01, price=0.99, price_001=0.995), 0.99)
+        self.assertAlmostEqual(limit_price_for_tick(0.001, price=0.99, price_001=0.995), 0.995)
+        self.assertAlmostEqual(limit_price_for_tick(0.0001, price=0.99, price_001=0.995), 0.99)
 
     def test_quantize_limit_buy_sizes_by_usdc_budget(self) -> None:
         from weather_runtime.orders import LiveOrderError, quantize_limit_buy
@@ -3864,6 +3874,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -3886,9 +3897,9 @@ class WeatherRuntimeTests(unittest.TestCase):
                 self.assertTrue(row["dry_run"])
                 self.assertEqual(row["status"], "simulated_gtc")
                 self.assertEqual(row["order_type"], "GTC")
-                self.assertAlmostEqual(row["price"], 0.99)
-                self.assertAlmostEqual(row["size"], 5.05)
-                self.assertAlmostEqual(row["usdc"], round(0.99 * 5.05, 4))
+                self.assertAlmostEqual(row["price"], 0.995)
+                self.assertAlmostEqual(row["size"], 5.02)
+                self.assertAlmostEqual(row["usdc"], round(0.995 * 5.02, 4))
             orders_path = Path(temp) / "data" / "orders.jsonl"
             lines = orders_path.read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(lines), 3)
@@ -3896,6 +3907,28 @@ class WeatherRuntimeTests(unittest.TestCase):
             with patch.dict("os.environ", env, clear=False):
                 again = service._auto_place_limit_orders(result)
             self.assertEqual(again, [])
+
+    def test_auto_place_limit_orders_keeps_cent_tick_on_base_price(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            rows = self._final_limit_rows()[:1]
+            rows[0]["economics"] = {"min_order_size": 5, "tick_size": 0.01}
+            result = {"summary": {}, "rows": rows}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "false",
+                "LIMIT_ORDER_USDC": "5",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                placed = service._auto_place_limit_orders(result)
+            self.assertEqual(len(placed), 1)
+            self.assertTrue(placed[0]["ok"])
+            self.assertAlmostEqual(placed[0]["price"], 0.99)
+            self.assertAlmostEqual(placed[0]["size"], 5.05)
 
     def test_auto_place_limit_orders_skips_when_disabled_or_out_of_band(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3922,6 +3955,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIMIT_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -3943,6 +3977,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -3950,7 +3985,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 placed = service._auto_place_limit_orders(result)
             self.assertEqual(len(placed), 1)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["size"], 5.05)
+            self.assertAlmostEqual(placed[0]["size"], 5.02)
 
     def test_auto_place_limit_orders_sizes_by_configured_usdc(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3962,6 +3997,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "100",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -3969,9 +4005,9 @@ class WeatherRuntimeTests(unittest.TestCase):
                 placed = service._auto_place_limit_orders(result)
             self.assertEqual(len(placed), 1)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["price"], 0.99)
-            self.assertAlmostEqual(placed[0]["size"], 101.01)
-            self.assertAlmostEqual(placed[0]["usdc"], round(0.99 * 101.01, 4))
+            self.assertAlmostEqual(placed[0]["price"], 0.995)
+            self.assertAlmostEqual(placed[0]["size"], 100.50)
+            self.assertAlmostEqual(placed[0]["usdc"], round(0.995 * 100.50, 4))
 
     def test_auto_place_limit_orders_rejects_price_below_band_after_tick(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -3984,6 +4020,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.95",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4003,6 +4040,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4016,8 +4054,8 @@ class WeatherRuntimeTests(unittest.TestCase):
             submit.assert_called_once()
             kwargs = submit.call_args.kwargs
             self.assertEqual(kwargs["token_id"], "yes-winner-token")
-            self.assertAlmostEqual(kwargs["price"], 0.99)
-            self.assertAlmostEqual(kwargs["size"], 5.05)
+            self.assertAlmostEqual(kwargs["price"], 0.995)
+            self.assertAlmostEqual(kwargs["size"], 5.02)
             self.assertEqual(len(placed), 1)
             self.assertTrue(placed[0]["ok"])
             self.assertEqual(placed[0]["status"], "submitted")
@@ -4035,6 +4073,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "100",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4046,8 +4085,8 @@ class WeatherRuntimeTests(unittest.TestCase):
                     ) as submit:
                         placed = service._auto_place_limit_orders(result)
             submit.assert_called_once()
-            # min(100, 20) / 0.99 → 20.20 shares
-            self.assertAlmostEqual(submit.call_args.kwargs["size"], 20.20)
+            # min(100, 20) / 0.995 → 20.10 shares
+            self.assertAlmostEqual(submit.call_args.kwargs["size"], 20.10)
             self.assertTrue(placed[0]["ok"])
             self.assertAlmostEqual(placed[0]["budget_usdc"], 20.0)
             self.assertAlmostEqual(placed[0]["balance_usdc"], 20.0)
@@ -4061,6 +4100,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "100",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4082,6 +4122,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "100",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4095,7 +4136,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(submit.call_count, 1)
             self.assertEqual(len(placed), 2)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["size"], 25.25)  # 25 / 0.99
+            self.assertAlmostEqual(placed[0]["size"], 25.12)  # 25 / 0.995
             self.assertFalse(placed[1]["ok"])
             self.assertEqual(placed[1]["error"], "insufficient_balance")
 
@@ -4109,6 +4150,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4127,6 +4169,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "true",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4259,6 +4302,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4304,6 +4348,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_USDC": "5",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
             }
@@ -4312,8 +4357,8 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertEqual(len(placed), 1)
             self.assertTrue(placed[0]["ok"])
             self.assertEqual(placed[0]["reason"], "intraday_impossible_no")
-            self.assertAlmostEqual(placed[0]["price"], 0.99)
-            self.assertAlmostEqual(placed[0]["size"], 5.05)
+            self.assertAlmostEqual(placed[0]["price"], 0.995)
+            self.assertAlmostEqual(placed[0]["size"], 5.02)
 
     def test_auto_place_limit_places_locked_no_even_when_bid_at_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4344,6 +4389,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 "LIMIT_ORDERS": "true",
                 "LIVE_ORDERS": "false",
                 "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
                 "LIMIT_ORDER_MIN_PRICE": "0.01",
                 "LIMIT_ORDER_MAX_PRICE": "0.99",
                 "LIMIT_ORDER_USDC": "5",
@@ -4352,7 +4398,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 placed = service._auto_place_limit_orders(result)
             self.assertEqual(len(placed), 1)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["price"], 0.99)
+            self.assertAlmostEqual(placed[0]["price"], 0.995)
             self.assertEqual(placed[0]["reason"], "intraday_impossible_no")
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -214,7 +215,12 @@ class JsonHttp:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
                 raise SourceError("HTTP {} from {}: {}".format(exc.code, url, detail)) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.IncompleteRead,
+            ) as exc:
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
@@ -247,7 +253,12 @@ class JsonHttp:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
                 raise SourceError("HTTP {} from {}: {}".format(exc.code, url, detail)) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.IncompleteRead,
+            ) as exc:
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
@@ -285,7 +296,12 @@ class JsonHttp:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
                 raise SourceError("HTTP {} from {}: {}".format(exc.code, url, detail)) from exc
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+                http.client.IncompleteRead,
+            ) as exc:
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
