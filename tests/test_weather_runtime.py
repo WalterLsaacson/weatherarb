@@ -2882,6 +2882,183 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.value, 32)
         self.assertEqual(observation.reason, "incomplete_observation_window")
 
+    def _seoul_day_rule(
+        self,
+        *,
+        metric_word: str,
+        awc_rows: Optional[list] = None,
+        awc_static: Any = None,
+        include_awc: bool = True,
+        sample_set: str = "",
+    ):
+        from weather_runtime.rules import with_source_contract
+
+        titles = ["9°C or below", *["{}°C".format(deg) for deg in range(10, 24)], "24°C or higher"]
+        markets = self._temp_markets(
+            slug="{}-temperature-in-seoul-on-september-6-2026".format(metric_word),
+            source="https://www.weather.gov/wrh/timeseries?site=rksi",
+            titles=titles,
+            metric_word=metric_word,
+        )
+        rule = parse_rule(discover_rules(markets)["generated_rules"][0])
+        source = {
+            **rule.source,
+            "static": {
+                "STATION": [
+                    {
+                        "STID": "RKSI",
+                        "OBSERVATIONS": {
+                            "date_time": [
+                                "2026-09-06T01:00:00Z",
+                                "2026-09-06T06:00:00Z",
+                                "2026-09-06T12:00:00Z",
+                            ],
+                            "air_temp_set_1": [10.0, 23.0, 21.0],
+                        },
+                    }
+                ]
+            },
+        }
+        if sample_set:
+            source["sample_set"] = sample_set
+            source["hourly_window"] = "other"
+        if include_awc:
+            source["awc_static"] = awc_rows if awc_static is None else awc_static
+        return with_source_contract(rule, source=source)
+
+    @staticmethod
+    def _awc_hour(hour_utc: int, temp: float, *, minute: int = 0, altim: Optional[float] = 1013.0) -> dict:
+        stamp = "2026-09-06T{:02d}:{:02d}:00Z".format(hour_utc, minute)
+        row = {
+            "icaoId": "RKSI",
+            "temp": temp,
+            "reportTime": stamp,
+            "rawOb": "METAR RKSI 06{:02d}{:02d}Z".format(hour_utc, minute),
+            "metarType": "METAR" if minute == 0 else "SPECI",
+        }
+        if altim is not None:
+            row["altim"] = altim
+        return row
+
+    def test_awc_confirms_closed_day_when_tail_stays_inside_wrh_range(self) -> None:
+        awc = [self._awc_hour(13, 21.0), self._awc_hour(14, 21.0)]
+        closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
+        for metric_word, expected in (("highest", 23), ("lowest", 10)):
+            observation = WeatherSourceAdapter().poll(
+                self._seoul_day_rule(metric_word=metric_word, awc_rows=awc),
+                now=closed,
+            )
+            self.assertEqual(observation.status, "final", metric_word)
+            self.assertEqual(observation.reason, "awc_range_confirmed", metric_word)
+            self.assertEqual(observation.value, expected, metric_word)
+            self.assertIn("12:00:00", observation.source_timestamp)
+
+    def test_awc_extreme_blocks_only_the_market_it_moves(self) -> None:
+        awc = [self._awc_hour(13, 25.0), self._awc_hour(14, 21.0)]
+        closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
+        high = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="highest", awc_rows=awc),
+            now=closed,
+        )
+        low = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="lowest", awc_rows=awc),
+            now=closed,
+        )
+        self.assertEqual(high.status, "provisional")
+        self.assertEqual(high.value, 23)
+        self.assertNotEqual(high.reason, "awc_range_confirmed")
+        self.assertEqual(low.status, "final")
+        self.assertEqual(low.reason, "awc_range_confirmed")
+        self.assertEqual(low.value, 10)
+
+    def test_awc_does_not_confirm_with_a_gap_or_an_open_day(self) -> None:
+        closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
+        open_now = datetime(2026, 9, 6, 13, 30, tzinfo=timezone.utc)
+        gap = [self._awc_hour(14, 21.0)]
+        full = [self._awc_hour(13, 21.0), self._awc_hour(14, 21.0)]
+        for metric_word in ("highest", "lowest"):
+            missing = WeatherSourceAdapter().poll(
+                self._seoul_day_rule(metric_word=metric_word, awc_rows=gap),
+                now=closed,
+            )
+            early = WeatherSourceAdapter().poll(
+                self._seoul_day_rule(metric_word=metric_word, awc_rows=full),
+                now=open_now,
+            )
+            self.assertNotEqual(missing.status, "final", metric_word)
+            self.assertNotEqual(missing.reason, "awc_range_confirmed", metric_word)
+            self.assertEqual(early.status, "intraday", metric_word)
+            self.assertNotEqual(early.reason, "awc_range_confirmed", metric_word)
+
+    def test_awc_fetch_failure_leaves_wrh_status(self) -> None:
+        rule = self._seoul_day_rule(metric_word="highest", include_awc=False)
+        raw = rule.source.pop("static")
+
+        class Boom:
+            def __init__(self) -> None:
+                self.urls: list[str] = []
+
+            def get_json(self, url, params=None, headers=None):
+                self.urls.append(str(url))
+                raise SourceError("awc down")
+
+        boom = Boom()
+        adapter = WeatherSourceAdapter(http=boom, http_cache_ttl_s=300)
+        adapter._synoptic_token_cache = (time.time(), "test-token")
+        url, params, _headers = adapter._request_parts(rule)
+        adapter._http_cache[adapter._cache_key(url, params)] = (
+            time.time(),
+            adapter._normalize_payload(rule, raw),
+        )
+        observation = adapter.poll(rule, now=datetime(2026, 9, 6, 16, tzinfo=timezone.utc))
+        self.assertEqual(observation.status, "provisional")
+        self.assertEqual(observation.value, 23)
+        self.assertEqual(observation.reason, "awaiting_final_confirmation")
+        self.assertTrue(any("aviationweather.gov" in url for url in boom.urls))
+
+    def test_filtered_awc_speci_neither_covers_an_hour_nor_moves_the_extremum(self) -> None:
+        closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
+        counted = [
+            self._awc_hour(13, 21.0),
+            self._awc_hour(13, 30.0, minute=30, altim=None),
+            self._awc_hour(14, 21.0),
+        ]
+        observation = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="highest", awc_rows=counted, sample_set="hourly"),
+            now=closed,
+        )
+        self.assertEqual(observation.status, "final")
+        self.assertEqual(observation.reason, "awc_range_confirmed")
+        self.assertEqual(observation.value, 23)
+        uncovered = [
+            self._awc_hour(13, 21.0, minute=30, altim=None),
+            self._awc_hour(14, 21.0),
+        ]
+        missing_hour = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="highest", awc_rows=uncovered, sample_set="hourly"),
+            now=closed,
+        )
+        self.assertNotEqual(missing_hour.status, "final")
+        self.assertEqual(missing_hour.value, 23)
+
+    def test_awc_rounding_uses_the_published_whole_degree(self) -> None:
+        closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
+        inside = [self._awc_hour(13, 23.4), self._awc_hour(14, 21.0)]
+        outside = [self._awc_hour(13, 25.4), self._awc_hour(14, 21.0)]
+        kept = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="highest", awc_rows=inside),
+            now=closed,
+        )
+        moved = WeatherSourceAdapter().poll(
+            self._seoul_day_rule(metric_word="highest", awc_rows=outside),
+            now=closed,
+        )
+        self.assertEqual(kept.status, "final")
+        self.assertEqual(kept.reason, "awc_range_confirmed")
+        self.assertEqual(kept.value, 23)
+        self.assertEqual(moved.status, "provisional")
+        self.assertEqual(moved.value, 23)
+
     def test_synoptic_empty_station_is_unavailable(self) -> None:
         markets = self._temp_markets(
             slug="highest-temperature-in-seoul-on-september-6-2026",

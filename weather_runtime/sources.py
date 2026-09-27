@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
@@ -32,6 +33,8 @@ _SYNOPTIC_PAGE_UNITS = "temp|F,speed|mph,english"
 _SYNOPTIC_PAGE_RECENT_MINUTES = 72 * 60
 _SYNOPTIC_VARS = "air_temp,sea_level_pressure,metar"
 _SYNOPTIC_TIMESERIES_URL = "https://api.synopticdata.com/v2/stations/timeseries"
+_AWC_METAR_URL = "https://aviationweather.gov/api/data/metar"
+_AWC_HOURS = 48
 # Keep per-station waits short so a slow Synoptic host cannot serialize the scan.
 _WEATHER_HTTP_TIMEOUT_S = 10.0
 _HTTP_FAIL_COOLDOWN_S = 120.0
@@ -731,7 +734,7 @@ class WeatherSourceAdapter:
             )
         evidence_hash = sha256_json(payload)
         try:
-            return self._evaluate(
+            evidence = self._evaluate(
                 rule, payload, url, current, evidence_hash, window_open=window_open
             )
         except Exception as exc:  # noqa: BLE001
@@ -747,6 +750,12 @@ class WeatherSourceAdapter:
                 raw=payload,
                 evidence_hash=evidence_hash,
             )
+        return self._maybe_confirm_with_awc(
+            rule,
+            evidence,
+            payload,
+            window_open=window_open,
+        )
 
     def drain_synoptic_watch(self) -> list[dict[str, Any]]:
         """First-seen observation timestamps from WRH's Synoptic fetches."""
@@ -1107,6 +1116,129 @@ class WeatherSourceAdapter:
                     continue
                 result.append((timestamp, _convert(number, source_unit, rule.unit)))
         return sorted(result, key=lambda item: item[0])
+
+    def _maybe_confirm_with_awc(
+        self,
+        rule: WeatherRule,
+        evidence: ObservationEvidence,
+        wrh_payload: Any,
+        *,
+        window_open: bool,
+    ) -> ObservationEvidence:
+        """Upgrade a closed NOAA day when AWC cannot move the WRH extremum.
+
+        The settled number stays the WRH value. AWC is only a witness that the
+        hours WRH has not printed yet are inside that value.
+        """
+
+        if window_open or evidence.status not in {"intraday", "provisional"}:
+            return evidence
+        if str(rule.source.get("provider") or "").lower() != "noaa":
+            return evidence
+        if rule.metric not in {"daily_max", "daily_min"}:
+            return evidence
+        try:
+            awc_payload = self._awc_observations_for_confirm(rule)
+        except SourceError:
+            return evidence
+        if awc_payload is None:
+            return evidence
+        if not self._awc_range_confirmed(rule, wrh_payload, awc_payload):
+            return evidence
+        return replace(evidence, status="final", reason="awc_range_confirmed")
+
+    def _awc_observations_for_confirm(self, rule: WeatherRule) -> Any:
+        """Side-fetch AWC. Fixtures with a static WRH payload skip the network."""
+
+        source = rule.source
+        if "awc_static" in source:
+            raw = source.get("awc_static")
+            if raw is None:
+                raise SourceError("awc_unavailable")
+            return self._awc_observations(raw)
+        if isinstance(source.get("static"), dict):
+            return None
+        return self._fetch_awc_metar(rule)
+
+    def _fetch_awc_metar(self, rule: WeatherRule) -> Any:
+        station = str(rule.source.get("station_id") or "").strip().upper()
+        if not station:
+            raise SourceError("awc station missing")
+        params = {"ids": station, "format": "json", "hours": _AWC_HOURS}
+        cache_key = self._cache_key(_AWC_METAR_URL, params)
+        now = time.time()
+        if self.http_cache_ttl_s:
+            with self._http_lock:
+                hit = self._http_cache.get(cache_key)
+                failed_at = self._http_fail.get(cache_key)
+            if hit and (now - hit[0]) < self.http_cache_ttl_s:
+                return hit[1]
+            if failed_at and (now - failed_at) < _HTTP_FAIL_COOLDOWN_S:
+                raise SourceError("awc recently failed")
+        try:
+            raw = self.http.get_json(
+                _AWC_METAR_URL,
+                params=params,
+                headers={"Accept": "application/json"},
+            )
+        except SourceError:
+            with self._http_lock:
+                self._http_fail[cache_key] = time.time()
+            raise
+        payload = self._awc_observations(raw)
+        if self.http_cache_ttl_s:
+            with self._http_lock:
+                self._http_cache[cache_key] = (time.time(), payload)
+                self._http_fail.pop(cache_key, None)
+        return payload
+
+    def _awc_range_confirmed(self, rule: WeatherRule, wrh_payload: Any, awc_payload: Any) -> bool:
+        end = self._parse(rule, rule.observation_end)
+        if end is None:
+            return False
+        wrh_values = self._resolution_values(rule, self._iter_values(rule, wrh_payload))
+        if not wrh_values:
+            return False
+        zone = self._zone(rule)
+        last_wrh = max(item[0] for item in wrh_values)
+        required_hours = self._local_hours_after(
+            last_wrh.astimezone(zone),
+            end.astimezone(zone),
+        )
+        if not required_hours:
+            return False
+        awc_values = self._resolution_values(rule, self._iter_values(rule, awc_payload))
+        covered = {
+            self._local_hour_key(item[0].astimezone(zone))
+            for item in awc_values
+        }
+        if any(hour not in covered for hour in required_hours):
+            return False
+        wrh_temps = [item[1] for item in wrh_values]
+        awc_temps = [item[1] for item in awc_values]
+        if rule.metric == "daily_max":
+            wrh_extremum = max(wrh_temps)
+            merged = max(wrh_extremum, max(awc_temps, default=wrh_extremum))
+        else:
+            wrh_extremum = min(wrh_temps)
+            merged = min(wrh_extremum, min(awc_temps, default=wrh_extremum))
+        rounding = rule.rounding or ROUNDING_WHOLE
+        return apply_rounding(wrh_extremum, rounding) == apply_rounding(merged, rounding)
+
+    @staticmethod
+    def _local_hour_key(local: datetime) -> datetime:
+        return local.replace(minute=0, second=0, microsecond=0)
+
+    def _local_hours_after(self, last_local: datetime, end_local: datetime) -> list[datetime]:
+        hour = self._local_hour_key(last_local) + timedelta(hours=1)
+        end_hour = self._local_hour_key(end_local)
+        hours: list[datetime] = []
+        for _ in range(48):
+            if hour > end_hour:
+                break
+            hours.append(hour)
+            hour = hour + timedelta(hours=1)
+        return hours
 
     def _evaluate(
         self,
