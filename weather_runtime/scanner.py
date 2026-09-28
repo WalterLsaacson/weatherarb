@@ -110,7 +110,7 @@ class WeatherScannerConfig:
     book_ttl_s: float = 5.0
     display_book_ttl_s: float = 60.0
     weather_prefetch_deadline_s: float = 90.0
-    weather_prefetch_workers: int = 16
+    weather_prefetch_workers: int = 4
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True

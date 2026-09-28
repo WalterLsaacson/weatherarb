@@ -475,12 +475,13 @@ class RuntimeService:
         from .sources import (
             WeatherSourceAdapter,
             _DEFAULT_HTTP_CACHE_TTL_S,
+            _WEATHER_HTTP_RETRIES,
             _WEATHER_HTTP_TIMEOUT_S,
         )
 
         trading = trading_config()
         self.scanner.source_adapter = WeatherSourceAdapter(
-            http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S, retries=0),
+            http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S, retries=_WEATHER_HTTP_RETRIES),
             http_cache_ttl_s=_DEFAULT_HTTP_CACHE_TTL_S,
         )
         self.scanner.clob_client = ClobClient(

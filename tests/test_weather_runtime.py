@@ -185,7 +185,23 @@ class WeatherRuntimeTests(unittest.TestCase):
                 adapter._wrh_page_token()
             with self.assertRaises(SourceError):
                 adapter._wrh_page_token()
-        self.assertEqual(http.calls, 1)
+        self.assertEqual(http.calls, 3)
+
+    def test_stale_wrh_token_survives_refresh_failure(self) -> None:
+        class BoomHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_text(self, url, **kwargs):  # noqa: ARG002
+                self.calls += 1
+                raise SourceError("timed out after 8s from {}".format(url))
+
+        http = BoomHttp()
+        adapter = WeatherSourceAdapter(http=http)
+        adapter._synoptic_token_cache = (time.time() - 7200, "page-token")
+        self.assertEqual(adapter._wrh_page_token(), "page-token")
+        self.assertEqual(adapter._wrh_page_token(), "page-token")
+        self.assertEqual(http.calls, 3)
 
     def _live_source_rule(self, *, url: str, station_id: str = "TEST"):
         rule = load_rules(FIXTURES / "rules.json")[0]
@@ -223,6 +239,25 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.status, "unavailable")
         self.assertIn("recently timed out", observation.reason)
         self.assertEqual(http.calls, first_calls)
+
+    def test_prefetch_second_wave_retries_dropped_connection(self) -> None:
+        class FlakyHttp:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_json(self, url, **kwargs):  # noqa: ARG002
+                self.calls += 1
+                if self.calls == 1:
+                    raise SourceError("Remote end closed connection without response")
+                return {"observations": [{"timestamp": "2026-09-04T12:00:00Z", "value": 20}]}
+
+        live = self._live_source_rule(url="https://example.invalid/weather")
+        http = FlakyHttp()
+        adapter = WeatherSourceAdapter(http=http, http_cache_ttl_s=60.0)
+        adapter.prefetch([live], now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc), deadline_s=5.0)
+        observation = adapter.poll(live, now=datetime(2026, 9, 4, 12, tzinfo=timezone.utc))
+        self.assertGreaterEqual(http.calls, 2)
+        self.assertNotIn("recently timed out", observation.reason)
 
     def test_prefetch_miss_does_not_mark_unfetched_timed_out(self) -> None:
         class GatedHttp:

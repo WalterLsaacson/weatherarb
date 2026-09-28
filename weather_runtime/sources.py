@@ -29,6 +29,7 @@ _WU_WEB_API_KEY = "e1f10a1e78da46f5b10a1e78da96f525"
 _SYNOPTIC_TOKEN_JS = "https://www.weather.gov/source/wrh/apiKey.js"
 _SYNOPTIC_TOKEN_RE = re.compile(r"mesoToken\s*=\s*['\"]([^'\"]+)['\"]")
 _SYNOPTIC_TOKEN_TTL_S = 3600.0
+_SYNOPTIC_TOKEN_ATTEMPTS = 3
 _SYNOPTIC_PAGE_UNITS = "temp|F,speed|mph,english"
 _SYNOPTIC_PAGE_RECENT_MINUTES = 72 * 60
 _SYNOPTIC_VARS = "air_temp,sea_level_pressure,metar"
@@ -37,9 +38,11 @@ _AWC_METAR_URL = "https://aviationweather.gov/api/data/metar"
 _AWC_HOURS = 48
 # Keep per-station waits short so a slow Synoptic host cannot serialize the scan.
 _WEATHER_HTTP_TIMEOUT_S = 10.0
+_WEATHER_HTTP_RETRIES = 2
 _HTTP_FAIL_COOLDOWN_S = 120.0
 _DEFAULT_HTTP_CACHE_TTL_S = 300.0
-_DEFAULT_PREFETCH_WORKERS = 16
+# Synoptic closes connections when many stations are fetched at once.
+_DEFAULT_PREFETCH_WORKERS = 4
 _WU_POST_CLOSE_REFRESH_HOURS = 3.0
 _WU_POST_CLOSE_CACHE_S = 15.0
 # Do not mark source-final if the last in-window sample is too far from local midnight.
@@ -408,7 +411,7 @@ class WeatherSourceAdapter:
         http: Optional[JsonHttp] = None,
         http_cache_ttl_s: float = _DEFAULT_HTTP_CACHE_TTL_S,
     ):
-        self.http = http or JsonHttp(timeout=_WEATHER_HTTP_TIMEOUT_S, retries=0)
+        self.http = http or JsonHttp(timeout=_WEATHER_HTTP_TIMEOUT_S, retries=_WEATHER_HTTP_RETRIES)
         self.http_cache_ttl_s = max(0.0, float(http_cache_ttl_s))
         self._http_cache: dict[tuple[str, str], tuple[float, Any]] = {}
         self._http_fail: dict[tuple[str, str], float] = {}
@@ -627,6 +630,29 @@ class WeatherSourceAdapter:
             return True
         return False
 
+    def _payload_cached(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> bool:
+        if isinstance(rule.source.get("static"), dict):
+            return True
+        try:
+            url, params, _headers = self._request_parts(rule)
+        except Exception:
+            return False
+        cache_key = self._cache_key(url, params)
+        current_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        cache_ttl_s = self._cache_ttl_s(rule, current_utc)
+        with self._http_lock:
+            hit = self._http_cache.get(cache_key)
+        return bool(hit and cache_ttl_s and (time.time() - hit[0]) < cache_ttl_s)
+
+    def _clear_payload_failure(self, rule: WeatherRule) -> None:
+        try:
+            url, params, _headers = self._request_parts(rule)
+        except Exception:
+            return
+        cache_key = self._cache_key(url, params)
+        with self._http_lock:
+            self._http_fail.pop(cache_key, None)
+
     def prefetch(
         self,
         rules: Iterable[WeatherRule],
@@ -664,12 +690,15 @@ class WeatherSourceAdapter:
                 except Exception:
                     return
 
-        # Two waves: first fills most stations; second retries only misses so a
-        # short first-wave stall cannot force serial poll() afterwards.
+        # Two waves. A dropped Synoptic connection used to cool down for 120s
+        # and the second wave treated that as done, so the station stayed stale.
         pending = list(unique)
-        for _wave in range(2):
+        for wave in range(2):
             if not pending or time.time() >= deadline:
                 break
+            if wave:
+                for rule in pending:
+                    self._clear_payload_failure(rule)
             threads = [
                 threading.Thread(target=_warm, args=(rule,), daemon=True, name="wx-prefetch")
                 for rule in pending
@@ -682,7 +711,7 @@ class WeatherSourceAdapter:
             pending = [
                 rule
                 for rule in pending
-                if not self._payload_cached_or_failed(rule, now=current)
+                if not self._payload_cached(rule, now=current)
             ]
 
     def poll(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> ObservationEvidence:
@@ -805,27 +834,53 @@ class WeatherSourceAdapter:
                 )
             self._watch_pending.extend(fresh)
 
+    def _cached_wrh_token(self) -> str:
+        cached = self._synoptic_token_cache
+        if cached and cached[1]:
+            return str(cached[1])
+        return ""
+
     def _wrh_page_token(self) -> str:
-        """Token embedded in the WRH timeseries page, not an account API token."""
+        """Token embedded in the WRH timeseries page, not an account API token.
+
+        A failed refresh keeps the last page token. One blip must not blank
+        every NOAA station for the rest of the scan.
+        """
 
         now = time.time()
         with self._http_lock:
-            if self._synoptic_token_error_at and (now - self._synoptic_token_error_at) < 60.0:
-                raise SourceError("synoptic token recently failed")
             cached = self._synoptic_token_cache
-            if cached and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S and cached[1]:
-                return cached[1]
-        try:
-            raw = self.http.get_text(_SYNOPTIC_TOKEN_JS)
-        except SourceError:
+            if cached and cached[1] and (now - cached[0]) < _SYNOPTIC_TOKEN_TTL_S:
+                return str(cached[1])
+            if self._synoptic_token_error_at and (now - self._synoptic_token_error_at) < 60.0:
+                stale = self._cached_wrh_token()
+                if stale:
+                    return stale
+                raise SourceError("synoptic token recently failed")
+        last_error: Optional[BaseException] = None
+        raw = ""
+        for _attempt in range(_SYNOPTIC_TOKEN_ATTEMPTS):
+            try:
+                raw = self.http.get_text(_SYNOPTIC_TOKEN_JS)
+                last_error = None
+                break
+            except SourceError as exc:
+                last_error = exc
+        if last_error is not None:
             with self._http_lock:
                 self._synoptic_token_error_at = time.time()
-            raise
+                stale = self._cached_wrh_token()
+            if stale:
+                return stale
+            raise SourceError("synoptic token recently failed") from last_error
         match = _SYNOPTIC_TOKEN_RE.search(raw)
         token = (match.group(1) if match else "").strip()
         if not token:
             with self._http_lock:
                 self._synoptic_token_error_at = time.time()
+                stale = self._cached_wrh_token()
+            if stale:
+                return stale
             raise SourceError("synoptic token missing")
         with self._http_lock:
             self._synoptic_token_cache = (now, token)
