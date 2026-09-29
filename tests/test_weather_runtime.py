@@ -47,7 +47,7 @@ from weather_runtime.cli import serve_argv
 from weather_runtime.scanner import WeatherScanner, WeatherScannerConfig
 from weather_runtime.service import RuntimeService, slim_board_groups
 from weather_runtime.server import build_parser as build_board_parser, resolved_service_options
-from weather_runtime.sources import SourceError, WeatherSourceAdapter, series_from_raw
+from weather_runtime.sources import JsonHttp, SourceError, WeatherSourceAdapter, series_from_raw
 from weather_runtime.storage import append_jsonl_dedup, load_json
 
 
@@ -4612,6 +4612,162 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertTrue(placed[0]["ok"])
             self.assertAlmostEqual(placed[0]["price"], 0.995)
             self.assertEqual(placed[0]["reason"], "intraday_impossible_no")
+
+
+def _recv_exact(sock, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise OSError("short read")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+class JsonHttpFallbackTests(unittest.TestCase):
+    def _http_server(self, status: int = 200):
+        import http.server
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = b"pong"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):  # noqa: A003
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def shutdown() -> None:
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(shutdown)
+        return server
+
+    def _socks_server(self, http_host: str, http_port: int):
+        import socket
+
+        listen = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listen.bind(("127.0.0.1", 0))
+        listen.listen(8)
+        listen.settimeout(0.2)
+        stop = threading.Event()
+
+        def relay(client: socket.socket) -> None:
+            remote = None
+            try:
+                client.settimeout(2)
+                greeting = _recv_exact(client, 2)
+                _recv_exact(client, greeting[1])
+                client.sendall(b"\x05\x00")
+                header = _recv_exact(client, 4)
+                atyp = header[3]
+                if atyp == 1:
+                    _recv_exact(client, 6)
+                elif atyp == 3:
+                    length = _recv_exact(client, 1)[0]
+                    _recv_exact(client, length + 2)
+                elif atyp == 4:
+                    _recv_exact(client, 18)
+                client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+                remote = socket.create_connection((http_host, http_port), timeout=2)
+
+                def pump(src, dst) -> None:
+                    try:
+                        while True:
+                            data = src.recv(65536)
+                            if not data:
+                                break
+                            dst.sendall(data)
+                    except OSError:
+                        pass
+                    try:
+                        dst.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+
+                back = threading.Thread(target=pump, args=(remote, client), daemon=True)
+                back.start()
+                pump(client, remote)
+                back.join(timeout=2)
+            except OSError:
+                pass
+            finally:
+                client.close()
+                if remote is not None:
+                    remote.close()
+
+        def accept_loop() -> None:
+            while not stop.is_set():
+                try:
+                    client, _addr = listen.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=relay, args=(client,), daemon=True).start()
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+
+        def shutdown() -> None:
+            stop.set()
+            listen.close()
+
+        self.addCleanup(shutdown)
+        return listen.getsockname()[1]
+
+    def test_direct_success_skips_fallback(self) -> None:
+        server = self._http_server()
+        host, port = server.server_address
+        http = JsonHttp(timeout=2, retries=0, fallback_proxy="socks5://127.0.0.1:1")
+        self.assertEqual(http.get_text("http://{}:{}/direct".format(host, port)), "pong")
+
+    def test_connection_reset_retries_through_socks(self) -> None:
+        server = self._http_server()
+        host, port = server.server_address
+        socks_port = self._socks_server(host, port)
+        http = JsonHttp(timeout=2, retries=0, fallback_proxy="socks5://127.0.0.1:{}".format(socks_port))
+        calls = {"n": 0}
+
+        def fail_direct(request):  # noqa: ARG001
+            calls["n"] += 1
+            raise ConnectionResetError(54, "Connection reset by peer")
+
+        http._read = fail_direct
+        url = "http://127.0.0.1:9/weather"
+        self.assertEqual(http.get_text(url), "pong")
+        self.assertEqual(http.get_text(url), "pong")
+        self.assertEqual(calls["n"], 1)
+
+    def test_disabled_fallback_reports_the_reset(self) -> None:
+        http = JsonHttp(timeout=2, retries=0, fallback_proxy="off")
+
+        def fail_direct(request):  # noqa: ARG001
+            raise ConnectionResetError(54, "Connection reset by peer")
+
+        http._read = fail_direct
+        with self.assertRaises(SourceError) as caught:
+            http.get_text("http://127.0.0.1:9/weather")
+        self.assertIn("network error", str(caught.exception))
+
+    def test_http_status_does_not_fall_back(self) -> None:
+        server = self._http_server(status=404)
+        host, port = server.server_address
+        http = JsonHttp(timeout=2, retries=0, fallback_proxy="socks5://127.0.0.1:1")
+        used = []
+        http._read_via_socks = lambda *args, **kwargs: used.append(1) or "nope"  # noqa: ARG005
+        with self.assertRaises(SourceError) as caught:
+            http.get_text("http://{}:{}/missing".format(host, port))
+        self.assertIn("HTTP 404", str(caught.exception))
+        self.assertEqual(used, [])
 
 
 if __name__ == "__main__":

@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import http.client
+import io
 import json
 import os
 import re
+import socket
+import ssl
+import struct
+import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -40,6 +46,11 @@ _AWC_HOURS = 48
 _WEATHER_HTTP_TIMEOUT_S = 10.0
 _WEATHER_HTTP_RETRIES = 2
 _HTTP_FAIL_COOLDOWN_S = 120.0
+# The VPN TUN resets weather.gov / Synoptic. macOS already points 1082 at an
+# HTTP proxy that still reaches those hosts. After that proxy succeeds, keep
+# the host on it for one scan instead of paying a reset on every station.
+_DIRECT_DOWN_HOLD_S = 45.0
+_LOCAL_HTTP_FALLBACK = "http://127.0.0.1:1082"
 _DEFAULT_HTTP_CACHE_TTL_S = 300.0
 # Synoptic closes connections when many stations are fetched at once.
 _DEFAULT_PREFETCH_WORKERS = 4
@@ -135,6 +146,99 @@ def json_path(value: Any, path: str) -> Any:
     return current
 
 
+def _is_transport_error(exc: BaseException) -> bool:
+    """Connection resets and timeouts. An HTTP status means the host answered."""
+
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (urllib.error.URLError, TimeoutError, OSError, http.client.IncompleteRead)):
+        return True
+    if isinstance(exc, SourceError):
+        text = str(exc)
+        return text.startswith("timed out") or text.startswith("empty response")
+    return False
+
+
+def _normalize_fallback(value: Optional[str]) -> str:
+    """Return a proxy URL, or '' when fallback is disabled. None is not passed here."""
+
+    text = str(value or "").strip()
+    if text.lower() in {"", "none", "direct", "off", "0"}:
+        return ""
+    if "://" not in text:
+        text = "socks5://" + text
+    return text
+
+
+def _tcp_open(host: str, port: int, timeout: float) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _recv_exact(sock: socket.socket, size: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < size:
+        chunk = sock.recv(size - len(buf))
+        if not chunk:
+            raise OSError("socks5 connection closed")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _socks5_connect(sock: socket.socket, host: str, port: int) -> None:
+    """SOCKS5 CONNECT with the hostname left for the proxy to resolve."""
+
+    sock.sendall(b"\x05\x01\x00")
+    version, method = _recv_exact(sock, 2)
+    if version != 5 or method != 0:
+        raise OSError("socks5 handshake rejected")
+    host_bytes = host.encode("idna")
+    if len(host_bytes) > 255:
+        raise OSError("socks5 hostname too long")
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(host_bytes)]) + host_bytes + struct.pack("!H", port))
+    header = _recv_exact(sock, 4)
+    if header[1] != 0:
+        raise OSError("socks5 connect failed ({})".format(header[1]))
+    atyp = header[3]
+    if atyp == 1:
+        _recv_exact(sock, 6)
+    elif atyp == 4:
+        _recv_exact(sock, 18)
+    elif atyp == 3:
+        length = _recv_exact(sock, 1)[0]
+        _recv_exact(sock, length + 2)
+    else:
+        raise OSError("socks5 unsupported address type")
+
+
+class _SocksConnectionMixin:
+    def __init__(self, *args, proxy_host: str, proxy_port: int, **kwargs):
+        self._proxy_host = proxy_host
+        self._proxy_port = int(proxy_port)
+        super().__init__(*args, **kwargs)
+
+    def connect(self) -> None:
+        raw = socket.create_connection((self._proxy_host, self._proxy_port), self.timeout)
+        raw.settimeout(self.timeout)
+        _socks5_connect(raw, self.host, int(self.port))
+        if isinstance(self, http.client.HTTPSConnection):
+            context = getattr(self, "_context", None) or ssl.create_default_context()
+            self.sock = context.wrap_socket(raw, server_hostname=self.host)
+        else:
+            self.sock = raw
+
+
+class _SocksHTTPConnection(_SocksConnectionMixin, http.client.HTTPConnection):
+    pass
+
+
+class _SocksHTTPSConnection(_SocksConnectionMixin, http.client.HTTPSConnection):
+    pass
+
+
 class JsonHttp:
     def __init__(
         self,
@@ -143,6 +247,7 @@ class JsonHttp:
         timeout: float = 8.0,
         retries: int = 1,
         backoff_s: float = 0.25,
+        fallback_proxy: Optional[str] = None,
     ):
         raw_proxy = proxy
         if raw_proxy is None:
@@ -157,6 +262,17 @@ class JsonHttp:
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
         self.backoff_s = max(0.0, float(backoff_s))
+        # None: auto-detect local SOCKS when the env var is unset. "" disables fallback.
+        if fallback_proxy is None and "WEATHER_PROXY_FALLBACK" not in os.environ:
+            self._fallback_spec: Optional[str] = None
+        else:
+            raw_fallback = fallback_proxy if fallback_proxy is not None else os.environ.get("WEATHER_PROXY_FALLBACK")
+            self._fallback_spec = _normalize_fallback(raw_fallback)
+        self._route_lock = threading.Lock()
+        self._direct_down: dict[str, float] = {}
+        self._fallback_logged = False
+        self._socks_probe_at = 0.0
+        self._socks_probe_value = ""
 
     def _opener(self):
         if self.proxy:
@@ -190,6 +306,226 @@ class JsonHttp:
         with self._opener().open(request, timeout=self.timeout) as response:
             return response.read().decode("utf-8")
 
+    def _fallback_proxy(self) -> str:
+        if self.proxy:
+            return ""
+        spec = self._fallback_spec
+        if spec == "":
+            return ""
+        if spec:
+            return spec
+        now = time.time()
+        with self._route_lock:
+            if now < self._socks_probe_at:
+                return self._socks_probe_value
+        value = _LOCAL_HTTP_FALLBACK if _tcp_open("127.0.0.1", 1082, 0.15) else ""
+        with self._route_lock:
+            self._socks_probe_value = value
+            self._socks_probe_at = time.time() + (30.0 if value else 5.0)
+        return value
+
+    def _direct_blocked(self, host: str) -> bool:
+        if not host:
+            return False
+        with self._route_lock:
+            until = self._direct_down.get(host, 0.0)
+        return time.time() < until
+
+    def _block_direct(self, host: str) -> None:
+        if not host:
+            return
+        with self._route_lock:
+            self._direct_down[host] = time.time() + _DIRECT_DOWN_HOLD_S
+
+    def _unblock_direct(self, host: str) -> None:
+        if not host:
+            return
+        with self._route_lock:
+            self._direct_down.pop(host, None)
+
+    def _note_fallback(self, proxy_url: str) -> None:
+        if self._fallback_logged:
+            return
+        self._fallback_logged = True
+        print("HTTP direct failed; using {}".format(proxy_url), flush=True)
+
+    def _request_label(self, request: urllib.request.Request) -> str:
+        parsed = urllib.parse.urlparse(request.full_url)
+        return urllib.parse.urlunparse(parsed._replace(query="", fragment=""))
+
+    def _read_via_socks(self, request: urllib.request.Request, proxy_url: str) -> str:
+        parsed_proxy = urllib.parse.urlparse(proxy_url)
+        scheme = (parsed_proxy.scheme or "").lower()
+        if scheme in {"http", "https"}:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+            with opener.open(request, timeout=self.timeout) as response:
+                return response.read().decode("utf-8")
+        if scheme not in {"socks5", "socks5h"}:
+            raise SourceError("unsupported fallback proxy scheme {}".format(scheme or "empty"))
+        proxy_host = parsed_proxy.hostname or ""
+        proxy_port = parsed_proxy.port or 1082
+        parsed = urllib.parse.urlparse(request.full_url)
+        dest_host = parsed.hostname or ""
+        if not dest_host or not proxy_host:
+            raise SourceError("fallback proxy destination missing")
+        https = parsed.scheme == "https"
+        port = parsed.port or (443 if https else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = path + "?" + parsed.query
+        headers: dict[str, str] = {}
+        for key, value in request.header_items():
+            if key.lower() in {"host", "content-length"}:
+                continue
+            headers[key] = value
+        headers["Connection"] = "close"
+        conn_cls = _SocksHTTPSConnection if https else _SocksHTTPConnection
+        context = ssl.create_default_context() if https else None
+        conn_kwargs: dict[str, Any] = {
+            "timeout": self.timeout,
+            "proxy_host": proxy_host,
+            "proxy_port": proxy_port,
+        }
+        if context is not None:
+            conn_kwargs["context"] = context
+        conn = conn_cls(dest_host, port, **conn_kwargs)
+        try:
+            conn.request(request.get_method(), path, body=request.data, headers=headers)
+            response = conn.getresponse()
+            payload = response.read()
+            status = response.status
+            reason = response.reason
+            response_headers = response.headers
+        finally:
+            conn.close()
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                reason,
+                response_headers,
+                io.BytesIO(payload),
+            )
+        return payload.decode("utf-8")
+
+    def _read_via_curl(self, request: urllib.request.Request, proxy_url: str) -> str:
+        """curl's HTTP client. urllib's CONNECT to this proxy is reset; curl is not."""
+
+        header_lines = []
+        for key, value in request.header_items():
+            if key.lower() in {"host", "content-length", "accept-encoding", "connection"}:
+                continue
+            safe = str(value).replace("\r", " ").replace("\n", " ").replace('"', "")
+            header_lines.append('header = "{}: {}"'.format(key, safe))
+        url = request.full_url.replace("\\", "\\\\").replace('"', '\\"')
+        proxy = str(proxy_url).replace('"', "")
+        lines = [
+            "silent",
+            "show-error",
+            "http1.1",
+            "max-time {}".format(max(1, int(self.timeout) - 1)),
+            'proxy = "{}"'.format(proxy),
+            'url = "{}"'.format(url),
+            "output -",
+            'write-out "\\n__STATUS__:%{http_code}"',
+            *header_lines,
+        ]
+        body_path = ""
+        if request.data:
+            lines.append("request = {}".format(request.get_method()))
+            handle = tempfile.NamedTemporaryFile(prefix="wx-http-", delete=False)
+            handle.write(request.data)
+            handle.close()
+            body_path = handle.name
+            lines.append('data-binary = "@{}"'.format(body_path.replace('"', "")))
+        config = ("\n".join(lines) + "\n").encode()
+        try:
+            try:
+                proc = subprocess.run(
+                    ["curl", "--config", "-"],
+                    input=config,
+                    capture_output=True,
+                    timeout=self.timeout + 2,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError("curl timed out") from exc
+        finally:
+            if body_path:
+                try:
+                    os.remove(body_path)
+                except OSError:
+                    pass
+        if proc.returncode != 0:
+            detail = proc.stderr.decode("utf-8", "replace").strip()[:300]
+            raise OSError(detail or "curl exit {}".format(proc.returncode))
+        marker = b"\n__STATUS__:"
+        body, separator, code_bytes = proc.stdout.rpartition(marker)
+        if not separator:
+            raise OSError("curl status missing")
+        try:
+            status = int(code_bytes.strip() or b"0")
+        except ValueError as exc:
+            raise OSError("curl status invalid") from exc
+        if status >= 400:
+            raise urllib.error.HTTPError(
+                request.full_url,
+                status,
+                "curl",
+                http.client.HTTPMessage(),
+                io.BytesIO(body),
+            )
+        return body.decode("utf-8")
+
+    def _read_resilient(self, request: urllib.request.Request) -> str:
+        """Direct first. A reset connection is retried through the local proxy."""
+
+        host = urllib.parse.urlparse(request.full_url).hostname or ""
+        fallback = self._fallback_proxy()
+        label = self._request_label(request)
+
+        def direct() -> str:
+            return self._deadline(lambda: self._read(request), label=label)
+
+        def via_fallback() -> str:
+            self._note_fallback(fallback)
+
+            def run() -> str:
+                scheme = (urllib.parse.urlparse(fallback).scheme or "").lower()
+                if scheme in {"http", "https"}:
+                    try:
+                        return self._read_via_curl(request, fallback)
+                    except FileNotFoundError:
+                        return self._read_via_socks(request, fallback)
+                return self._read_via_socks(request, fallback)
+
+            return self._deadline(run, label=label)
+
+        if not fallback:
+            return direct()
+        if self._direct_blocked(host):
+            try:
+                return via_fallback()
+            except Exception as exc:
+                if not _is_transport_error(exc):
+                    raise
+                self._unblock_direct(host)
+                return direct()
+        try:
+            return direct()
+        except Exception as exc:
+            if not _is_transport_error(exc):
+                raise
+            try:
+                body = via_fallback()
+            except Exception as fallback_exc:
+                if not _is_transport_error(fallback_exc):
+                    raise
+                raise exc
+            self._block_direct(host)
+            return body
+
     def get_json(
         self,
         url: str,
@@ -212,7 +548,7 @@ class JsonHttp:
         request = urllib.request.Request(url, headers=request_headers, method="GET")
         for attempt in range(self.retries + 1):
             try:
-                raw = self._deadline(lambda: self._read(request), label=url)
+                raw = self._read_resilient(request)
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -226,10 +562,17 @@ class JsonHttp:
                 TimeoutError,
                 OSError,
                 http.client.IncompleteRead,
+                SourceError,
             ) as exc:
+                if isinstance(exc, urllib.error.HTTPError) or (
+                    isinstance(exc, SourceError) and not _is_transport_error(exc)
+                ):
+                    raise
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
+                if isinstance(exc, SourceError):
+                    raise
                 raise SourceError("network error from {}: {}".format(url, exc)) from exc
         try:
             return json.loads(raw)
@@ -251,7 +594,7 @@ class JsonHttp:
         request = urllib.request.Request(url, headers=request_headers, method="GET")
         for attempt in range(self.retries + 1):
             try:
-                return self._deadline(lambda: self._read(request), label=url)
+                return self._read_resilient(request)
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
                 retryable = exc.code == 429 or 500 <= exc.code <= 599
@@ -264,10 +607,17 @@ class JsonHttp:
                 TimeoutError,
                 OSError,
                 http.client.IncompleteRead,
+                SourceError,
             ) as exc:
+                if isinstance(exc, urllib.error.HTTPError) or (
+                    isinstance(exc, SourceError) and not _is_transport_error(exc)
+                ):
+                    raise
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
+                if isinstance(exc, SourceError):
+                    raise
                 raise SourceError("network error from {}: {}".format(url, exc)) from exc
         raise SourceError("network error from {}".format(url))
 
@@ -293,7 +643,7 @@ class JsonHttp:
         )
         for attempt in range(self.retries + 1):
             try:
-                raw = self._deadline(lambda: self._read(request), label=url)
+                raw = self._read_resilient(request)
                 break
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:300]
@@ -307,10 +657,17 @@ class JsonHttp:
                 TimeoutError,
                 OSError,
                 http.client.IncompleteRead,
+                SourceError,
             ) as exc:
+                if isinstance(exc, urllib.error.HTTPError) or (
+                    isinstance(exc, SourceError) and not _is_transport_error(exc)
+                ):
+                    raise
                 if attempt < self.retries:
                     time.sleep(self.backoff_s * (2 ** attempt))
                     continue
+                if isinstance(exc, SourceError):
+                    raise
                 raise SourceError("network error from {}: {}".format(url, exc)) from exc
         try:
             return json.loads(raw)
