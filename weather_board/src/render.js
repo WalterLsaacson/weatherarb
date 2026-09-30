@@ -120,9 +120,9 @@ function diurnalPhaseLabel(diurnal) {
   if (!diurnal) return "—";
   if (diurnal.city_class !== "A") return "非A类";
   if (diurnal.phase === "regime_change" || (diurnal.continuity || {}).status === "regime_change") return "变天不买";
-  if (diurnal.phase === "window_unverified") return "时段无效";
+  if (diurnal.phase === "trend_unlearned" || diurnal.phase === "weather_mismatch") return "不可买";
   if (diurnal.trigger || diurnal.phase === "ready") return "可买";
-  if (diurnal.passed || diurnal.phase === "passed") return "已过";
+  if (diurnal.phase === "passed") return "已过";
   return "未到";
 }
 
@@ -138,7 +138,13 @@ function diurnalCell(group) {
   const continuity = diurnal.continuity || {};
   const delta = continuity.delta == null ? "" : ` Δ${continuity.delta}${continuity.unit || ""}`;
   const phase = diurnalPhaseLabel(diurnal);
-  return `<td class="diurnal-cell"><span>高 ${escapeHtml(clock(diurnal.max_window_start_local))}–${escapeHtml(clock(diurnal.max_window_end_local))}</span><span>低 ${escapeHtml(clock(diurnal.min_window_start_local))}–${escapeHtml(clock(diurnal.min_window_end_local))}</span><small>${escapeHtml(phase)}${escapeHtml(delta)}</small></td>`;
+  const high = diurnal.learned_max_valid
+    ? `${clock(diurnal.learned_max_start_local)}–${clock(diurnal.learned_max_end_local)}`
+    : "—";
+  const low = diurnal.learned_min_valid
+    ? `${clock(diurnal.learned_min_start_local)}–${clock(diurnal.learned_min_end_local)}`
+    : "—";
+  return `<td class="diurnal-cell"><span>高 ${escapeHtml(high)}</span><span>低 ${escapeHtml(low)}</span><small>${escapeHtml(phase)}${escapeHtml(delta)}</small></td>`;
 }
 
 export function renderEvents() {
@@ -258,7 +264,10 @@ function diurnalFacts(detail) {
   const status = continuity.status || "—";
   const cityClass = diurnal.city_class === "A" ? "A类" : "非A类";
   const yesterdayExtreme = diurnal.metric === "daily_min" ? diurnal.yesterday_min_at_local : diurnal.yesterday_max_at_local;
-  return `<span>城市 <b>${escapeHtml(cityClass)}</b></span><span>潜在影响 <b>${escapeHtml(diurnalInfluenceLabel(diurnal))}</b></span><span>昨日极值 <b>${escapeHtml(clock(yesterdayExtreme) || "—")}</b></span><span>日出 <b>${escapeHtml(clock(diurnal.sunrise_local))}</b></span><span>太阳正午 <b>${escapeHtml(clock(diurnal.solar_noon_local))}</b></span><span>日落 <b>${escapeHtml(clock(diurnal.sunset_local))}</b></span><span>天气 <b>${escapeHtml(diurnal.weather_class || "—")}</b></span><span>最高温窗口 <b>${escapeHtml(clock(diurnal.max_window_start_local))}–${escapeHtml(clock(diurnal.max_window_end_local))}</b></span><span>最低温窗口 <b>${escapeHtml(clock(diurnal.min_window_start_local))}–${escapeHtml(clock(diurnal.min_window_end_local))}</b></span><span>不确定性 <b>±${escapeHtml(diurnal.uncertainty_hours || "—")}h</b></span><span>昨日温差 <b>${escapeHtml(delta)}</b></span><span>对照 <b>${escapeHtml(status)}</b></span><span>日变化 <b>${escapeHtml(diurnalPhaseLabel(diurnal))}</b></span>`;
+  const learnedStart = diurnal.metric === "daily_min" ? diurnal.learned_min_start_local : diurnal.learned_max_start_local;
+  const learnedEnd = diurnal.metric === "daily_min" ? diurnal.learned_min_end_local : diurnal.learned_max_end_local;
+  const learnedBuy = diurnal.metric === "daily_min" ? diurnal.learned_min_buy_local : diurnal.learned_max_buy_local;
+  return `<span>城市 <b>${escapeHtml(cityClass)}</b></span><span>潜在影响 <b>${escapeHtml(diurnalInfluenceLabel(diurnal))}</b></span><span>昨日趋势 <b>${escapeHtml(clock(yesterdayExtreme) || "—")}</b></span><span>学习时段 <b>${learnedStart ? escapeHtml(clock(learnedStart)) + "–" + escapeHtml(clock(learnedEnd)) : "—"}</b></span><span>买入 <b>${escapeHtml(clock(learnedBuy) || "—")}</b></span><span>日出 <b>${escapeHtml(clock(diurnal.sunrise_local))}</b></span><span>太阳正午 <b>${escapeHtml(clock(diurnal.solar_noon_local))}</b></span><span>日落 <b>${escapeHtml(clock(diurnal.sunset_local))}</b></span><span>天气 <b>${escapeHtml(diurnal.weather_class || "—")}</b></span><span>昨日天气 <b>${escapeHtml(diurnal.yesterday_weather_class || "—")}</b></span><span>几何最高温 <b>${escapeHtml(clock(diurnal.max_window_start_local))}–${escapeHtml(clock(diurnal.max_window_end_local))}</b></span><span>几何最低温 <b>${escapeHtml(clock(diurnal.min_window_start_local))}–${escapeHtml(clock(diurnal.min_window_end_local))}</b></span><span>昨日温差 <b>${escapeHtml(delta)}</b></span><span>对照 <b>${escapeHtml(status)}</b></span><span>日变化 <b>${escapeHtml(diurnalPhaseLabel(diurnal))}</b></span>`;
 }
 
 function clockStamp(value) {
@@ -294,25 +303,36 @@ function renderObservationTable(detail) {
   const diurnal = detail.diurnal || {};
   const hourly = meta.sampleSet === "hourly";
   const suppressed = diurnalPhaseLabel(diurnal) === "变天不买";
+  const todayWeather = String(diurnal.weather_class || "");
+  const yesterdayWeather = String(diurnal.yesterday_weather_class || "");
+  const weatherReusable = Boolean(
+    todayWeather
+    && yesterdayWeather
+    && todayWeather !== "unknown"
+    && yesterdayWeather !== "unknown"
+    && todayWeather === yesterdayWeather
+  );
   const windows = [
     {
       kind: "min",
       label: "最低温",
-      start: diurnal.min_window_start_local,
-      end: diurnal.min_window_end_local,
-      trigger: diurnal.min_trigger_local,
-      valid: diurnal.min_window_valid !== false,
+      start: diurnal.learned_min_start_local,
+      end: diurnal.learned_min_end_local,
+      trigger: diurnal.learned_min_buy_local,
+      valid: diurnal.learned_min_valid === true && weatherReusable,
+      reference: `${clock(diurnal.min_window_start_local)}–${clock(diurnal.min_window_end_local)}`,
     },
     {
       kind: "max",
       label: "最高温",
-      start: diurnal.max_window_start_local,
-      end: diurnal.max_window_end_local,
-      trigger: diurnal.max_trigger_local,
-      valid: diurnal.max_window_valid !== false,
+      start: diurnal.learned_max_start_local,
+      end: diurnal.learned_max_end_local,
+      trigger: diurnal.learned_max_buy_local,
+      valid: diurnal.learned_max_valid === true && weatherReusable,
+      reference: `${clock(diurnal.max_window_start_local)}–${clock(diurnal.max_window_end_local)}`,
     },
-  ].filter((item) => item.start && item.end);
-  const activeWindows = windows.filter((item) => item.valid);
+  ];
+  const activeWindows = windows.filter((item) => item.valid && item.start && item.end);
   const values = seriesPoints(detail).slice(-96);
   const page = wrhPageHref(meta);
   const hourlyNote = hourly
@@ -323,9 +343,12 @@ function renderObservationTable(detail) {
   const caption = `<p class="obs-caption">结算序列：<b>${escapeHtml(sampleSetLabel(meta))}</b>${hourlyNote}${
     page ? `<br><span class="muted">${escapeHtml(page)}</span>` : ""
   }</p>`;
-  const legend = windows.length
-    ? `<p class="obs-legend">${windows.map((item) => `<span>${diurnalTag(item.valid ? item.kind : "off", item.valid ? item.label : item.label + "无效")} ${escapeHtml(clock(item.start))}–${escapeHtml(clock(item.end))}</span>`).join("")}${suppressed ? diurnalTag("off", "变天不买") : ""}</p>`
-    : "";
+  const legend = `<p class="obs-legend">${windows.map((item) => {
+    const learned = item.valid && item.start
+      ? `${escapeHtml(clock(item.start))}–${escapeHtml(clock(item.end))} · 买入 ${escapeHtml(clock(item.trigger))}`
+      : "不可买";
+    return `<span>${diurnalTag(item.valid ? item.kind : "off", item.label)} ${learned}<small> 几何 ${escapeHtml(item.reference)}</small></span>`;
+  }).join("")}${suppressed ? diurnalTag("off", "变天不买") : ""}</p>`;
   if (!values.length) {
     return caption + legend + `<div class="empty">${escapeHtml(observationEmptyMessage(detail))}</div>`;
   }

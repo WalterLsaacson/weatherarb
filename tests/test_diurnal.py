@@ -176,7 +176,7 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(cooled["continuity"]["status"], "regime_change")
         self.assertFalse(cooled["trigger"])
 
-    def test_missing_yesterday_still_allows_max_after_window(self) -> None:
+    def test_missing_yesterday_does_not_learn_a_window(self) -> None:
         zone = load_timezone("America/Los_Angeles")
         solar = solar_day("KSFO", date(2026, 9, 7), zone)
         series = [
@@ -203,21 +203,24 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(payload["continuity"]["threshold"], 3.6)
         self.assertEqual(payload["city_class"], "A")
         self.assertEqual(payload["influences"], ["heat_island"])
-        self.assertFalse(payload["max_window_valid"])
-        self.assertFalse(payload["min_window_valid"])
+        self.assertTrue(payload["max_window_start_local"])
+        self.assertFalse(payload["learned_max_valid"])
+        self.assertFalse(payload["learned_min_valid"])
         self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["block_reason"], "window_unverified")
-        self.assertEqual(payload["phase"], "window_unverified")
+        self.assertEqual(payload["block_reason"], "no_trend")
+        self.assertEqual(payload["phase"], "trend_unlearned")
         self.assertFalse(payload["near_edge"])
 
-    def test_min_waits_for_cutoff_and_a_finished_fall(self) -> None:
+    def test_min_waits_until_learned_buy_and_a_finished_fall(self) -> None:
         zone = load_timezone("America/Los_Angeles")
-        sunrise = solar_day("KSFO", date(2026, 9, 7), zone)["sunrise"]
-        series = [
-            _point("2026-09-07 04:00", 15),
-            _point("2026-09-07 05:00", 14),
-            _point("2026-09-07 06:00", 14.5),
-            _point("2026-09-07 09:00", 16),
+        yesterday = [
+            _point("2026-09-06 02:00", 16),
+            _point("2026-09-06 04:00", 8),
+        ]
+        early_series = [
+            _point("2026-09-07 03:00", 15),
+            _point("2026-09-07 04:00", 14),
+            _point("2026-09-07 04:30", 14.5),
         ]
         early = build_diurnal(
             station_id="KSFO",
@@ -225,15 +228,17 @@ class DiurnalTests(unittest.TestCase):
             local_date="2026-09-07",
             metric="daily_min",
             unit="C",
-            series=series,
-            yesterday_series=[],
-            now=datetime(2026, 9, 7, 9, 30, tzinfo=zone),
+            series=early_series,
+            yesterday_series=yesterday,
+            now=datetime(2026, 9, 7, 5, 30, tzinfo=zone),
             running_value=14,
             observation_status="intraday",
         )
+        self.assertTrue(early["learned_min_valid"])
+        self.assertEqual(early["learned_min_buy_local"], "2026-09-07 06:00")
         self.assertFalse(early["trigger"])
-        self.assertEqual(early["block_reason"], "before_min_cutoff")
-        falling = [_point("2026-09-07 10:30", 13)] + series
+        self.assertEqual(early["block_reason"], "before_learned_buy")
+        falling = early_series + [_point("2026-09-07 10:30", 13)]
         still = build_diurnal(
             station_id="KSFO",
             timezone_name="America/Los_Angeles",
@@ -241,21 +246,22 @@ class DiurnalTests(unittest.TestCase):
             metric="daily_min",
             unit="C",
             series=falling,
-            yesterday_series=[],
+            yesterday_series=yesterday,
             now=datetime(2026, 9, 7, 11, 0, tzinfo=zone),
             running_value=13,
             observation_status="intraday",
         )
         self.assertFalse(still["trigger"])
         self.assertEqual(still["block_reason"], "still_falling")
+        self.assertEqual(still["phase"], "pending")
         ready = build_diurnal(
             station_id="KATL",
             timezone_name="America/Los_Angeles",
             local_date="2026-09-07",
             metric="daily_min",
             unit="C",
-            series=series + [_point("2026-09-07 11:00", 18)],
-            yesterday_series=_yesterday_extreme("KATL", date(2026, 9, 7), kind="min"),
+            series=early_series + [_point("2026-09-07 11:00", 18)],
+            yesterday_series=yesterday,
             now=datetime(2026, 9, 7, 12, 0, tzinfo=zone),
             running_value=14,
             running_bucket={"lower": 13.8, "upper": 15},
@@ -264,7 +270,8 @@ class DiurnalTests(unittest.TestCase):
         self.assertTrue(ready["trigger"])
         self.assertEqual(ready["city_class"], "A")
         self.assertTrue(ready["near_edge"])
-        self.assertLess(sunrise, datetime(2026, 9, 7, 10, 0, tzinfo=zone))
+        self.assertEqual(ready["learned_min_start_local"], "2026-09-07 04:00")
+        self.assertEqual(ready["learned_min_end_local"], "2026-09-07 05:00")
 
     def test_short_series_does_not_trigger(self) -> None:
         zone = load_timezone("America/Los_Angeles")
@@ -283,8 +290,26 @@ class DiurnalTests(unittest.TestCase):
         )
         self.assertFalse(payload["trigger"])
         self.assertEqual(payload["block_reason"], "sample_count")
+        learned_but_short = build_diurnal(
+            station_id="KSFO",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_max",
+            unit="C",
+            series=[_point("2026-09-07 12:00", 20), _point("2026-09-07 15:00", 24)],
+            yesterday_series=[
+                _point("2026-09-06 08:00", 16),
+                _point("2026-09-06 12:00", 22),
+            ],
+            now=datetime(2026, 9, 7, 16, 0, tzinfo=zone),
+            running_value=24,
+            observation_status="intraday",
+        )
+        self.assertEqual(learned_but_short["block_reason"], "sample_count")
+        self.assertEqual(learned_but_short["phase"], "pending")
+        self.assertTrue(learned_but_short["passed"])
 
-    def test_yesterday_min_inside_copied_window_allows_min(self) -> None:
+    def test_one_fall_buys_two_hours_after_its_low(self) -> None:
         series = [
             _point("2026-09-07 04:00", 15),
             _point("2026-09-07 05:00", 14),
@@ -298,33 +323,32 @@ class DiurnalTests(unittest.TestCase):
             metric="daily_min",
             unit="C",
             series=series,
-            yesterday_series=_yesterday_extreme("KATL", date(2026, 9, 7), kind="min"),
+            yesterday_series=[
+                _point("2026-09-06 01:00", 18),
+                _point("2026-09-06 03:00", 9),
+                _point("2026-09-06 03:40", 9),
+            ],
             now=datetime(2026, 9, 7, 12, 0, tzinfo=load_timezone("America/Los_Angeles")),
             running_value=14,
             observation_status="intraday",
         )
-        self.assertTrue(payload["min_window_valid"])
-        self.assertTrue(payload["yesterday_min_at_local"])
+        self.assertTrue(payload["learned_min_valid"])
+        self.assertEqual(payload["yesterday_min_at_local"], "2026-09-06 03:40")
+        self.assertEqual(payload["learned_min_buy_local"], "2026-09-07 05:40")
+        self.assertTrue(payload["min_window_start_local"])
         self.assertTrue(payload["trigger"])
 
-    def test_midnight_min_blocks_only_the_min_side(self) -> None:
+    def test_two_falls_block_only_the_min_side(self) -> None:
         zone = load_timezone("America/Los_Angeles")
-        day = date(2026, 9, 7)
-        solar = solar_day("KATL", day, zone)
-        min_start = (solar["sunrise"] - timedelta(hours=1)) - timedelta(days=1)
-        max_start, max_end, _band = max_window(
-            solar["solar_noon"],
-            "clear",
-            [],
-            zone,
-            datetime(2026, 9, 7, 23, tzinfo=zone),
-        )
-        max_mid = (max_start + (max_end - max_start) / 2) - timedelta(days=1)
         yesterday = [
-            _point((min_start.replace(hour=0, minute=10)).strftime("%Y-%m-%d %H:%M"), 1),
-            _point((min_start + timedelta(minutes=15)).strftime("%Y-%m-%d %H:%M"), 14),
-            _point(max_mid.strftime("%Y-%m-%d %H:%M"), 35),
-            _point((max_mid + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"), 20),
+            _point("2026-09-06 00:10", 16),
+            _point("2026-09-06 03:00", 10),
+            _point("2026-09-06 04:00", 15),
+            _point("2026-09-06 08:00", 18),
+            _point("2026-09-06 12:00", 24),
+            _point("2026-09-06 15:00", 28),
+            _point("2026-09-06 18:00", 22),
+            _point("2026-09-06 22:00", 16),
         ]
         today = [
             _point("2026-09-07 04:00", 15),
@@ -352,35 +376,76 @@ class DiurnalTests(unittest.TestCase):
             unit="C",
             series=today,
             yesterday_series=yesterday,
-            now=solar["solar_noon"] + timedelta(hours=4),
+            now=datetime(2026, 9, 7, 18, 0, tzinfo=zone),
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(minimum["min_window_valid"])
+        self.assertFalse(minimum["learned_min_valid"])
+        self.assertTrue(minimum["learned_max_valid"])
         self.assertFalse(minimum["trigger"])
-        self.assertEqual(minimum["block_reason"], "window_unverified")
-        self.assertTrue(minimum["max_window_valid"])
-        self.assertTrue(maximum["max_window_valid"])
-        self.assertFalse(maximum["min_window_valid"])
+        self.assertEqual(minimum["block_reason"], "multiple_trends")
+        self.assertEqual(minimum["phase"], "trend_unlearned")
+        self.assertTrue(maximum["learned_max_valid"])
+        self.assertFalse(maximum["learned_min_valid"])
+        self.assertEqual(maximum["learned_max_buy_local"], "2026-09-07 17:00")
         self.assertTrue(maximum["trigger"])
 
-    def test_plateau_past_the_window_blocks_that_side(self) -> None:
+    def test_unfinished_fall_still_learns_the_min(self) -> None:
         zone = load_timezone("America/Los_Angeles")
-        day = date(2026, 9, 7)
-        solar = solar_day("KATL", day, zone)
-        start, end, _band = max_window(
-            solar["solar_noon"],
-            "clear",
-            [],
-            zone,
-            datetime(2026, 9, 7, 23, tzinfo=zone),
-        )
-        prev_start = start - timedelta(days=1)
-        prev_end = end - timedelta(days=1)
         yesterday = [
-            _point((prev_start + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M"), 23),
-            _point((prev_end + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"), 23),
-            _point((prev_end + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), 21),
+            _point("2026-09-06 01:00", 24),
+            _point("2026-09-06 03:00", 21),
+            _point("2026-09-06 05:00", 19),
+        ]
+        today = [
+            _point("2026-09-07 04:00", 15),
+            _point("2026-09-07 08:00", 18),
+            _point("2026-09-07 12:00", 24),
+        ]
+        payload = build_diurnal(
+            station_id="KATL",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_min",
+            unit="C",
+            series=today,
+            yesterday_series=yesterday,
+            now=datetime(2026, 9, 7, 12, 0, tzinfo=zone),
+            running_value=15,
+            observation_status="intraday",
+        )
+        self.assertTrue(payload["learned_min_valid"])
+        self.assertFalse(payload["learned_max_valid"])
+        self.assertEqual(payload["learned_min_buy_local"], "2026-09-07 07:00")
+        self.assertTrue(payload["trigger"])
+        late = build_diurnal(
+            station_id="KATL",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_min",
+            unit="C",
+            series=today,
+            yesterday_series=[
+                _point("2026-09-06 18:00", 24),
+                _point("2026-09-06 21:00", 21),
+                _point("2026-09-06 23:00", 19),
+            ],
+            now=datetime(2026, 9, 7, 12, 0, tzinfo=zone),
+            running_value=15,
+            observation_status="intraday",
+        )
+        self.assertTrue(late["learned_min_valid"])
+        self.assertEqual(late["learned_min_buy_local"], "2026-09-08 01:00")
+        self.assertFalse(late["trigger"])
+        self.assertEqual(late["block_reason"], "before_learned_buy")
+
+    def test_two_rises_block_only_the_max_side(self) -> None:
+        zone = load_timezone("America/Los_Angeles")
+        yesterday = [
+            _point("2026-09-06 02:00", 10),
+            _point("2026-09-06 08:00", 18),
+            _point("2026-09-06 12:00", 14),
+            _point("2026-09-06 16:00", 22),
         ]
         today = [
             _point("2026-09-07 08:00", 18),
@@ -396,61 +461,70 @@ class DiurnalTests(unittest.TestCase):
             unit="C",
             series=today,
             yesterday_series=yesterday,
-            now=solar["solar_noon"] + timedelta(hours=4),
+            now=datetime(2026, 9, 7, 20, 0, tzinfo=zone),
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(payload["max_window_valid"])
+        self.assertFalse(payload["learned_max_valid"])
+        self.assertTrue(payload["learned_min_valid"])
         self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["block_reason"], "window_unverified")
-        self.assertEqual(
-            payload["yesterday_max_at_local"],
-            (prev_end + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"),
-        )
+        self.assertEqual(payload["block_reason"], "multiple_trends")
+        self.assertEqual(payload["phase"], "trend_unlearned")
 
-    def test_trough_that_turns_after_the_window_blocks_only_the_min(self) -> None:
+    def test_weather_mismatch_blocks_a_learned_window(self) -> None:
         zone = load_timezone("America/Los_Angeles")
-        day = date(2026, 9, 7)
-        solar = solar_day("KATL", day, zone)
-        min_start = (solar["sunrise"] - timedelta(hours=1)) - timedelta(days=1)
-        min_end = (solar["sunrise"] - timedelta(minutes=30)) - timedelta(days=1)
-        start, end, _band = max_window(
-            solar["solar_noon"],
-            "clear",
-            [],
-            zone,
-            datetime(2026, 9, 7, 23, tzinfo=zone),
-        )
-        max_mid = (start + (end - start) / 2) - timedelta(days=1)
         yesterday = [
-            _point((min_start + timedelta(minutes=10)).strftime("%Y-%m-%d %H:%M"), 12),
-            _point((min_end + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"), 12),
-            _point((min_end + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M"), 14),
-            _point(max_mid.strftime("%Y-%m-%d %H:%M"), 35),
-            _point((max_mid + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M"), 20),
+            _point("2026-09-06 08:00", 16, "OVC", "precip"),
+            _point("2026-09-06 12:00", 20, "OVC", "precip"),
+            _point("2026-09-06 16:00", 18, "OVC", "precip"),
         ]
         today = [
-            _point("2026-09-07 04:00", 15),
-            _point("2026-09-07 08:00", 18),
-            _point("2026-09-07 12:00", 24),
-            _point("2026-09-07 15:00", 27),
+            _point("2026-09-07 08:00", 16),
+            _point("2026-09-07 12:00", 20),
+            _point("2026-09-07 16:00", 18),
         ]
         payload = build_diurnal(
             station_id="KATL",
             timezone_name="America/Los_Angeles",
             local_date="2026-09-07",
-            metric="daily_min",
+            metric="daily_max",
             unit="C",
             series=today,
             yesterday_series=yesterday,
-            now=datetime(2026, 9, 7, 12, 0, tzinfo=zone),
-            running_value=15,
+            now=datetime(2026, 9, 7, 20, 0, tzinfo=zone),
+            running_value=20,
             observation_status="intraday",
         )
-        self.assertFalse(payload["min_window_valid"])
+        self.assertTrue(payload["learned_max_valid"])
+        self.assertEqual(payload["weather_class"], "clear")
+        self.assertEqual(payload["yesterday_weather_class"], "precip")
         self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["block_reason"], "window_unverified")
-        self.assertTrue(payload["max_window_valid"])
+        self.assertEqual(payload["block_reason"], "weather_mismatch")
+        self.assertEqual(payload["phase"], "weather_mismatch")
+        unknown_today = []
+        for local, temp in (("08:00", 16), ("12:00", 20), ("16:00", 18)):
+            point = _point("2026-09-07 " + local, temp)
+            point["sky"] = ""
+            unknown_today.append(point)
+        unknown = build_diurnal(
+            station_id="KATL",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_max",
+            unit="C",
+            series=unknown_today,
+            yesterday_series=[
+                _point("2026-09-06 08:00", 16),
+                _point("2026-09-06 12:00", 20),
+                _point("2026-09-06 16:00", 18),
+            ],
+            now=datetime(2026, 9, 7, 20, 0, tzinfo=zone),
+            running_value=20,
+            observation_status="intraday",
+        )
+        self.assertEqual(unknown["block_reason"], "weather_class_unknown")
+        self.assertEqual(unknown["phase"], "weather_mismatch")
+        self.assertFalse(unknown["trigger"])
 
     def test_flat_day_does_not_validate_either_side(self) -> None:
         yesterday = [_point("2026-09-06 {:02d}:00".format(hour), 20) for hour in range(0, 23)]
@@ -473,10 +547,12 @@ class DiurnalTests(unittest.TestCase):
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(payload["max_window_valid"])
-        self.assertFalse(payload["min_window_valid"])
+        self.assertFalse(payload["learned_max_valid"])
+        self.assertFalse(payload["learned_min_valid"])
+        self.assertTrue(payload["max_window_start_local"])
         self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["phase"], "window_unverified")
+        self.assertEqual(payload["block_reason"], "no_trend")
+        self.assertEqual(payload["phase"], "trend_unlearned")
 
     def test_only_class_a_can_trigger_and_breeze_is_metadata(self) -> None:
         from weather_runtime.station_tz import DIURNAL_CLASS_A, STATION_COORDS
@@ -484,14 +560,13 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(len(DIURNAL_CLASS_A), 36)
         self.assertTrue(set(DIURNAL_CLASS_A) <= set(STATION_COORDS))
         zone = load_timezone("America/Los_Angeles")
-        solar = solar_day("KORD", date(2026, 9, 7), zone)
         series = [
             _point("2026-09-07 08:00", 18),
             _point("2026-09-07 10:00", 21),
             _point("2026-09-07 12:00", 24),
             _point("2026-09-07 15:00", 27),
         ]
-        now = solar["solar_noon"] + timedelta(hours=4)
+        now = datetime(2026, 9, 7, 22, 0, tzinfo=zone)
         chicago = build_diurnal(
             station_id="KORD",
             timezone_name="America/Los_Angeles",
@@ -515,7 +590,7 @@ class DiurnalTests(unittest.TestCase):
             unit="C",
             series=series,
             yesterday_series=_yesterday_extreme("KSFO", date(2026, 9, 7), kind="max"),
-            now=solar_day("KSFO", date(2026, 9, 7), zone)["solar_noon"] + timedelta(hours=4),
+            now=now,
             running_value=27,
             observation_status="intraday",
         )
@@ -524,6 +599,40 @@ class DiurnalTests(unittest.TestCase):
         self.assertFalse(excluded["trigger"])
         self.assertEqual(excluded["block_reason"], "city_class")
         self.assertEqual(excluded["phase"], "excluded")
+
+    def test_previous_day_bounds_use_station_local_clock(self) -> None:
+        from weather_runtime.models import ObservationEvidence, WeatherRule
+        from weather_runtime.sources import WeatherSourceAdapter
+
+        rule = WeatherRule(
+            market_id="m",
+            event_group_id="e",
+            adapter="wrh",
+            source={"station_id": "KORD", "provider": "NOAA"},
+            metric="daily_max",
+            observation_start="2026-09-07T00:00:00",
+            observation_end="2026-09-08T00:00:00",
+            unit="F",
+            buckets=[],
+            timezone="America/Chicago",
+        )
+        adapter = WeatherSourceAdapter()
+        seen = {}
+
+        def _payload(shifted, now=None):
+            seen["start"] = shifted.observation_start
+            seen["end"] = shifted.observation_end
+            return {"observations": []}, "https://example.test"
+
+        def _evaluate(shifted, payload, url, current, evidence_hash, window_open=False):
+            return ObservationEvidence(status="ok", series=[{"temp": 70}])
+
+        adapter._payload = _payload
+        adapter._evaluate = _evaluate
+        series = adapter.previous_day_series(rule, now=datetime(2026, 9, 7, 18, tzinfo=timezone.utc))
+        self.assertEqual(series, [{"temp": 70}])
+        self.assertEqual(seen["start"], "2026-09-06T00:00:00")
+        self.assertEqual(seen["end"], "2026-09-07T00:00:00")
 
 
 class DiurnalScanTests(unittest.TestCase):

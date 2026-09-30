@@ -476,25 +476,10 @@ def _on_date(moment: datetime, day: date) -> datetime:
     return moment.replace(year=day.year, month=day.month, day=day.day)
 
 
-def _window_extreme(
+def _day_temps(
     points: list[tuple[datetime, dict[str, Any]]],
-    start: datetime,
-    end: datetime,
-    *,
-    pick_min: bool,
-) -> tuple[bool, str]:
-    """Whether yesterday's extremum turned inside the copied window.
-
-    The last time the daily max or min was seen must fall inside ``start``..``end``,
-    and a later counted point that day must have left it. A flat day, or a
-    plateau that ends outside the window, does not validate that side.
-
-    The window is 30 minutes. No counted observation inside it fails this side,
-    which hourly stations hit often. Follow-up: if the window is empty, consider
-    widening the range. Leave the 30-minute rule in place until that is designed.
-    """
-
-    day = start.date()
+    day: date,
+) -> list[tuple[datetime, float]]:
     temps: list[tuple[datetime, float]] = []
     for local, point in points:
         if local.date() != day:
@@ -503,17 +488,73 @@ def _window_extreme(
             temps.append((local, float(point.get("temp"))))
         except (TypeError, ValueError):
             continue
-    if not temps:
-        return False, ""
-    extreme = min(temp for _local, temp in temps) if pick_min else max(temp for _local, temp in temps)
-    hits = [local for local, temp in temps if abs(temp - extreme) <= 1e-6]
-    last = max(hits)
-    later = [temp for local, temp in temps if local > last]
-    if pick_min:
-        turned = any(temp > extreme + 1e-6 for temp in later)
-    else:
-        turned = any(temp < extreme - 1e-6 for temp in later)
-    return bool(turned and start <= last <= end), _fmt_local(last)
+    temps.sort(key=lambda item: item[0])
+    return temps
+
+
+def _trend_segments(
+    temps: list[tuple[datetime, float]],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Split yesterday into falling and rising runs.
+
+    A flat step stays with the run already in progress. A run that is still
+    falling or rising at the last point still counts; it does not have to turn.
+    """
+
+    falls: list[tuple[int, int]] = []
+    rises: list[tuple[int, int]] = []
+    direction = ""
+    start = 0
+    for index in range(1, len(temps)):
+        delta = temps[index][1] - temps[index - 1][1]
+        if abs(delta) <= 1e-6:
+            continue
+        new_direction = "up" if delta > 0 else "down"
+        if not direction:
+            direction = new_direction
+            start = 0
+            continue
+        if new_direction == direction:
+            continue
+        segment = (start, index - 1)
+        if direction == "up":
+            rises.append(segment)
+        else:
+            falls.append(segment)
+        direction = new_direction
+        start = index - 1
+    if direction:
+        segment = (start, len(temps) - 1)
+        if direction == "up":
+            rises.append(segment)
+        else:
+            falls.append(segment)
+    return falls, rises
+
+
+def _segment_anchor(
+    temps: list[tuple[datetime, float]],
+    segment: tuple[int, int],
+    *,
+    pick_min: bool,
+) -> datetime:
+    start, end = segment
+    chunk = temps[start : end + 1]
+    extreme = min(temp for _local, temp in chunk) if pick_min else max(temp for _local, temp in chunk)
+    hits = [local for local, temp in chunk if abs(temp - extreme) <= 1e-6]
+    return max(hits)
+
+
+def _learned_window(
+    anchor: datetime,
+    day: date,
+) -> tuple[datetime, datetime, datetime]:
+    """One hour from yesterday's trend end, stamped onto today, buy an hour later."""
+
+    start = _on_date(anchor, day)
+    end = start + timedelta(hours=1)
+    buy_at = start + timedelta(hours=2)
+    return start, end, buy_at
 
 
 def _bucket_edge(metric: str, value: Optional[float], bucket: Optional[dict[str, Any]]) -> bool:
@@ -596,27 +637,42 @@ def build_diurnal(
     points = _counted_points(series or [], zone, current)
     yesterday_points = _counted_points(yesterday_series or [], zone, current + timedelta(days=2))
     previous_day = day - timedelta(days=1)
-    min_window_valid, yesterday_min_at = _window_extreme(
-        yesterday_points,
-        _on_date(min_start, previous_day),
-        _on_date(min_end, previous_day),
-        pick_min=True,
+    yesterday_temps = _day_temps(yesterday_points, previous_day)
+    falls, rises = _trend_segments(yesterday_temps)
+    learned: dict[str, Optional[datetime]] = {
+        "min_start": None,
+        "min_end": None,
+        "min_buy": None,
+        "min_anchor": None,
+        "max_start": None,
+        "max_end": None,
+        "max_buy": None,
+        "max_anchor": None,
+    }
+    trend_counts = {"daily_min": len(falls), "daily_max": len(rises)}
+    if len(falls) == 1:
+        anchor = _segment_anchor(yesterday_temps, falls[0], pick_min=True)
+        start, end, buy_at = _learned_window(anchor, day)
+        learned["min_anchor"] = anchor
+        learned["min_start"] = start
+        learned["min_end"] = end
+        learned["min_buy"] = buy_at
+    if len(rises) == 1:
+        anchor = _segment_anchor(yesterday_temps, rises[0], pick_min=False)
+        start, end, buy_at = _learned_window(anchor, day)
+        learned["max_anchor"] = anchor
+        learned["max_start"] = start
+        learned["max_end"] = end
+        learned["max_buy"] = buy_at
+    trend_count = trend_counts.get(metric)
+    trigger_at = learned["min_buy"] if metric == "daily_min" else learned["max_buy"]
+    yesterday_weather = classify_weather(yesterday_series or [], zone, current + timedelta(days=2))
+    weather_matches = (
+        weather_class not in {"", "unknown"}
+        and yesterday_weather not in {"", "unknown"}
+        and weather_class == yesterday_weather
     )
-    max_window_valid, yesterday_max_at = _window_extreme(
-        yesterday_points,
-        _on_date(max_start, previous_day),
-        _on_date(max_end, previous_day),
-        pick_min=False,
-    )
-    metric_window_valid = min_window_valid if metric == "daily_min" else max_window_valid
-    min_cutoff = datetime(day.year, day.month, day.day, 10, 0, tzinfo=zone)
-    if min_end > min_cutoff:
-        min_cutoff = min_end
-    if metric == "daily_min":
-        trigger_at = min_cutoff
-    else:
-        trigger_at = max_end
-    passed = current >= trigger_at
+    passed = trigger_at is not None and current >= trigger_at
     near_edge = _bucket_edge(metric, running_value, running_bucket)
     block_reason = ""
     trigger = False
@@ -628,34 +684,30 @@ def build_diurnal(
         block_reason = "weather_class_unknown"
     elif len(points) < 3:
         block_reason = "sample_count"
-    elif metric == "daily_min":
-        if current < trigger_at:
-            block_reason = "before_min_cutoff"
-        elif _convective_ongoing(points):
-            block_reason = "convective_ongoing"
-        elif _min_still_falling(points, current):
-            block_reason = "still_falling"
-        else:
-            trigger = True
-    elif metric == "daily_max":
-        if current < trigger_at:
-            block_reason = "before_max_window"
-        else:
-            trigger = True
-    else:
+    elif metric not in {"daily_min", "daily_max"}:
         block_reason = "metric_unsupported"
-    if metric in {"daily_min", "daily_max"} and not metric_window_valid:
-        if trigger:
-            block_reason = "window_unverified"
-        trigger = False
+    elif trend_count != 1:
+        block_reason = "multiple_trends" if trend_count and trend_count > 1 else "no_trend"
+    elif not weather_matches:
+        block_reason = "weather_mismatch"
+    elif trigger_at is None or current < trigger_at:
+        block_reason = "before_learned_buy"
+    elif metric == "daily_min" and _convective_ongoing(points):
+        block_reason = "convective_ongoing"
+    elif metric == "daily_min" and _min_still_falling(points, current):
+        block_reason = "still_falling"
+    else:
+        trigger = True
     phase = "pending"
     if continuity.get("status") == "regime_change":
         phase = "regime_change"
-    elif metric in {"daily_min", "daily_max"} and not metric_window_valid:
-        phase = "window_unverified"
+    elif metric in {"daily_min", "daily_max"} and trend_count != 1:
+        phase = "trend_unlearned"
+    elif metric in {"daily_min", "daily_max"} and not weather_matches:
+        phase = "weather_mismatch"
     elif trigger:
         phase = "ready"
-    elif passed:
+    elif passed and block_reason not in {"sample_count", "convective_ongoing", "still_falling"}:
         phase = "passed"
     city_class = diurnal_city_class(station_id)
     if city_class != "A":
@@ -678,12 +730,19 @@ def build_diurnal(
         "min_window_end_local": _fmt_local(min_end),
         "max_window_start_local": _fmt_local(max_start),
         "max_window_end_local": _fmt_local(max_end),
-        "min_trigger_local": _fmt_local(min_cutoff),
-        "max_trigger_local": _fmt_local(max_end),
-        "min_window_valid": min_window_valid,
-        "max_window_valid": max_window_valid,
-        "yesterday_min_at_local": yesterday_min_at,
-        "yesterday_max_at_local": yesterday_max_at,
+        "min_trigger_local": _fmt_local(learned["min_buy"]) if learned["min_buy"] else "",
+        "max_trigger_local": _fmt_local(learned["max_buy"]) if learned["max_buy"] else "",
+        "learned_min_valid": len(falls) == 1,
+        "learned_max_valid": len(rises) == 1,
+        "learned_min_start_local": _fmt_local(learned["min_start"]) if learned["min_start"] else "",
+        "learned_min_end_local": _fmt_local(learned["min_end"]) if learned["min_end"] else "",
+        "learned_min_buy_local": _fmt_local(learned["min_buy"]) if learned["min_buy"] else "",
+        "learned_max_start_local": _fmt_local(learned["max_start"]) if learned["max_start"] else "",
+        "learned_max_end_local": _fmt_local(learned["max_end"]) if learned["max_end"] else "",
+        "learned_max_buy_local": _fmt_local(learned["max_buy"]) if learned["max_buy"] else "",
+        "yesterday_weather_class": yesterday_weather,
+        "yesterday_min_at_local": _fmt_local(learned["min_anchor"]) if learned["min_anchor"] else "",
+        "yesterday_max_at_local": _fmt_local(learned["max_anchor"]) if learned["max_anchor"] else "",
         "passed": passed,
         "trigger": trigger,
         "near_edge": near_edge,

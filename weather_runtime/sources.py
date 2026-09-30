@@ -1159,9 +1159,10 @@ class WeatherSourceAdapter:
         end = self._parse(rule, rule.observation_end)
         if not station or start is None or end is None:
             return []
+        zone = self._zone(rule)
         prev_start = start - timedelta(days=1)
         prev_end = end - timedelta(days=1)
-        day_key = prev_start.astimezone(self._zone(rule)).date().isoformat()
+        day_key = prev_start.astimezone(zone).date().isoformat()
         cache_key = (station, day_key)
         cached = self._previous_series_cache.get(cache_key)
         if cached is not None:
@@ -1170,14 +1171,16 @@ class WeatherSourceAdapter:
         params = source.get("params")
         if isinstance(params, dict) and params.get("startDate"):
             shifted_params = dict(params)
-            prev_date = prev_start.astimezone(self._zone(rule)).date()
+            prev_date = prev_start.astimezone(zone).date()
             shifted_params["startDate"] = prev_date.strftime("%Y%m%d")
             shifted_params["endDate"] = (prev_date + timedelta(days=1)).strftime("%Y%m%d")
             source["params"] = shifted_params
+        local_start = prev_start.astimezone(zone)
+        local_end = prev_end.astimezone(zone)
         shifted = replace(
             rule,
-            observation_start=prev_start.strftime("%Y-%m-%dT%H:%M:%S"),
-            observation_end=prev_end.strftime("%Y-%m-%dT%H:%M:%S"),
+            observation_start=local_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            observation_end=local_end.strftime("%Y-%m-%dT%H:%M:%S"),
             source=source,
         )
         current = now or datetime.now(timezone.utc)
