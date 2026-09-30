@@ -21,6 +21,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+from .diurnal import sky_wx_from_row
 from .models import ObservationEvidence, WeatherRule, now_iso, parse_time
 from .rules import ROUNDING_WHOLE, apply_rounding, load_timezone
 from .storage import sha256_json
@@ -778,6 +779,7 @@ class WeatherSourceAdapter:
         self._synoptic_token_error_at = 0.0
         self._watch_seen: set[tuple[str, str]] = set()
         self._watch_pending: list[dict[str, Any]] = []
+        self._previous_series_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
 
     def _zone(self, rule: WeatherRule):
         return load_timezone(rule.timezone)
@@ -1143,6 +1145,58 @@ class WeatherSourceAdapter:
             window_open=window_open,
         )
 
+    def previous_day_series(self, rule: WeatherRule, *, now: Optional[datetime] = None) -> list[dict[str, Any]]:
+        """Yesterday's in-window series for the two-day continuity check.
+
+        Synoptic already returns about 72 hours, so this refilters the cached
+        payload. Wunderground historical calls shift ``startDate``. A failed
+        fetch is not cached, so the next scan can retry. An empty series is
+        cached and treated as "no baseline" by the diurnal gate.
+        """
+
+        station = str(rule.source.get("station_id") or "").strip().upper()
+        start = self._parse(rule, rule.observation_start)
+        end = self._parse(rule, rule.observation_end)
+        if not station or start is None or end is None:
+            return []
+        prev_start = start - timedelta(days=1)
+        prev_end = end - timedelta(days=1)
+        day_key = prev_start.astimezone(self._zone(rule)).date().isoformat()
+        cache_key = (station, day_key)
+        cached = self._previous_series_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        source = dict(rule.source)
+        params = source.get("params")
+        if isinstance(params, dict) and params.get("startDate"):
+            shifted_params = dict(params)
+            prev_date = prev_start.astimezone(self._zone(rule)).date()
+            shifted_params["startDate"] = prev_date.strftime("%Y%m%d")
+            shifted_params["endDate"] = (prev_date + timedelta(days=1)).strftime("%Y%m%d")
+            source["params"] = shifted_params
+        shifted = replace(
+            rule,
+            observation_start=prev_start.strftime("%Y-%m-%dT%H:%M:%S"),
+            observation_end=prev_end.strftime("%Y-%m-%dT%H:%M:%S"),
+            source=source,
+        )
+        current = now or datetime.now(timezone.utc)
+        try:
+            payload, url = self._payload(shifted, now=current)
+            evidence = self._evaluate(
+                shifted,
+                payload,
+                url,
+                current,
+                sha256_json(payload),
+                window_open=False,
+            )
+        except Exception:
+            return []
+        series = list(evidence.series or [])
+        self._previous_series_cache[cache_key] = series
+        return series
+
     def drain_synoptic_watch(self) -> list[dict[str, Any]]:
         """First-seen observation timestamps from WRH's Synoptic fetches."""
 
@@ -1492,18 +1546,22 @@ class WeatherSourceAdapter:
             source_values = resolution_values
         counted = {item[0] for item in source_values}
         points: list[dict[str, Any]] = []
-        for stamp, temp, _row in sorted(source_values, key=lambda item: item[0]):
+        for stamp, temp, row in sorted(source_values, key=lambda item: item[0]):
             utc = stamp.astimezone(timezone.utc)
             local = utc.astimezone(zone)
-            points.append(
-                {
-                    "timestamp": utc.isoformat(),
-                    "local_time": local.strftime("%Y-%m-%d %H:%M"),
-                    "timezone": zone_name,
-                    "temp": round(float(temp), 1),
-                    "counts_for_resolution": stamp in counted,
-                }
-            )
+            point = {
+                "timestamp": utc.isoformat(),
+                "local_time": local.strftime("%Y-%m-%d %H:%M"),
+                "timezone": zone_name,
+                "temp": round(float(temp), 1),
+                "counts_for_resolution": stamp in counted,
+            }
+            sky, wx = sky_wx_from_row(row if isinstance(row, dict) else {})
+            if sky:
+                point["sky"] = sky
+            if wx:
+                point["wx"] = wx
+            points.append(point)
         return points
 
     def _following_values(self, rule: WeatherRule, payload: Any) -> list[tuple[datetime, float]]:

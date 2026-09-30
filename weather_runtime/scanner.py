@@ -7,10 +7,18 @@ import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
 from .books import ClobClient, ask_depth, bid_depth, normalize_book, walk_asks, walk_bids
+from .diurnal import (
+    DIURNAL_MAX_LOSER_NO,
+    DIURNAL_MAX_REASON,
+    DIURNAL_MIN_LOSER_NO,
+    DIURNAL_MIN_REASON,
+    DIURNAL_REASONS,
+    build_diurnal,
+)
 from .models import Book, ObservationEvidence, WeatherMarket, WeatherRule, as_float, parse_time, utc_now
 from .rules import (
     bucket_for_outcome,
@@ -22,6 +30,7 @@ from .rules import (
     validate_event_group_siblings,
 )
 from .sources import WeatherSourceAdapter, sample_set_of
+from .station_tz import coordinates_for_station
 from .storage import sha256_json
 
 
@@ -79,7 +88,15 @@ _OPPORTUNITY_REASONS = {
     "provisional_loser_sell_yes",
     "source_final_loser_sell_yes",
     "source_final_winner_yes",
+    DIURNAL_MAX_REASON,
+    DIURNAL_MIN_REASON,
+    DIURNAL_MAX_LOSER_NO,
+    DIURNAL_MIN_LOSER_NO,
 }
+
+
+def _is_diurnal_reason(reason: Any) -> bool:
+    return str(reason or "") in DIURNAL_REASONS
 
 
 def extrema_from_rows(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -106,6 +123,7 @@ class WeatherScannerConfig:
     min_order_shares: float = 1.0
     target_shares: float = 1.0
     max_usdc: float = 50.0
+    diurnal_order_usdc: float = 5.0
     max_slippage: float = 0.003
     book_ttl_s: float = 5.0
     display_book_ttl_s: float = 60.0
@@ -191,6 +209,161 @@ class WeatherScanner:
         base["status"] = "rule_matched"
         base["reason"] = reason
         rows.append(base)
+
+    def _yesterday_series(
+        self,
+        rule: WeatherRule,
+        series_index: dict[tuple[str, str], list[dict[str, Any]]],
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        station = str(rule.source.get("station_id") or "").strip().upper()
+        local_date = str(rule.observation_start or "")[:10]
+        if not station or coordinates_for_station(station) is None or len(local_date) < 10:
+            return []
+        try:
+            prev = (date.fromisoformat(local_date) - timedelta(days=1)).isoformat()
+        except ValueError:
+            return []
+        cached = series_index.get((station, prev))
+        if cached is not None:
+            return cached
+        return self.source_adapter.previous_day_series(rule, now=now)
+
+    def _diurnal_snapshot(
+        self,
+        rule: WeatherRule,
+        observation: ObservationEvidence,
+        now: datetime,
+        series_index: dict[tuple[str, str], list[dict[str, Any]]],
+        cache: dict[str, dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        event_id = str(rule.event_group_id)
+        if event_id in cache:
+            return cache[event_id]
+        if rule.metric not in {"daily_max", "daily_min"}:
+            return None
+        station = str(observation.station_id or rule.source.get("station_id") or "")
+        local_date = str(rule.observation_start or "")[:10]
+        running_bucket = None
+        if observation.value is not None and rule.buckets:
+            found = bucket_for_value(observation.value, rule.buckets, rounding=rule.rounding)
+            if found is not None:
+                running_bucket = found.to_dict()
+        snapshot = build_diurnal(
+            station_id=station,
+            timezone_name=rule.timezone,
+            local_date=local_date,
+            metric=rule.metric,
+            unit=rule.unit,
+            series=list(observation.series or []),
+            yesterday_series=self._yesterday_series(rule, series_index, now),
+            now=now,
+            running_value=observation.value,
+            running_bucket=running_bucket,
+            observation_status=observation.status,
+        )
+        if snapshot is not None:
+            cache[event_id] = snapshot
+        return snapshot
+
+    def _queue_diurnal_yes(
+        self,
+        base: dict[str, Any],
+        rows: list[dict[str, Any]],
+        token_ids: list[str],
+        market: WeatherMarket,
+        *,
+        bucket: Any,
+        observation: ObservationEvidence,
+        history: list[str],
+        priority_token_ids: list[str],
+    ) -> bool:
+        diurnal = base.get("diurnal") if isinstance(base.get("diurnal"), dict) else {}
+        if not diurnal.get("trigger"):
+            return False
+        rule_payload = base.get("rule") if isinstance(base.get("rule"), dict) else {}
+        metric = str(observation.aggregation or rule_payload.get("metric") or "")
+        if metric == "daily_max":
+            reason = DIURNAL_MAX_REASON
+        elif metric == "daily_min":
+            reason = DIURNAL_MIN_REASON
+        else:
+            return False
+        self._queue_matched_trade(
+            base,
+            rows,
+            token_ids,
+            market,
+            bucket=bucket,
+            trade_side="YES",
+            is_target=True,
+            source_status=observation.status,
+            reason=reason,
+            history=history,
+            priority_token_ids=priority_token_ids,
+            priority=False,
+        )
+        return True
+
+    def _queue_diurnal_book(
+        self,
+        base: dict[str, Any],
+        rows: list[dict[str, Any]],
+        token_ids: list[str],
+        market: WeatherMarket,
+        *,
+        is_running: bool,
+        running_bucket: Any,
+        observation: ObservationEvidence,
+        history: list[str],
+        priority_token_ids: list[str],
+    ) -> bool:
+        """One diurnal order per bucket once the window is confirmed.
+
+        The running bucket buys Yes. Every other bucket buys No. A confirmed
+        window does not also emit a locked No for the same book.
+        """
+
+        diurnal = base.get("diurnal") if isinstance(base.get("diurnal"), dict) else {}
+        if not diurnal.get("trigger"):
+            return False
+        if is_running:
+            return self._queue_diurnal_yes(
+                base,
+                rows,
+                token_ids,
+                market,
+                bucket=running_bucket,
+                observation=observation,
+                history=history,
+                priority_token_ids=priority_token_ids,
+            )
+        metric = str(observation.aggregation or "")
+        if not metric:
+            rule_payload = base.get("rule") if isinstance(base.get("rule"), dict) else {}
+            metric = str(rule_payload.get("metric") or "")
+        if metric == "daily_max":
+            reason = DIURNAL_MAX_LOSER_NO
+        elif metric == "daily_min":
+            reason = DIURNAL_MIN_LOSER_NO
+        else:
+            return False
+        self._queue_matched_trade(
+            base,
+            rows,
+            token_ids,
+            market,
+            bucket=running_bucket,
+            trade_side="NO",
+            is_target=False,
+            source_status=observation.status,
+            reason=reason,
+            history=history,
+            priority_token_ids=priority_token_ids,
+            priority=False,
+            order_side="BUY",
+        )
+        return True
 
     def _queue_impossible_bucket_trades(
         self,
@@ -397,6 +570,13 @@ class WeatherScanner:
             }
         )
 
+    def _buy_notional_cap(self, row: dict[str, Any]) -> float:
+        """Diurnal Yes and No use DIURNAL_ORDER_USDC. Other buys use MAX_ORDER_USDC."""
+
+        if _is_diurnal_reason(row.get("reason")):
+            return float(self.config.diurnal_order_usdc)
+        return float(self.config.max_usdc)
+
     def _evaluate_buy_row(
         self,
         row: dict[str, Any],
@@ -421,12 +601,13 @@ class WeatherScanner:
         ):
             row.update({"status": "no_trade", "reason": "market_constraints_missing"})
             return
+        budget = self._buy_notional_cap(row)
         target = max(
             float(self.config.min_order_shares),
             float(min_order_size or 0.0),
-            min(float(self.config.target_shares), self.config.max_usdc / best_ask),
+            min(float(self.config.target_shares), budget / best_ask),
         )
-        if target * best_ask > float(self.config.max_usdc) + 1e-12:
+        if target * best_ask > budget + 1e-12:
             row.update(
                 {
                     "status": "no_trade",
@@ -434,7 +615,7 @@ class WeatherScanner:
                     "economics": {
                         "best_ask": best_ask,
                         "min_order_size": min_order_size,
-                        "max_usdc": float(self.config.max_usdc),
+                        "max_usdc": budget,
                         "tick_size": tick,
                     },
                 }
@@ -491,7 +672,9 @@ class WeatherScanner:
             "trade_side": row.get("trade_side") or "YES",
             "order_side": "BUY",
         }
-        if edge < self.config.min_net_edge:
+        # Diurnal Yes is gated by DIURNAL_MIN_PRICE. The $1 edge shrinks as the
+        # ask approaches 1, so a price inside the floor would otherwise miss it.
+        if edge < self.config.min_net_edge and not _is_diurnal_reason(row.get("reason")):
             row.update({"status": "no_trade", "reason": "edge_below_minimum"})
             return
         self._mark_opportunity(row)
@@ -723,6 +906,17 @@ class WeatherScanner:
                     key, observation = future.result()
                     source_cache[key] = observation
         weather_prefetch_done = time.monotonic()
+        series_by_station_day: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for obs_key, obs_rule in obs_jobs.items():
+            obs_item = source_cache.get(obs_key)
+            if obs_item is None:
+                continue
+            station = str(obs_item.station_id or obs_rule.source.get("station_id") or "").strip().upper()
+            day = str(obs_rule.observation_start or "")[:10]
+            series = list(obs_item.series or [])
+            if station and len(day) >= 10 and series:
+                series_by_station_day[(station, day)] = series
+        diurnal_by_group: dict[str, dict[str, Any]] = {}
 
         for rule in rule_list:
             market = market_map.get(rule.market_id)
@@ -811,6 +1005,15 @@ class WeatherScanner:
                     },
                 )
             base["observation"] = _without_raw(evidence)
+            snapshot = self._diurnal_snapshot(
+                rule,
+                observation,
+                current,
+                series_by_station_day,
+                diurnal_by_group,
+            )
+            if snapshot is not None:
+                base["diurnal"] = snapshot
             if observation.status == "waiting_window":
                 base.update(
                     {
@@ -883,6 +1086,18 @@ class WeatherScanner:
             )
 
             if observation.status == "intraday":
+                if self._queue_diurnal_book(
+                    base,
+                    rows,
+                    token_ids,
+                    market,
+                    is_running=is_running,
+                    running_bucket=running_bucket,
+                    observation=observation,
+                    history=["DISCOVERED", "INTRADAY", "RULE_MATCHED"],
+                    priority_token_ids=priority_token_ids,
+                ):
+                    continue
                 if not bucket_impossible_while_open(
                     rule.metric,
                     observation.value,
@@ -927,6 +1142,18 @@ class WeatherScanner:
                 continue
 
             if observation.status == "provisional":
+                if self._queue_diurnal_book(
+                    base,
+                    rows,
+                    token_ids,
+                    market,
+                    is_running=is_running,
+                    running_bucket=running_bucket,
+                    observation=observation,
+                    history=["DISCOVERED", "PROVISIONAL", "RULE_MATCHED"],
+                    priority_token_ids=priority_token_ids,
+                ):
+                    continue
                 if not bucket_impossible_while_open(
                     rule.metric,
                     observation.value,
@@ -1185,7 +1412,17 @@ class WeatherScanner:
                     ),
                     "market_count": len(group_rows),
                     "matched_market_count": len(target_rows),
-                    "candidate_count": sum(1 for row in group_rows if row.get("status") == "opportunity"),
+                    "candidate_count": sum(
+                        1
+                        for row in group_rows
+                        if row.get("status") == "opportunity" and not _is_diurnal_reason(row.get("reason"))
+                    ),
+                    "diurnal_candidate_count": sum(
+                        1
+                        for row in group_rows
+                        if row.get("status") == "opportunity" and _is_diurnal_reason(row.get("reason"))
+                    ),
+                    "diurnal": diurnal_by_group.get(event_group_id),
                     "status_counts": _status_counts(group_rows),
                     "markets": [
                         {
@@ -1208,7 +1445,21 @@ class WeatherScanner:
         eligible = len(rows)
         paired = sum(1 for row in rows if row.get("market_match_status") == "matched")
         matched = sum(1 for row in rows if row.get("rule_status") == "matched")
-        actionable = sum(1 for row in rows if row.get("trade_side"))
+        actionable = sum(
+            1
+            for row in rows
+            if row.get("trade_side") and not _is_diurnal_reason(row.get("reason"))
+        )
+        finality_ready = sum(
+            1
+            for row in rows
+            if row.get("status") == "opportunity" and not _is_diurnal_reason(row.get("reason"))
+        )
+        diurnal_ready = sum(
+            1
+            for row in rows
+            if row.get("status") == "opportunity" and _is_diurnal_reason(row.get("reason"))
+        )
         final_groups = sum(1 for group in group_views if group.get("source_status") == "final")
         mapped_groups = sum(
             1
@@ -1234,13 +1485,10 @@ class WeatherScanner:
             "final_event_groups": final_groups,
             "mapped_event_groups": mapped_groups,
             "bucket_match_rate": (mapped_groups / final_groups) if final_groups else 0.0,
-            "book_ready": sum(1 for row in rows if row.get("status") == "opportunity"),
-            "book_ready_rate": (
-                sum(1 for row in rows if row.get("status") == "opportunity") / actionable
-                if actionable
-                else 0.0
-            ),
-            "opportunities": sum(1 for row in rows if row.get("status") == "opportunity"),
+            "book_ready": finality_ready,
+            "book_ready_rate": (finality_ready / actionable) if actionable else 0.0,
+            "opportunities": finality_ready,
+            "diurnal_opportunities": diurnal_ready,
             "waiting": sum(1 for row in rows if row.get("status") == "waiting"),
             "review": sum(1 for row in rows if row.get("status") == "review"),
             "no_trade": sum(1 for row in rows if row.get("status") == "no_trade"),

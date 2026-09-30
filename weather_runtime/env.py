@@ -42,6 +42,13 @@ def _first_env(*names: str) -> str:
 def trading_config() -> dict[str, Any]:
     live = as_bool(os.environ.get("LIVE_ORDERS"), False)
     limit_orders = as_bool(os.environ.get("LIMIT_ORDERS"), False)
+    legacy_diurnal = as_bool(os.environ.get("DIURNAL_ORDERS"), False)
+    yes_text = os.environ.get("DIURNAL_YES_ORDERS")
+    if yes_text is None or not str(yes_text).strip():
+        diurnal_yes_orders = bool(legacy_diurnal)
+    else:
+        diurnal_yes_orders = bool(as_bool(yes_text, False))
+    diurnal_no_orders = bool(as_bool(os.environ.get("DIURNAL_NO_ORDERS"), False))
     return {
         "private_key": _first_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY"),
         "address": _first_env("POLY_ADDRESS", "POLYMARKET_WALLET_ADDRESS"),
@@ -53,6 +60,11 @@ def trading_config() -> dict[str, Any]:
         "api_secret": _first_env("POLY_API_SECRET", "POLYMARKET_API_SECRET"),
         "api_passphrase": _first_env("POLY_API_PASSPHRASE", "POLYMARKET_API_PASSPHRASE"),
         "live_orders": bool(live),
+        "diurnal_orders": bool(diurnal_yes_orders),
+        "diurnal_yes_orders": bool(diurnal_yes_orders),
+        "diurnal_no_orders": bool(diurnal_no_orders),
+        "diurnal_order_usdc": float(as_float(os.environ.get("DIURNAL_ORDER_USDC"), 5.0) or 5.0),
+        "diurnal_min_price": float(as_float(os.environ.get("DIURNAL_MIN_PRICE"), 0.90) or 0.90),
         "max_order_usdc": float(as_float(os.environ.get("MAX_ORDER_USDC"), 5.0) or 5.0),
         "min_net_edge": float(as_float(os.environ.get("MIN_NET_EDGE"), 0.0075) or 0.0075),
         "max_ask": float(as_float(os.environ.get("MAX_ASK"), 0.995) or 0.995),
@@ -76,6 +88,11 @@ def public_trading_status() -> dict[str, Any]:
     cfg = trading_config()
     return {
         "live_orders": cfg["live_orders"],
+        "diurnal_orders": cfg["diurnal_yes_orders"],
+        "diurnal_yes_orders": cfg["diurnal_yes_orders"],
+        "diurnal_no_orders": cfg["diurnal_no_orders"],
+        "diurnal_order_usdc": cfg["diurnal_order_usdc"],
+        "diurnal_min_price": cfg["diurnal_min_price"],
         "has_private_key": cfg["has_private_key"],
         "has_api_creds": cfg["has_api_creds"],
         "has_funder": bool(cfg["funder"]),

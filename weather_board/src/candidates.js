@@ -11,6 +11,10 @@ const REASON_LABEL = {
   provisional_loser_sell_yes: "暂定输家，卖 Yes",
   source_final_loser_sell_yes: "源已终局，卖 Yes",
   dry_run_candidate_only: "匹配 Yes（dry-run）",
+  diurnal_max_winner_yes: "日变化 · 最高温 Yes",
+  diurnal_min_winner_yes: "日变化 · 最低温 Yes",
+  diurnal_max_loser_no: "日变化 · 最高温 No",
+  diurnal_min_loser_no: "日变化 · 最低温 No",
 };
 
 const state = {
@@ -222,6 +226,9 @@ function renderDetail() {
         ${fact("源状态", obs.status || "—")}
         ${fact("sample_set", (rule.source || {}).sample_set || "all")}
         ${lock.locked ? fact("锁", "No 已锁定") : ""}
+        ${(row.reason || "").startsWith("diurnal_") ? fact("策略", "日变化 DRY-RUN") : ""}
+        ${row.diurnal ? fact("触发", (row.diurnal.min_trigger_local && String(row.diurnal.metric || "").includes("min") ? row.diurnal.min_trigger_local : row.diurnal.max_trigger_local) || "—") : ""}
+        ${row.diurnal && row.diurnal.continuity ? fact("昨日对照", (row.diurnal.continuity.status || "—") + (row.diurnal.continuity.delta == null ? "" : " Δ" + row.diurnal.continuity.delta)) : ""}
       </div>
     </section>
     <section class="detail-card">

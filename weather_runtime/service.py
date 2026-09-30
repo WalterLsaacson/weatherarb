@@ -28,6 +28,7 @@ from .markets import (
 )
 from .discovery import discover_rules
 from .models import WeatherMarket, as_float, parse_time
+from .diurnal import DIURNAL_REASONS
 from .rules import (
     RuleError,
     bucket_for_outcome,
@@ -74,6 +75,8 @@ def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
                 "market_count": group.get("market_count"),
                 "matched_market_count": group.get("matched_market_count"),
                 "candidate_count": group.get("candidate_count"),
+                "diurnal_candidate_count": group.get("diurnal_candidate_count"),
+                "diurnal": group.get("diurnal"),
                 "status_counts": group.get("status_counts"),
                 "rows": _list_rows_for_board(group),
                 "markets": [],
@@ -82,23 +85,55 @@ def slim_board_groups(groups: Any) -> list[dict[str, Any]]:
     return slim
 
 
+def _is_diurnal_row(row: dict[str, Any]) -> bool:
+    return str(row.get("reason") or "") in DIURNAL_REASONS
+
+
+def _diurnal_side_enabled(cfg: dict[str, Any], row: dict[str, Any]) -> bool:
+    """Yes follows DIURNAL_YES_ORDERS, or DIURNAL_ORDERS when that key is absent."""
+
+    side = str(row.get("trade_side") or "").upper()
+    if side == "YES":
+        flag = cfg.get("diurnal_yes_orders")
+        if flag is None:
+            flag = cfg.get("diurnal_orders")
+        return bool(flag)
+    if side == "NO":
+        return bool(cfg.get("diurnal_no_orders"))
+    return False
+
+
 def _list_rows_for_board(group: dict[str, Any]) -> list[dict[str, Any]]:
     rows = [row for row in group.get("rows") or [] if isinstance(row, dict)]
     if not rows:
         return []
-    opportunities = [row for row in rows if row.get("status") == "opportunity"]
-    if opportunities:
-        def _edge(row: dict[str, Any]) -> float:
-            eco = row.get("economics") if isinstance(row.get("economics"), dict) else {}
-            try:
-                return float(eco.get("net_edge"))
-            except (TypeError, ValueError):
-                return -1.0
 
-        opportunities.sort(key=_edge, reverse=True)
-        chosen = opportunities[0]
+    def _edge(row: dict[str, Any]) -> float:
+        eco = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+        try:
+            return float(eco.get("net_edge"))
+        except (TypeError, ValueError):
+            return -1.0
+
+    finality = [
+        row
+        for row in rows
+        if row.get("status") == "opportunity" and not _is_diurnal_row(row)
+    ]
+    if finality:
+        finality.sort(key=_edge, reverse=True)
+        chosen = finality[0]
     else:
-        chosen = rows[0]
+        plain = [row for row in rows if not _is_diurnal_row(row)]
+        if plain:
+            chosen = plain[0]
+        else:
+            opportunities = [row for row in rows if row.get("status") == "opportunity"]
+            if opportunities:
+                opportunities.sort(key=_edge, reverse=True)
+                chosen = opportunities[0]
+            else:
+                chosen = rows[0]
     return [_list_row(chosen)]
 
 
@@ -346,6 +381,52 @@ def _fill_keys(record: Any) -> set[str]:
     return keys
 
 
+def _price_below(price: Any, minimum: Any) -> bool:
+    """True when ``price`` is strictly under ``minimum``. Equality still buys."""
+
+    try:
+        return float(price) + 1e-9 < float(minimum)
+    except (TypeError, ValueError):
+        return True
+
+
+def _diurnal_buy_settled(result: Any) -> bool:
+    """True when this sighting already bought, or deliberately did not."""
+
+    if not isinstance(result, dict):
+        return False
+    if result.get("ok"):
+        return True
+    error = str(result.get("error") or "")
+    if error in {
+        "diurnal_price_below_min",
+        "already_taken",
+        "diurnal_orders_disabled",
+        "diurnal_yes_orders_disabled",
+        "diurnal_no_orders_disabled",
+    }:
+        return True
+    order = result.get("order") if isinstance(result.get("order"), dict) else {}
+    status = str(order.get("status") or result.get("status") or "")
+    return status in {"submitted", "matched", "live", "error", "blocked"}
+
+
+def _diurnal_opportunity_keys(rows: Any) -> set[str]:
+    """Books already shown as diurnal opportunities. Later scans must not buy them."""
+
+    keys: set[str] = set()
+    if not isinstance(rows, list):
+        return keys
+    for row in rows:
+        if not isinstance(row, dict) or row.get("status") != "opportunity":
+            continue
+        if str(row.get("reason") or "") not in DIURNAL_REASONS:
+            continue
+        token = str(row.get("book_token_id") or row.get("winning_token_id") or "")
+        keys.update(_instrument_keys(row, token))
+    return keys
+
+
 def _instrument_keys(row: dict[str, Any], token_id: str = "") -> set[str]:
     keys: set[str] = set()
     token = str(token_id or row.get("book_token_id") or row.get("winning_token_id") or row.get("token_id") or "")
@@ -523,6 +604,8 @@ class RuntimeService:
         self.scan_in_progress = False
         self._extrema: dict[str, dict[str, Any]] = {}
         self._taken_tokens: set[str] = set()
+        self._diurnal_taken_tokens: set[str] = set()
+        self._diurnal_seen_tokens: set[str] = set()
         self._limit_taken_tokens: set[str] = set()
         self._limit_attempted_tokens: set[str] = set()
         self._open_limit_orders: dict[str, dict[str, Any]] = {}
@@ -530,7 +613,42 @@ class RuntimeService:
         self._last_data_cleanup_at = 0.0
         self._hydrate_last_result()
         self._hydrate_taken()
+        self._load_diurnal_seen()
         self._maybe_cleanup_data_dir(force=False)
+
+    def _diurnal_seen_path(self) -> Path:
+        return self.data_dir / "diurnal_seen.json"
+
+    def _load_diurnal_seen(self) -> None:
+        """Books we already bought or skipped stay ineligible across restarts."""
+
+        stored = load_json(self._diurnal_seen_path(), default=[])
+        if isinstance(stored, list):
+            self._diurnal_seen_tokens.update(str(item) for item in stored if item)
+        self._diurnal_seen_tokens.update(self._diurnal_taken_tokens)
+
+    def _remember_diurnal_book(self, keys: set[str]) -> None:
+        fresh = {str(key) for key in keys if key and key not in self._diurnal_seen_tokens}
+        if not fresh and keys <= self._diurnal_seen_tokens:
+            self._persist_diurnal_seen()
+            return
+        self._diurnal_seen_tokens.update(fresh)
+        self._persist_diurnal_seen()
+
+    def _forget_diurnal_book(self, keys: set[str]) -> None:
+        """Drop a sighting when no order was submitted, so a later scan can still buy."""
+
+        dropped = {str(key) for key in keys if key in self._diurnal_seen_tokens}
+        if not dropped:
+            return
+        self._diurnal_seen_tokens.difference_update(dropped)
+        self._persist_diurnal_seen()
+
+    def _persist_diurnal_seen(self) -> None:
+        try:
+            write_json_atomic(self._diurnal_seen_path(), sorted(self._diurnal_seen_tokens))
+        except OSError:
+            return
 
     def _catalog_path(self) -> Path:
         return self.data_dir / "weather_catalog.json"
@@ -593,6 +711,8 @@ class RuntimeService:
                                 "event_group_id": record.get("event_group_id"),
                                 "target_outcome": record.get("target_outcome"),
                             }
+                    elif str(record.get("reason") or "") in DIURNAL_REASONS:
+                        self._diurnal_taken_tokens.update(keys)
                     else:
                         self._taken_tokens.update(keys)
         except OSError:
@@ -830,7 +950,7 @@ class RuntimeService:
                 if not path.is_file():
                     continue
                 name = path.name
-                if name in {".cleanup_at", "orders.jsonl", "health.json", "latest.json"}:
+                if name in {".cleanup_at", "orders.jsonl", "health.json", "latest.json", "diurnal_seen.json"}:
                     continue
                 if name.endswith(_DATA_CLEANUP_DELETE_SUFFIXES) or name.endswith(".jsonl.old"):
                     try:
@@ -1297,7 +1417,11 @@ class RuntimeService:
         from .env import trading_config
 
         cfg = trading_config()
-        if not cfg["live_orders"] or self.fixture:
+        live_orders = bool(cfg.get("live_orders"))
+        diurnal_live = _diurnal_side_enabled(cfg, {"trade_side": "YES"}) or _diurnal_side_enabled(
+            cfg, {"trade_side": "NO"}
+        )
+        if self.fixture or (not live_orders and not diurnal_live):
             return []
         takes: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1310,8 +1434,26 @@ class RuntimeService:
             token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
             if not token_id:
                 continue
+            reason = str(row.get("reason") or "")
+            diurnal = reason in DIURNAL_REASONS
             keys = _instrument_keys(row, token_id)
-            if keys & self._taken_tokens or keys & self._limit_taken_tokens or token_id in seen:
+            if diurnal:
+                if not _diurnal_side_enabled(cfg, row):
+                    continue
+                if keys & self._diurnal_seen_tokens or token_id in seen:
+                    continue
+                self._diurnal_seen_tokens.update(keys)
+                economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+                scanned_ask = as_float(economics.get("best_ask"))
+                if scanned_ask is not None and _price_below(scanned_ask, cfg.get("diurnal_min_price")):
+                    self._persist_diurnal_seen()
+                    continue
+                if keys & self._diurnal_taken_tokens:
+                    self._persist_diurnal_seen()
+                    continue
+            elif not live_orders:
+                continue
+            elif keys & self._taken_tokens or keys & self._limit_taken_tokens or token_id in seen:
                 continue
             seen.add(token_id)
             event_id = str(row.get("event_group_id") or "")
@@ -1320,14 +1462,18 @@ class RuntimeService:
                 "LIVE auto-take {} {} {}".format(event_id, outcome, row.get("trade_side")),
                 flush=True,
             )
-            takes.append(
-                self.take_opportunity(
-                    event_group_id=event_id,
-                    target_outcome=outcome,
-                    live=True,
-                    require_locked_no=True,
-                )
+            taken = self.take_opportunity(
+                event_group_id=event_id,
+                target_outcome=outcome,
+                live=True,
+                require_locked_no=not diurnal,
+                token_ledger="diurnal" if diurnal else "finality",
             )
+            if diurnal and not _diurnal_buy_settled(taken):
+                self._forget_diurnal_book(keys)
+            elif diurnal:
+                self._persist_diurnal_seen()
+            takes.append(taken)
         return takes
 
     def _auto_place_limit_orders(self, result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1363,6 +1509,8 @@ class RuntimeService:
             if not token_id:
                 continue
             reason = str(row.get("match_reason") or row.get("reason") or "")
+            if reason in DIURNAL_REASONS or str(row.get("reason") or "") in DIURNAL_REASONS:
+                continue
             keys = _instrument_keys(row, token_id)
             if (
                 keys & self._taken_tokens
@@ -1649,6 +1797,7 @@ class RuntimeService:
         target_outcome: str = "",
         live: bool = False,
         require_locked_no: bool = True,
+        token_ledger: str = "finality",
     ) -> dict[str, Any]:
         from .env import trading_config
         from .models import utc_now
@@ -1705,9 +1854,10 @@ class RuntimeService:
         token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
         if not token_id:
             return {"ok": False, "error": "missing_token", "row": _slim_row(row)}
-        if live and (
-            _instrument_keys(row, token_id) & (self._taken_tokens | self._limit_taken_tokens)
-        ):
+        diurnal_ledger = token_ledger == "diurnal"
+        own_tokens = self._diurnal_taken_tokens if diurnal_ledger else self._taken_tokens
+        blocked_tokens = own_tokens if diurnal_ledger else (self._taken_tokens | self._limit_taken_tokens)
+        if live and (_instrument_keys(row, token_id) & blocked_tokens):
             return {
                 "ok": False,
                 "error": "already_taken",
@@ -1740,7 +1890,7 @@ class RuntimeService:
                     "error": "market_not_tradable",
                     "market_id": market.market_id,
                 }
-        order_budget = float(cfg["max_order_usdc"])
+        order_budget = float(cfg["diurnal_order_usdc"] if diurnal_ledger else cfg["max_order_usdc"])
         if live:
             try:
                 balance_usdc = float(fetch_collateral_usdc(cfg))
@@ -1750,13 +1900,17 @@ class RuntimeService:
         books = self.scanner.clob_client.fetch_books([token_id])
         row["status"] = "rule_matched"
         original_max_usdc = float(self.scanner.config.max_usdc)
+        original_diurnal_usdc = float(self.scanner.config.diurnal_order_usdc)
         original_target = float(self.scanner.config.target_shares)
         self.scanner.config.max_usdc = order_budget
+        if diurnal_ledger:
+            self.scanner.config.diurnal_order_usdc = order_budget
         self.scanner.config.target_shares = max(original_target, order_budget * 1000.0)
         try:
             self.scanner._evaluate_matched_row(row, books, {market.market_id: market}, utc_now())
         finally:
             self.scanner.config.max_usdc = original_max_usdc
+            self.scanner.config.diurnal_order_usdc = original_diurnal_usdc
             self.scanner.config.target_shares = original_target
         if row.get("status") != "opportunity":
             return {
@@ -1787,6 +1941,19 @@ class RuntimeService:
         min_order = float(economics.get("min_order_size") or 0.0)
         if price <= 0.0 or size <= 0.0:
             return {"ok": False, "error": "invalid_size_or_price", "row": _slim_row(row)}
+        if diurnal_ledger:
+            unit_price = as_float(economics.get("best_ask"))
+            if unit_price is None:
+                unit_price = price
+            min_price = float(cfg.get("diurnal_min_price") or 0.90)
+            if _price_below(unit_price, min_price):
+                return {
+                    "ok": False,
+                    "error": "diurnal_price_below_min",
+                    "price": unit_price,
+                    "min_price": min_price,
+                    "row": _slim_row(row),
+                }
         max_shares = order_budget / price
         size = min(size, max_shares)
         try:
@@ -1810,11 +1977,12 @@ class RuntimeService:
                 error = "insufficient_balance"
             return {"ok": False, "error": error, "price": price, "size": size, "budget_usdc": order_budget}
         if min_order > 0 and size + 1e-12 < min_order:
-            below_balance = live and order_budget < float(cfg["max_order_usdc"])
+            cap = float(cfg["diurnal_order_usdc"] if diurnal_ledger else cfg["max_order_usdc"])
+            below_balance = live and order_budget + 1e-9 < cap
             return {
                 "ok": False,
                 "error": "insufficient_balance" if below_balance else "max_usdc_below_min_order",
-                "max_order_usdc": cfg["max_order_usdc"],
+                "max_order_usdc": cap,
                 "budget_usdc": order_budget,
                 "min_order_size": min_order,
                 "price": price,
@@ -1840,20 +2008,36 @@ class RuntimeService:
             "live_requested": bool(live),
         }
         if live:
-            if not cfg["live_orders"]:
+            side = str(row.get("trade_side") or "").upper()
+            if diurnal_ledger:
+                live_allowed = _diurnal_side_enabled(cfg, row)
+                if side == "NO":
+                    disabled = "diurnal_no_orders_disabled"
+                    hint = "Set DIURNAL_NO_ORDERS=true in .env to buy diurnal No"
+                else:
+                    disabled = "diurnal_yes_orders_disabled"
+                    hint = "Set DIURNAL_YES_ORDERS=true in .env to buy diurnal Yes"
+            else:
+                live_allowed = bool(cfg.get("live_orders"))
+                disabled = "live_orders_disabled"
+                hint = "Set LIVE_ORDERS=true in .env, then pass --live"
+            if not live_allowed:
                 record["status"] = "blocked"
-                record["error"] = "live_orders_disabled"
+                record["error"] = disabled
                 append_jsonl(self.data_dir / "orders.jsonl", [record])
                 return {
                     "ok": False,
-                    "error": "live_orders_disabled",
-                    "hint": "Set LIVE_ORDERS=true in .env, then pass --live",
+                    "error": record["error"],
+                    "hint": hint,
                     "order": record,
                     "trading": self.trading_status(),
                 }
+            submit_cfg = dict(cfg)
+            if diurnal_ledger:
+                submit_cfg["diurnal_live_submit"] = True
             with self.lock:
                 fill_keys = _instrument_keys(row, token_id)
-                if fill_keys & self._taken_tokens:
+                if fill_keys & own_tokens or (not diurnal_ledger and fill_keys & self._limit_taken_tokens):
                     return {
                         "ok": False,
                         "error": "already_taken",
@@ -1861,14 +2045,14 @@ class RuntimeService:
                         "event_group_id": row.get("event_group_id"),
                         "target_outcome": row.get("target_outcome"),
                     }
-                self._taken_tokens.update(fill_keys)
+                own_tokens.update(fill_keys)
             try:
                 submit = submit_fak_sell if order_side == "SELL" else submit_fak_buy
                 exchange = submit(
                     token_id=token_id,
                     price=price,
                     size=size,
-                    config=cfg,
+                    config=submit_cfg,
                 )
                 record["exchange"] = exchange
                 if isinstance(exchange, dict):
@@ -1879,14 +2063,14 @@ class RuntimeService:
                     record["status"] = "submitted"
             except LiveOrderError as exc:
                 with self.lock:
-                    self._taken_tokens.difference_update(fill_keys)
+                    own_tokens.difference_update(fill_keys)
                 record["status"] = "error"
                 record["error"] = str(exc)
                 append_jsonl(self.data_dir / "orders.jsonl", [record])
                 return {"ok": False, "error": str(exc), "order": record}
             except Exception as exc:  # noqa: BLE001
                 with self.lock:
-                    self._taken_tokens.difference_update(fill_keys)
+                    own_tokens.difference_update(fill_keys)
                 record["status"] = "error"
                 record["error"] = str(exc)
                 append_jsonl(self.data_dir / "orders.jsonl", [record])

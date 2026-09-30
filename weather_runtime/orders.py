@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Optional
@@ -39,20 +40,39 @@ def quantize_buy(
     *,
     tick_size: Optional[float] = None,
 ) -> tuple[float, float]:
-    """FAK buys: snap price to market tick and cap size by USDC budget."""
+    """FAK buys: snap price to the tick and keep the USDC notional in cents.
+
+    Market buys reject a maker amount finer than 2 decimals and a share
+    size finer than 2 decimals. 0.99 * 5.05 is 4.9995, so the size steps
+    down to the largest 0.01 lot whose product is an exact cent.
+    """
 
     cent = Decimal("0.01")
+    share_q = Decimal("0.01")
     tick = _tick_quantum(tick_size)
     px = Decimal(str(price)).quantize(tick, rounding=ROUND_DOWN)
     if px <= 0:
         raise LiveOrderError("invalid_price")
     budget = Decimal(str(max_usdc)).quantize(cent, rounding=ROUND_DOWN)
-    shares = Decimal(str(size)).quantize(cent, rounding=ROUND_DOWN)
+    shares = Decimal(str(size)).quantize(share_q, rounding=ROUND_DOWN)
     if shares <= 0:
         raise LiveOrderError("invalid_size")
     if px * shares > budget:
-        shares = (budget / px).quantize(cent, rounding=ROUND_DOWN)
+        shares = (budget / px).quantize(share_q, rounding=ROUND_DOWN)
     if shares <= 0:
+        raise LiveOrderError("cannot_quantize_buy_amount")
+    scale = max(0, -px.as_tuple().exponent)
+    p_int = int((px * (Decimal(10) ** scale)).to_integral_value())
+    if p_int <= 0:
+        raise LiveOrderError("invalid_price")
+    step = (10**scale) // math.gcd(p_int, 10**scale)
+    lots = int((shares / share_q).to_integral_value(rounding=ROUND_DOWN))
+    lots -= lots % step
+    if lots <= 0:
+        raise LiveOrderError("cannot_quantize_buy_amount")
+    shares = share_q * lots
+    maker = px * shares
+    if maker <= 0 or maker > budget or maker != maker.quantize(cent):
         raise LiveOrderError("cannot_quantize_buy_amount")
     return float(px), float(shares)
 
@@ -272,7 +292,7 @@ def _submit_order(
     from .env import trading_config
 
     cfg = dict(config or trading_config())
-    if not cfg.get("live_orders"):
+    if not cfg.get("live_orders") and not cfg.get("diurnal_live_submit"):
         raise LiveOrderError("LIVE_ORDERS is not true")
     client = _secure_client(cfg)
     try:

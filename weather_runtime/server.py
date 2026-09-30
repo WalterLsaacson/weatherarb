@@ -371,6 +371,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         require_explicit_fee=not args.allow_category_fee,
         max_usdc=float(trading["max_order_usdc"]),
+        diurnal_order_usdc=float(trading["diurnal_order_usdc"]),
         target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
     )
     live = bool(trading["live_orders"])
@@ -413,6 +414,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
     else:
         print("Mode → dry-run/read-only", flush=True)
+    diurnal_sides = [
+        label
+        for label, enabled in (
+            ("Yes", trading.get("diurnal_yes_orders")),
+            ("No", trading.get("diurnal_no_orders")),
+        )
+        if enabled
+    ]
+    if diurnal_sides:
+        print(
+            "Diurnal → LIVE {} · max {} USDC · floor {}".format(
+                " ".join(diurnal_sides),
+                trading.get("diurnal_order_usdc"),
+                trading.get("diurnal_min_price"),
+            ),
+            flush=True,
+        )
     if not args.no_open:
         threading.Timer(0.3, lambda: webbrowser.open(board_url)).start()
     try:

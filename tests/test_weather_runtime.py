@@ -1575,6 +1575,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
             (data / "source_observations.jsonl").write_text(
                 json.dumps(
                     {
@@ -1592,7 +1593,7 @@ class WeatherRuntimeTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            service = RuntimeService(root=ROOT, data_dir=data, sync=True)
+            service._series_index = None
             detail = service.event_detail(event_id)
             self.assertIsNotNone(detail)
             series = (detail or {}).get("source_series") or []
@@ -3446,20 +3447,25 @@ class WeatherRuntimeTests(unittest.TestCase):
     def test_quantize_buy_uses_tick_and_caps_usdc(self) -> None:
         from decimal import Decimal
 
-        from weather_runtime.orders import quantize_buy
+        from weather_runtime.orders import LiveOrderError, quantize_buy
 
         price, size = quantize_buy(0.58, 8.620689655172415, 5.0, tick_size=0.01)
         maker = Decimal(str(price)) * Decimal(str(size))
         self.assertLessEqual(maker, Decimal("5.0"))
+        self.assertEqual(maker, maker.quantize(Decimal("0.01")))
         self.assertEqual(Decimal(str(price)), Decimal("0.58"))
 
         price, size = quantize_buy(0.001, 5000.0, 5.0, tick_size=0.001)
         self.assertEqual(Decimal(str(price)), Decimal("0.001"))
         self.assertEqual(Decimal(str(size)), Decimal("5000.0"))
 
-        price, size = quantize_buy(0.001, 1.0, 5.0, tick_size=0.001)
-        self.assertEqual(Decimal(str(price)), Decimal("0.001"))
-        self.assertEqual(Decimal(str(size)), Decimal("1.0"))
+        with self.assertRaises(LiveOrderError):
+            quantize_buy(0.001, 1.0, 5.0, tick_size=0.001)
+
+        price, size = quantize_buy(0.99, 5.05050505050505, 5.0, tick_size=0.01)
+        self.assertEqual(Decimal(str(price)), Decimal("0.99"))
+        self.assertEqual(Decimal(str(size)), Decimal("5.00"))
+        self.assertEqual(Decimal(str(price)) * Decimal(str(size)), Decimal("4.95"))
 
     def test_live_take_skips_already_filled_token(self) -> None:
         from unittest.mock import patch
