@@ -118,7 +118,6 @@ const DIURNAL_INFLUENCE_LABELS = {
 
 function diurnalPhaseLabel(diurnal) {
   if (!diurnal) return "—";
-  if (diurnal.city_class !== "A") return "非A类";
   if (diurnal.phase === "regime_change" || (diurnal.continuity || {}).status === "regime_change") return "变天不买";
   if (diurnal.phase === "trend_unlearned" || diurnal.phase === "weather_mismatch") return "不可买";
   if (diurnal.trigger || diurnal.phase === "ready") return "可买";

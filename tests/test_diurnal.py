@@ -380,13 +380,16 @@ class DiurnalTests(unittest.TestCase):
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(minimum["learned_min_valid"])
+        self.assertTrue(minimum["learned_min_valid"])
         self.assertTrue(minimum["learned_max_valid"])
-        self.assertFalse(minimum["trigger"])
-        self.assertEqual(minimum["block_reason"], "multiple_trends")
-        self.assertEqual(minimum["phase"], "trend_unlearned")
+        self.assertEqual(minimum["yesterday_min_at_local"], "2026-09-06 03:00")
+        self.assertEqual(minimum["learned_min_buy_local"], "2026-09-07 05:00")
+        self.assertTrue(minimum["trigger"])
+        self.assertEqual(minimum["block_reason"], "")
+        self.assertEqual(minimum["phase"], "ready")
         self.assertTrue(maximum["learned_max_valid"])
-        self.assertFalse(maximum["learned_min_valid"])
+        self.assertTrue(maximum["learned_min_valid"])
+        self.assertEqual(maximum["yesterday_max_at_local"], "2026-09-06 15:00")
         self.assertEqual(maximum["learned_max_buy_local"], "2026-09-07 17:00")
         self.assertTrue(maximum["trigger"])
 
@@ -415,7 +418,9 @@ class DiurnalTests(unittest.TestCase):
             observation_status="intraday",
         )
         self.assertTrue(payload["learned_min_valid"])
-        self.assertFalse(payload["learned_max_valid"])
+        self.assertTrue(payload["learned_max_valid"])
+        self.assertEqual(payload["yesterday_max_at_local"], "2026-09-06 01:00")
+        self.assertEqual(payload["learned_max_buy_local"], "2026-09-07 03:00")
         self.assertEqual(payload["learned_min_buy_local"], "2026-09-07 07:00")
         self.assertTrue(payload["trigger"])
         late = build_diurnal(
@@ -465,11 +470,13 @@ class DiurnalTests(unittest.TestCase):
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(payload["learned_max_valid"])
+        self.assertTrue(payload["learned_max_valid"])
         self.assertTrue(payload["learned_min_valid"])
-        self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["block_reason"], "multiple_trends")
-        self.assertEqual(payload["phase"], "trend_unlearned")
+        self.assertEqual(payload["yesterday_max_at_local"], "2026-09-06 16:00")
+        self.assertEqual(payload["learned_max_buy_local"], "2026-09-07 18:00")
+        self.assertTrue(payload["trigger"])
+        self.assertEqual(payload["block_reason"], "")
+        self.assertEqual(payload["phase"], "ready")
 
     def test_weather_mismatch_blocks_a_learned_window(self) -> None:
         zone = load_timezone("America/Los_Angeles")
@@ -526,7 +533,7 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(unknown["phase"], "weather_mismatch")
         self.assertFalse(unknown["trigger"])
 
-    def test_flat_day_does_not_validate_either_side(self) -> None:
+    def test_flat_day_learns_the_last_reading(self) -> None:
         yesterday = [_point("2026-09-06 {:02d}:00".format(hour), 20) for hour in range(0, 23)]
         today = [
             _point("2026-09-07 08:00", 18),
@@ -547,14 +554,17 @@ class DiurnalTests(unittest.TestCase):
             running_value=27,
             observation_status="intraday",
         )
-        self.assertFalse(payload["learned_max_valid"])
-        self.assertFalse(payload["learned_min_valid"])
+        self.assertTrue(payload["learned_max_valid"])
+        self.assertTrue(payload["learned_min_valid"])
+        self.assertEqual(payload["yesterday_max_at_local"], "2026-09-06 22:00")
+        self.assertEqual(payload["yesterday_min_at_local"], "2026-09-06 22:00")
+        self.assertEqual(payload["learned_max_buy_local"], "2026-09-08 00:00")
         self.assertTrue(payload["max_window_start_local"])
         self.assertFalse(payload["trigger"])
-        self.assertEqual(payload["block_reason"], "no_trend")
-        self.assertEqual(payload["phase"], "trend_unlearned")
+        self.assertEqual(payload["block_reason"], "before_learned_buy")
+        self.assertEqual(payload["phase"], "pending")
 
-    def test_only_class_a_can_trigger_and_breeze_is_metadata(self) -> None:
+    def test_city_class_is_metadata_and_every_station_can_trigger(self) -> None:
         from weather_runtime.station_tz import DIURNAL_CLASS_A, STATION_COORDS
 
         self.assertEqual(len(DIURNAL_CLASS_A), 36)
@@ -582,7 +592,7 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(chicago["city_class"], "A")
         self.assertEqual(chicago["influences"], ["lake_breeze", "heat_island"])
         self.assertTrue(chicago["trigger"])
-        excluded = build_diurnal(
+        san_francisco = build_diurnal(
             station_id="KSFO",
             timezone_name="America/Los_Angeles",
             local_date="2026-09-07",
@@ -594,11 +604,11 @@ class DiurnalTests(unittest.TestCase):
             running_value=27,
             observation_status="intraday",
         )
-        self.assertEqual(excluded["city_class"], "")
-        self.assertEqual(excluded["influences"], [])
-        self.assertFalse(excluded["trigger"])
-        self.assertEqual(excluded["block_reason"], "city_class")
-        self.assertEqual(excluded["phase"], "excluded")
+        self.assertEqual(san_francisco["city_class"], "")
+        self.assertEqual(san_francisco["influences"], [])
+        self.assertTrue(san_francisco["trigger"])
+        self.assertEqual(san_francisco["block_reason"], "")
+        self.assertEqual(san_francisco["phase"], "ready")
 
     def test_previous_day_bounds_use_station_local_clock(self) -> None:
         from weather_runtime.models import ObservationEvidence, WeatherRule

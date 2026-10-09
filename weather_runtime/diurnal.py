@@ -492,46 +492,6 @@ def _day_temps(
     return temps
 
 
-def _trend_segments(
-    temps: list[tuple[datetime, float]],
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Split yesterday into falling and rising runs.
-
-    A flat step stays with the run already in progress. A run that is still
-    falling or rising at the last point still counts; it does not have to turn.
-    """
-
-    falls: list[tuple[int, int]] = []
-    rises: list[tuple[int, int]] = []
-    direction = ""
-    start = 0
-    for index in range(1, len(temps)):
-        delta = temps[index][1] - temps[index - 1][1]
-        if abs(delta) <= 1e-6:
-            continue
-        new_direction = "up" if delta > 0 else "down"
-        if not direction:
-            direction = new_direction
-            start = 0
-            continue
-        if new_direction == direction:
-            continue
-        segment = (start, index - 1)
-        if direction == "up":
-            rises.append(segment)
-        else:
-            falls.append(segment)
-        direction = new_direction
-        start = index - 1
-    if direction:
-        segment = (start, len(temps) - 1)
-        if direction == "up":
-            rises.append(segment)
-        else:
-            falls.append(segment)
-    return falls, rises
-
-
 def _segment_anchor(
     temps: list[tuple[datetime, float]],
     segment: tuple[int, int],
@@ -545,11 +505,23 @@ def _segment_anchor(
     return max(hits)
 
 
+def _extreme_anchor(
+    temps: list[tuple[datetime, float]],
+    *,
+    pick_min: bool,
+) -> Optional[datetime]:
+    """Last time yesterday's highest or lowest temperature was observed."""
+
+    if not temps:
+        return None
+    return _segment_anchor(temps, (0, len(temps) - 1), pick_min=pick_min)
+
+
 def _learned_window(
     anchor: datetime,
     day: date,
 ) -> tuple[datetime, datetime, datetime]:
-    """One hour from yesterday's trend end, stamped onto today, buy an hour later."""
+    """One hour from yesterday's extreme, stamped onto today, buy an hour later."""
 
     start = _on_date(anchor, day)
     end = start + timedelta(hours=1)
@@ -638,7 +610,6 @@ def build_diurnal(
     yesterday_points = _counted_points(yesterday_series or [], zone, current + timedelta(days=2))
     previous_day = day - timedelta(days=1)
     yesterday_temps = _day_temps(yesterday_points, previous_day)
-    falls, rises = _trend_segments(yesterday_temps)
     learned: dict[str, Optional[datetime]] = {
         "min_start": None,
         "min_end": None,
@@ -649,22 +620,15 @@ def build_diurnal(
         "max_buy": None,
         "max_anchor": None,
     }
-    trend_counts = {"daily_min": len(falls), "daily_max": len(rises)}
-    if len(falls) == 1:
-        anchor = _segment_anchor(yesterday_temps, falls[0], pick_min=True)
+    for pick_min, prefix in ((True, "min"), (False, "max")):
+        anchor = _extreme_anchor(yesterday_temps, pick_min=pick_min)
+        if anchor is None:
+            continue
         start, end, buy_at = _learned_window(anchor, day)
-        learned["min_anchor"] = anchor
-        learned["min_start"] = start
-        learned["min_end"] = end
-        learned["min_buy"] = buy_at
-    if len(rises) == 1:
-        anchor = _segment_anchor(yesterday_temps, rises[0], pick_min=False)
-        start, end, buy_at = _learned_window(anchor, day)
-        learned["max_anchor"] = anchor
-        learned["max_start"] = start
-        learned["max_end"] = end
-        learned["max_buy"] = buy_at
-    trend_count = trend_counts.get(metric)
+        learned[prefix + "_anchor"] = anchor
+        learned[prefix + "_start"] = start
+        learned[prefix + "_end"] = end
+        learned[prefix + "_buy"] = buy_at
     trigger_at = learned["min_buy"] if metric == "daily_min" else learned["max_buy"]
     yesterday_weather = classify_weather(yesterday_series or [], zone, current + timedelta(days=2))
     weather_matches = (
@@ -686,8 +650,8 @@ def build_diurnal(
         block_reason = "sample_count"
     elif metric not in {"daily_min", "daily_max"}:
         block_reason = "metric_unsupported"
-    elif trend_count != 1:
-        block_reason = "multiple_trends" if trend_count and trend_count > 1 else "no_trend"
+    elif not yesterday_temps:
+        block_reason = "no_trend"
     elif not weather_matches:
         block_reason = "weather_mismatch"
     elif trigger_at is None or current < trigger_at:
@@ -701,7 +665,7 @@ def build_diurnal(
     phase = "pending"
     if continuity.get("status") == "regime_change":
         phase = "regime_change"
-    elif metric in {"daily_min", "daily_max"} and trend_count != 1:
+    elif metric in {"daily_min", "daily_max"} and not yesterday_temps:
         phase = "trend_unlearned"
     elif metric in {"daily_min", "daily_max"} and not weather_matches:
         phase = "weather_mismatch"
@@ -710,12 +674,6 @@ def build_diurnal(
     elif passed and block_reason not in {"sample_count", "convective_ongoing", "still_falling"}:
         phase = "passed"
     city_class = diurnal_city_class(station_id)
-    if city_class != "A":
-        if trigger:
-            block_reason = "city_class"
-        trigger = False
-        if phase == "ready":
-            phase = "excluded"
     return {
         "station_id": str(station_id or "").strip().upper(),
         "local_date": day.isoformat(),
@@ -732,8 +690,8 @@ def build_diurnal(
         "max_window_end_local": _fmt_local(max_end),
         "min_trigger_local": _fmt_local(learned["min_buy"]) if learned["min_buy"] else "",
         "max_trigger_local": _fmt_local(learned["max_buy"]) if learned["max_buy"] else "",
-        "learned_min_valid": len(falls) == 1,
-        "learned_max_valid": len(rises) == 1,
+        "learned_min_valid": learned["min_anchor"] is not None,
+        "learned_max_valid": learned["max_anchor"] is not None,
         "learned_min_start_local": _fmt_local(learned["min_start"]) if learned["min_start"] else "",
         "learned_min_end_local": _fmt_local(learned["min_end"]) if learned["min_end"] else "",
         "learned_min_buy_local": _fmt_local(learned["min_buy"]) if learned["min_buy"] else "",

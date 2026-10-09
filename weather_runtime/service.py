@@ -1485,6 +1485,7 @@ class RuntimeService:
             LiveOrderError,
             fetch_collateral_usdc,
             limit_price_for_tick,
+            order_usdc_below_balance,
             quantize_limit_buy,
             submit_gtc_buy,
         )
@@ -1568,14 +1569,12 @@ class RuntimeService:
                             "detail": str(exc),
                         }
                     ]
-                balance_loaded = True
                 print(
                     "LIMIT balance {:.4f} USDC · cap {:.4f}".format(remaining_usdc, max_usdc),
                     flush=True,
                 )
+                balance_loaded = True
             budget = float(max_usdc)
-            if remaining_usdc is not None:
-                budget = min(budget, max(0.0, float(remaining_usdc)))
             price = limit_price_for_tick(tick_size, price=base_price, price_001=price_001)
             band_max = max(max_price, price_001) if abs(float(tick_size) - 0.001) <= 1e-9 else max_price
             if price < min_price or price > band_max + 1e-12:
@@ -1594,6 +1593,13 @@ class RuntimeService:
                 )
                 continue
             try:
+                if remaining_usdc is not None:
+                    balance = max(0.0, float(remaining_usdc))
+                    budget = min(budget, balance)
+                    # Fee is added on top of notional. When the balance is the cap,
+                    # floor to a whole USDC and leave 2 so the order amount fits.
+                    if balance - budget < 2:
+                        budget = order_usdc_below_balance(budget)
                 px, size = quantize_limit_buy(
                     price,
                     budget,
@@ -1623,6 +1629,8 @@ class RuntimeService:
                         "min_order_size": min_order,
                     }
                 )
+                if error == "insufficient_balance":
+                    break
                 continue
             if px < min_price or px > band_max + 1e-12:
                 placed.append(
@@ -1693,8 +1701,6 @@ class RuntimeService:
                         "event_group_id": row.get("event_group_id"),
                         "target_outcome": row.get("target_outcome"),
                     }
-                    if remaining_usdc is not None:
-                        remaining_usdc = max(0.0, float(remaining_usdc) - notional)
                 except LiveOrderError as exc:
                     record.update({"ok": False, "status": "error", "error": str(exc)})
             else:
@@ -1804,6 +1810,7 @@ class RuntimeService:
         from .orders import (
             LiveOrderError,
             fetch_collateral_usdc,
+            order_usdc_below_balance,
             quantize_buy,
             quantize_sell,
             submit_fak_buy,
@@ -1897,6 +1904,16 @@ class RuntimeService:
             except LiveOrderError as exc:
                 return {"ok": False, "error": "balance_fetch_failed", "detail": str(exc)}
             order_budget = min(order_budget, max(0.0, balance_usdc))
+            if balance_usdc - order_budget < 2:
+                try:
+                    order_budget = order_usdc_below_balance(order_budget)
+                except LiveOrderError:
+                    return {
+                        "ok": False,
+                        "error": "insufficient_balance",
+                        "token_id": token_id,
+                        "balance_usdc": balance_usdc,
+                    }
         books = self.scanner.clob_client.fetch_books([token_id])
         row["status"] = "rule_matched"
         original_max_usdc = float(self.scanner.config.max_usdc)

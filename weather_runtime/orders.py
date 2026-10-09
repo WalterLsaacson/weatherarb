@@ -118,6 +118,16 @@ def fetch_collateral_usdc(config: Optional[dict[str, Any]] = None) -> float:
     return float(units) / 1_000_000.0
 
 
+def order_usdc_below_balance(amount: float) -> float:
+    """Floor a balance-sized budget to whole USDC, then subtract 2 for fee headroom."""
+
+    whole = Decimal(str(amount)).to_integral_value(rounding=ROUND_DOWN)
+    budget = whole - Decimal(2)
+    if budget <= 0:
+        raise LiveOrderError("invalid_max_usdc")
+    return float(budget)
+
+
 def limit_price_for_tick(
     tick_size: Optional[float],
     *,

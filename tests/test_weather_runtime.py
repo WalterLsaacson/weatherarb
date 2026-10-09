@@ -3984,6 +3984,15 @@ class WeatherRuntimeTests(unittest.TestCase):
             quantize_limit_buy(0.99, 5.0, tick_size=0.001, min_order=10.0)
         self.assertEqual(str(raised.exception), "limit_order_exceeds_usdc")
 
+    def test_order_usdc_below_balance_floors_then_subtracts_two(self) -> None:
+        from weather_runtime.orders import LiveOrderError, order_usdc_below_balance
+
+        self.assertEqual(order_usdc_below_balance(171.554493), 169.0)
+        self.assertEqual(order_usdc_below_balance(1000), 998.0)
+        with self.assertRaises(LiveOrderError) as raised:
+            order_usdc_below_balance(2.9)
+        self.assertEqual(str(raised.exception), "invalid_max_usdc")
+
     def test_quantize_limit_buy_keeps_exchange_min_order_precision(self) -> None:
         from weather_runtime.orders import quantize_limit_buy
 
@@ -4303,11 +4312,64 @@ class WeatherRuntimeTests(unittest.TestCase):
                     ) as submit:
                         placed = service._auto_place_limit_orders(result)
             submit.assert_called_once()
-            # min(100, 20) / 0.995 → 20.10 shares
-            self.assertAlmostEqual(submit.call_args.kwargs["size"], 20.10)
+            # floor(min(100, 20)) - 2 = 18; 18 / 0.995 → 18.09 shares
+            self.assertAlmostEqual(submit.call_args.kwargs["size"], 18.09)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["budget_usdc"], 20.0)
+            self.assertAlmostEqual(placed[0]["budget_usdc"], 18.0)
             self.assertAlmostEqual(placed[0]["balance_usdc"], 20.0)
+
+    def test_auto_place_limit_orders_floors_balance_then_subtracts_two(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            result = {"summary": {}, "rows": self._final_limit_rows()[:1]}
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "1000",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=171.554493):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        return_value={"ok": True, "status": "live", "order_id": "gtc-headroom"},
+                    ) as submit:
+                        placed = service._auto_place_limit_orders(result)
+            submit.assert_called_once()
+            # floor(171.554493) - 2 = 169; 169 / 0.995 → 169.84 shares
+            self.assertAlmostEqual(submit.call_args.kwargs["size"], 169.84)
+            self.assertAlmostEqual(placed[0]["budget_usdc"], 169.0)
+            self.assertAlmostEqual(placed[0]["balance_usdc"], 171.5545)
+
+    def test_auto_place_limit_orders_repeats_balance_size_while_unfilled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
+            rows = self._final_limit_rows()
+            env = {
+                "LIMIT_ORDERS": "true",
+                "LIVE_ORDERS": "true",
+                "LIMIT_ORDER_USDC": "1000",
+                "LIMIT_ORDER_PRICE": "0.99",
+                "LIMIT_ORDER_PRICE_001": "0.995",
+                "LIMIT_ORDER_MIN_PRICE": "0.01",
+                "LIMIT_ORDER_MAX_PRICE": "0.99",
+            }
+            with patch.dict("os.environ", env, clear=False):
+                with patch("weather_runtime.orders.fetch_collateral_usdc", return_value=171.554493):
+                    with patch(
+                        "weather_runtime.orders.submit_gtc_buy",
+                        return_value={"ok": True, "status": "live", "order_id": "gtc-once"},
+                    ) as submit:
+                        first = service._auto_place_limit_orders({"summary": {}, "rows": rows[:1]})
+                        second = service._auto_place_limit_orders({"summary": {}, "rows": rows[1:2]})
+            self.assertEqual(submit.call_count, 2)
+            self.assertTrue(first[0]["ok"])
+            self.assertTrue(second[0]["ok"])
+            self.assertAlmostEqual(first[0]["size"], 169.84)
+            self.assertAlmostEqual(second[0]["size"], 169.84)
 
     def test_auto_place_limit_orders_skips_when_balance_below_min(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -4331,7 +4393,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             self.assertFalse(placed[0]["ok"])
             self.assertEqual(placed[0]["error"], "insufficient_balance")
 
-    def test_auto_place_limit_orders_decrements_balance_across_rows(self) -> None:
+    def test_auto_place_limit_orders_uses_same_balance_size_on_each_row(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             service = RuntimeService(root=ROOT, data_dir=Path(temp) / "data", sync=False)
             result = {"summary": {}, "rows": self._final_limit_rows()[:2]}
@@ -4351,12 +4413,13 @@ class WeatherRuntimeTests(unittest.TestCase):
                         return_value={"ok": True, "status": "live", "order_id": "gtc-x"},
                     ) as submit:
                         placed = service._auto_place_limit_orders(result)
-            self.assertEqual(submit.call_count, 1)
+            self.assertEqual(submit.call_count, 2)
             self.assertEqual(len(placed), 2)
             self.assertTrue(placed[0]["ok"])
-            self.assertAlmostEqual(placed[0]["size"], 25.12)  # 25 / 0.995
-            self.assertFalse(placed[1]["ok"])
-            self.assertEqual(placed[1]["error"], "insufficient_balance")
+            self.assertTrue(placed[1]["ok"])
+            # floor(25) - 2 = 23; 23 / 0.995, and an unfilled bid does not shrink the next one.
+            self.assertAlmostEqual(placed[0]["size"], 23.11)
+            self.assertAlmostEqual(placed[1]["size"], 23.11)
 
     def test_auto_place_limit_orders_skips_after_fak_token(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
