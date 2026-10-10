@@ -478,6 +478,53 @@ class DiurnalTests(unittest.TestCase):
         self.assertEqual(payload["block_reason"], "")
         self.assertEqual(payload["phase"], "ready")
 
+    def test_precip_skips_the_daily_min(self) -> None:
+        zone = load_timezone("America/Los_Angeles")
+        yesterday = [
+            _point("2026-09-06 02:00", 16, "OVC", "precip"),
+            _point("2026-09-06 04:00", 8, "OVC", "precip"),
+            _point("2026-09-06 16:00", 22, "OVC", "precip"),
+        ]
+        today = [
+            _point("2026-09-07 04:00", 15, "OVC", "precip"),
+            _point("2026-09-07 08:00", 18, "OVC", "precip"),
+            _point("2026-09-07 12:00", 24, "OVC", "precip"),
+            _point("2026-09-07 16:00", 27, "OVC", "precip"),
+        ]
+        minimum = build_diurnal(
+            station_id="KATL",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_min",
+            unit="C",
+            series=today,
+            yesterday_series=yesterday,
+            now=datetime(2026, 9, 7, 12, 0, tzinfo=zone),
+            running_value=15,
+            observation_status="intraday",
+        )
+        maximum = build_diurnal(
+            station_id="KATL",
+            timezone_name="America/Los_Angeles",
+            local_date="2026-09-07",
+            metric="daily_max",
+            unit="C",
+            series=today,
+            yesterday_series=yesterday,
+            now=datetime(2026, 9, 7, 20, 0, tzinfo=zone),
+            running_value=27,
+            observation_status="intraday",
+        )
+        self.assertEqual(minimum["weather_class"], "precip")
+        self.assertEqual(minimum["yesterday_weather_class"], "precip")
+        self.assertTrue(minimum["learned_min_valid"])
+        self.assertFalse(minimum["trigger"])
+        self.assertEqual(minimum["block_reason"], "precip_min")
+        self.assertEqual(minimum["phase"], "precip_min")
+        self.assertTrue(maximum["trigger"])
+        self.assertEqual(maximum["block_reason"], "")
+        self.assertEqual(maximum["phase"], "ready")
+
     def test_weather_mismatch_blocks_a_learned_window(self) -> None:
         zone = load_timezone("America/Los_Angeles")
         yesterday = [

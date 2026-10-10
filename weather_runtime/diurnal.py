@@ -654,6 +654,8 @@ def build_diurnal(
         block_reason = "no_trend"
     elif not weather_matches:
         block_reason = "weather_mismatch"
+    elif metric == "daily_min" and weather_class == "precip":
+        block_reason = "precip_min"
     elif trigger_at is None or current < trigger_at:
         block_reason = "before_learned_buy"
     elif metric == "daily_min" and _convective_ongoing(points):
@@ -669,6 +671,8 @@ def build_diurnal(
         phase = "trend_unlearned"
     elif metric in {"daily_min", "daily_max"} and not weather_matches:
         phase = "weather_mismatch"
+    elif metric == "daily_min" and weather_class == "precip":
+        phase = "precip_min"
     elif trigger:
         phase = "ready"
     elif passed and block_reason not in {"sample_count", "convective_ongoing", "still_falling"}:

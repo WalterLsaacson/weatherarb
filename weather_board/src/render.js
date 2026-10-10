@@ -119,7 +119,7 @@ const DIURNAL_INFLUENCE_LABELS = {
 function diurnalPhaseLabel(diurnal) {
   if (!diurnal) return "—";
   if (diurnal.phase === "regime_change" || (diurnal.continuity || {}).status === "regime_change") return "变天不买";
-  if (diurnal.phase === "trend_unlearned" || diurnal.phase === "weather_mismatch") return "不可买";
+  if (diurnal.phase === "trend_unlearned" || diurnal.phase === "weather_mismatch" || diurnal.phase === "precip_min") return "不可买";
   if (diurnal.trigger || diurnal.phase === "ready") return "可买";
   if (diurnal.phase === "passed") return "已过";
   return "未到";
@@ -318,7 +318,7 @@ function renderObservationTable(detail) {
       start: diurnal.learned_min_start_local,
       end: diurnal.learned_min_end_local,
       trigger: diurnal.learned_min_buy_local,
-      valid: diurnal.learned_min_valid === true && weatherReusable,
+      valid: diurnal.learned_min_valid === true && weatherReusable && todayWeather !== "precip",
       reference: `${clock(diurnal.min_window_start_local)}–${clock(diurnal.min_window_end_local)}`,
     },
     {
