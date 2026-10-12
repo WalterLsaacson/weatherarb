@@ -372,6 +372,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         require_explicit_fee=not args.allow_category_fee,
         max_usdc=float(trading["max_order_usdc"]),
         diurnal_order_usdc=float(trading["diurnal_order_usdc"]),
+        diurnal_forecast_gate=bool(trading["diurnal_forecast_gate"]),
+        forecast_cache_ttl_s=float(trading["forecast_cache_ttl_s"]),
         target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
     )
     live = bool(trading["live_orders"])
@@ -428,6 +430,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 " ".join(diurnal_sides),
                 trading.get("diurnal_order_usdc"),
                 trading.get("diurnal_min_price"),
+            ),
+            flush=True,
+        )
+        print(
+            "Diurnal forecast gate → {} · cache {}s".format(
+                "on" if trading.get("diurnal_forecast_gate") else "off",
+                trading.get("forecast_cache_ttl_s"),
             ),
             flush=True,
         )

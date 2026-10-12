@@ -65,6 +65,10 @@ def trading_config() -> dict[str, Any]:
         "diurnal_no_orders": bool(diurnal_no_orders),
         "diurnal_order_usdc": float(as_float(os.environ.get("DIURNAL_ORDER_USDC"), 5.0) or 5.0),
         "diurnal_min_price": float(as_float(os.environ.get("DIURNAL_MIN_PRICE"), 0.90) or 0.90),
+        "diurnal_forecast_gate": bool(as_bool(os.environ.get("DIURNAL_FORECAST_GATE"), False)),
+        "forecast_cache_ttl_s": float(
+            as_float(os.environ.get("FORECAST_CACHE_TTL_S"), 3600.0) or 3600.0
+        ),
         "max_order_usdc": float(as_float(os.environ.get("MAX_ORDER_USDC"), 5.0) or 5.0),
         "min_net_edge": float(as_float(os.environ.get("MIN_NET_EDGE"), 0.0075) or 0.0075),
         "max_ask": float(as_float(os.environ.get("MAX_ASK"), 0.995) or 0.995),
@@ -93,6 +97,8 @@ def public_trading_status() -> dict[str, Any]:
         "diurnal_no_orders": cfg["diurnal_no_orders"],
         "diurnal_order_usdc": cfg["diurnal_order_usdc"],
         "diurnal_min_price": cfg["diurnal_min_price"],
+        "diurnal_forecast_gate": cfg["diurnal_forecast_gate"],
+        "forecast_cache_ttl_s": cfg["forecast_cache_ttl_s"],
         "has_private_key": cfg["has_private_key"],
         "has_api_creds": cfg["has_api_creds"],
         "has_funder": bool(cfg["funder"]),

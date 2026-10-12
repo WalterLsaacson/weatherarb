@@ -114,6 +114,8 @@ chmod 600 .env
 | `LIMIT_ORDER_PRICE_001` | 0.001 档限价，本机 `0.995` |
 | `MAX_ORDER_USDC` | FAK 吃单名义本金上限 |
 | `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金；live 时实际为 `min(可用余额, LIMIT_ORDER_USDC)` |
+| `DIURNAL_FORECAST_GATE` | `true` 时，用 Open-Meteo 全天预报比较事件日与前一日天气类型；不同或取数失败则整天禁用 Diurnal |
+| `FORECAST_CACHE_TTL_S` | 全天预报缓存秒数，默认 `3600` |
 | `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |
 | `POLY_API_KEY` / `SECRET` / `PASSPHRASE` | 可留空；缺省时由 SDK 用私钥派生 |
 

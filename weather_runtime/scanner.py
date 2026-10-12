@@ -19,6 +19,7 @@ from .diurnal import (
     DIURNAL_REASONS,
     build_diurnal,
 )
+from .forecast import OpenMeteoForecastAdapter
 from .models import Book, ObservationEvidence, WeatherMarket, WeatherRule, as_float, parse_time, utc_now
 from .rules import (
     bucket_for_outcome,
@@ -129,6 +130,8 @@ class WeatherScannerConfig:
     display_book_ttl_s: float = 60.0
     weather_prefetch_deadline_s: float = 90.0
     weather_prefetch_workers: int = 4
+    diurnal_forecast_gate: bool = False
+    forecast_cache_ttl_s: float = 3600.0
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True
@@ -142,10 +145,15 @@ class WeatherScanner:
         config: Optional[WeatherScannerConfig] = None,
         source_adapter: Optional[WeatherSourceAdapter] = None,
         clob_client: Optional[ClobClient] = None,
+        forecast_adapter: Optional[OpenMeteoForecastAdapter] = None,
     ):
         self.config = config or WeatherScannerConfig()
         self.source_adapter = source_adapter or WeatherSourceAdapter()
         self.clob_client = clob_client or ClobClient(http=self.source_adapter.http)
+        self.forecast_adapter = forecast_adapter or OpenMeteoForecastAdapter(
+            http=self.source_adapter.http,
+            cache_ttl_s=self.config.forecast_cache_ttl_s,
+        )
 
     @staticmethod
     def _book(value: Any, token_id: str) -> Book:
@@ -249,6 +257,14 @@ class WeatherScanner:
             found = bucket_for_value(observation.value, rule.buckets, rounding=rule.rounding)
             if found is not None:
                 running_bucket = found.to_dict()
+        forecast_payload = None
+        if self.config.diurnal_forecast_gate:
+            forecast_payload = self.forecast_adapter.daily_forecast(
+                station_id=station,
+                local_date=local_date,
+                timezone_name=rule.timezone,
+                now=now,
+            )
         snapshot = build_diurnal(
             station_id=station,
             timezone_name=rule.timezone,
@@ -261,6 +277,7 @@ class WeatherScanner:
             running_value=observation.value,
             running_bucket=running_bucket,
             observation_status=observation.status,
+            forecast=forecast_payload,
         )
         if snapshot is not None:
             cache[event_id] = snapshot

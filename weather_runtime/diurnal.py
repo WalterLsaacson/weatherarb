@@ -574,6 +574,7 @@ def build_diurnal(
     running_value: Optional[float] = None,
     running_bucket: Optional[dict[str, Any]] = None,
     observation_status: str = "",
+    forecast: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Display payload plus whether this metric may emit a dry-run Yes."""
 
@@ -636,12 +637,34 @@ def build_diurnal(
         and yesterday_weather not in {"", "unknown"}
         and weather_class == yesterday_weather
     )
+    forecast_first_class = (
+        str(forecast.get("forecast_weather_class_first_day") or "unknown")
+        if isinstance(forecast, dict)
+        else "unknown"
+    )
+    forecast_second_class = (
+        str(forecast.get("forecast_weather_class_second_day") or "unknown")
+        if isinstance(forecast, dict)
+        else "unknown"
+    )
+    forecast_status = str(forecast.get("status") or "unknown") if isinstance(forecast, dict) else ""
+    forecast_matches = (
+        forecast_status == "ok"
+        and forecast_first_class not in {"", "unknown"}
+        and forecast_second_class not in {"", "unknown"}
+        and forecast_first_class == forecast_second_class
+    )
+    forecast_gate_active = forecast is not None
     passed = trigger_at is not None and current >= trigger_at
     near_edge = _bucket_edge(metric, running_value, running_bucket)
     block_reason = ""
     trigger = False
     if observation_status == "final":
         block_reason = "source_final"
+    elif forecast_gate_active and forecast_status != "ok":
+        block_reason = "forecast_weather_unknown"
+    elif forecast_gate_active and not forecast_matches:
+        block_reason = "forecast_weather_mismatch"
     elif continuity.get("status") == "regime_change":
         block_reason = "regime_change"
     elif weather_class == "unknown":
@@ -665,7 +688,11 @@ def build_diurnal(
     else:
         trigger = True
     phase = "pending"
-    if continuity.get("status") == "regime_change":
+    if forecast_gate_active and forecast_status != "ok":
+        phase = "forecast_weather_unknown"
+    elif forecast_gate_active and not forecast_matches:
+        phase = "forecast_weather_mismatch"
+    elif continuity.get("status") == "regime_change":
         phase = "regime_change"
     elif metric in {"daily_min", "daily_max"} and not yesterday_temps:
         phase = "trend_unlearned"
@@ -703,6 +730,10 @@ def build_diurnal(
         "learned_max_end_local": _fmt_local(learned["max_end"]) if learned["max_end"] else "",
         "learned_max_buy_local": _fmt_local(learned["max_buy"]) if learned["max_buy"] else "",
         "yesterday_weather_class": yesterday_weather,
+        "forecast_status": forecast_status,
+        "forecast_weather_class_first_day": forecast_first_class,
+        "forecast_weather_class_second_day": forecast_second_class,
+        "forecast_weather_match": forecast_matches,
         "yesterday_min_at_local": _fmt_local(learned["min_anchor"]) if learned["min_anchor"] else "",
         "yesterday_max_at_local": _fmt_local(learned["max_anchor"]) if learned["max_anchor"] else "",
         "passed": passed,

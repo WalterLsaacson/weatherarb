@@ -147,6 +147,8 @@ def take_command(args: argparse.Namespace) -> int:
             min_net_edge=float(trading["min_net_edge"]),
             max_usdc=float(trading["max_order_usdc"]),
             diurnal_order_usdc=float(trading["diurnal_order_usdc"]),
+            diurnal_forecast_gate=bool(trading["diurnal_forecast_gate"]),
+            forecast_cache_ttl_s=float(trading["forecast_cache_ttl_s"]),
             target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
         ),
     )
