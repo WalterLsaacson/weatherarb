@@ -114,6 +114,12 @@ chmod 600 .env
 | `LIMIT_ORDER_PRICE_001` | 0.001 档限价，本机 `0.995` |
 | `MAX_ORDER_USDC` | FAK 吃单名义本金上限 |
 | `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金；live 时实际为 `min(可用余额, LIMIT_ORDER_USDC)` |
+| `DYNAMIC_EXIT` | `true` 时，对未预留的天气持仓自动挂 GTC 卖出 |
+| `EXIT_PRICE_001` | 动态卖出限价，默认 `0.999`；仅 0.001 档市场会挂单，0.01 档市场直接跳过 |
+| `EXIT_MIN_SIZE` | 动态卖出最小持仓数量，同时受交易所最小下单数量约束 |
+| `EXIT_INTERVAL_S` | 动态持仓扫描间隔秒数，默认 `1800` |
+| `EXIT_MAX_ORDERS_PER_CYCLE` | 每轮扫描最多新增的动态卖出单数量 |
+| `EXIT_UNAVAILABLE_RETRY_S` | 无订单簿/无效 token 的重试间隔秒数 |
 | `DIURNAL_FORECAST_GATE` | `true` 时，用 Open-Meteo 全天预报比较事件日与前一日天气类型；不同或取数失败则整天禁用 Diurnal |
 | `FORECAST_CACHE_TTL_S` | 全天预报缓存秒数，默认 `3600` |
 | `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |

@@ -42,6 +42,7 @@ def _first_env(*names: str) -> str:
 def trading_config() -> dict[str, Any]:
     live = as_bool(os.environ.get("LIVE_ORDERS"), False)
     limit_orders = as_bool(os.environ.get("LIMIT_ORDERS"), False)
+    dynamic_exit = as_bool(os.environ.get("DYNAMIC_EXIT"), False)
     legacy_diurnal = as_bool(os.environ.get("DIURNAL_ORDERS"), False)
     yes_text = os.environ.get("DIURNAL_YES_ORDERS")
     if yes_text is None or not str(yes_text).strip():
@@ -79,6 +80,16 @@ def trading_config() -> dict[str, Any]:
         "limit_order_price_001": float(as_float(os.environ.get("LIMIT_ORDER_PRICE_001"), 0.995) or 0.995),
         "limit_order_min_price": float(as_float(os.environ.get("LIMIT_ORDER_MIN_PRICE"), 0.01) or 0.01),
         "limit_order_max_price": float(as_float(os.environ.get("LIMIT_ORDER_MAX_PRICE"), 0.99) or 0.99),
+        "dynamic_exit": bool(dynamic_exit and live),
+        "exit_price_001": float(as_float(os.environ.get("EXIT_PRICE_001"), 0.999) or 0.999),
+        "exit_min_size": float(as_float(os.environ.get("EXIT_MIN_SIZE"), 5.0) or 5.0),
+        "exit_interval_s": float(as_float(os.environ.get("EXIT_INTERVAL_S"), 1800.0) or 1800.0),
+        "exit_max_orders_per_cycle": int(
+            as_float(os.environ.get("EXIT_MAX_ORDERS_PER_CYCLE"), 10.0) or 10.0
+        ),
+        "exit_unavailable_retry_s": float(
+            as_float(os.environ.get("EXIT_UNAVAILABLE_RETRY_S"), 3600.0) or 3600.0
+        ),
         "has_private_key": bool(_first_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY")),
         "has_api_creds": bool(
             _first_env("POLY_API_KEY", "POLYMARKET_API_KEY")
@@ -115,4 +126,10 @@ def public_trading_status() -> dict[str, Any]:
         "limit_order_price_001": cfg["limit_order_price_001"],
         "limit_order_min_price": cfg["limit_order_min_price"],
         "limit_order_max_price": cfg["limit_order_max_price"],
+        "dynamic_exit": cfg["dynamic_exit"],
+        "exit_price_001": cfg["exit_price_001"],
+        "exit_min_size": cfg["exit_min_size"],
+        "exit_interval_s": cfg["exit_interval_s"],
+        "exit_max_orders_per_cycle": cfg["exit_max_orders_per_cycle"],
+        "exit_unavailable_retry_s": cfg["exit_unavailable_retry_s"],
     }

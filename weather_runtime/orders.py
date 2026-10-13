@@ -224,6 +224,118 @@ def submit_gtc_buy(
     )
 
 
+def submit_gtc_sell(
+    *,
+    token_id: str,
+    price: float,
+    size: float,
+    config: Optional[dict[str, Any]] = None,
+) -> Any:
+    return _submit_order(
+        token_id=token_id,
+        price=price,
+        size=size,
+        side="SELL",
+        order_type="GTC",
+        config=config,
+    )
+
+
+def fetch_positions(
+    *,
+    status: str = "OPEN",
+    config: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """Return simplified open positions from the account."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        paginator = client.list_positions(status=str(status or "OPEN"), page_size=100)
+        return [jsonable(position) for position in paginator.iter_items()]
+    except Exception as exc:
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+
+
+def fetch_open_orders(config: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    """Return simplified open CLOB orders from the account."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        return [jsonable(order) for order in client.list_open_orders().iter_items()]
+    except Exception as exc:
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+
+
+def fetch_order(
+    *,
+    order_id: str,
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return one CLOB order, including matched/cancelled orders when available."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        return jsonable(client.get_order(order_id=str(order_id)))
+    except Exception as exc:
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+
+
+def fetch_account_trades(
+    *,
+    token_id: Optional[str] = None,
+    config: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """Return simplified account trades, optionally filtered by CLOB token."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        paginator = client.list_account_trades(
+            token_id=str(token_id) if token_id else None,
+        )
+        return [jsonable(trade) for trade in paginator.iter_items()]
+    except Exception as exc:
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+
+
+def fetch_order_book(
+    *,
+    token_id: str,
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Return one simplified CLOB order book."""
+
+    from .env import trading_config
+
+    cfg = dict(config or trading_config())
+    client = _secure_client(cfg)
+    try:
+        return jsonable(client.get_order_book(token_id=str(token_id)))
+    except Exception as exc:
+        raise LiveOrderError(str(exc)) from exc
+    finally:
+        client.close()
+
+
 def _submit_fak(
     *,
     token_id: str,

@@ -166,6 +166,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/status":
             json_response(self, 200, SERVICE.status())
             return
+        if path == "/api/exits":
+            json_response(self, 200, SERVICE.dynamic_exit.snapshot())
+            return
         if path == "/api/overview":
             json_response(self, 200, SERVICE.overview())
             return
@@ -430,6 +433,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                 " ".join(diurnal_sides),
                 trading.get("diurnal_order_usdc"),
                 trading.get("diurnal_min_price"),
+            ),
+            flush=True,
+        )
+    if trading.get("dynamic_exit"):
+        print(
+            "Dynamic exit -> LIVE GTC sells | 0.001 tick only | price {}".format(
+                trading.get("exit_price_001"),
             ),
             flush=True,
         )

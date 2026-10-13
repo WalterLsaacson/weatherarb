@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .books import ClobClient
+from .dynamic_exit import DynamicExitManager
 from .markets import (
     GammaClient,
     catalog_event_groups,
@@ -561,6 +562,7 @@ class RuntimeService:
         )
 
         trading = trading_config()
+        self.dynamic_exit = DynamicExitManager(data_dir=self.data_dir, config=trading)
         self.scanner.source_adapter = WeatherSourceAdapter(
             http=JsonHttp(proxy=proxy, timeout=_WEATHER_HTTP_TIMEOUT_S, retries=_WEATHER_HTTP_RETRIES),
             http_cache_ttl_s=_DEFAULT_HTTP_CACHE_TTL_S,
@@ -1205,6 +1207,9 @@ class RuntimeService:
                 if _stopped():
                     return
                 try:
+                    exits = self.dynamic_exit.run_once()
+                    if _stopped():
+                        return
                     cancels = self._auto_cancel_stale_limit_orders(payload)
                     if _stopped():
                         return
@@ -1212,7 +1217,7 @@ class RuntimeService:
                     if _stopped():
                         return
                     limits = self._auto_place_limit_orders(payload)
-                    if takes or limits or cancels:
+                    if takes or limits or cancels or exits:
                         self._publish("health_update", self.status())
                 except Exception as exc:  # noqa: BLE001
                     with self.lock:
@@ -1402,6 +1407,7 @@ class RuntimeService:
                 "taken_tokens": len(self._taken_tokens),
                 "limit_taken_tokens": len(self._limit_taken_tokens),
                 "open_limit_orders": len(self._open_limit_orders),
+                "dynamic_exit": self.dynamic_exit.snapshot(),
             }
 
     def trading_status(self) -> dict[str, Any]:
