@@ -1347,7 +1347,7 @@ class WeatherSourceAdapter:
             temp = _number(row.get("temp"))
             if temp is None:
                 temp = _number(row.get("value"))
-            timestamp = row.get("reportTime") or row.get("timestamp") or row.get("obsTime")
+            timestamp = row.get("obsTime")
             if isinstance(timestamp, (int, float)) and timestamp > 10_000_000:
                 timestamp = datetime.fromtimestamp(float(timestamp), tz=timezone.utc).isoformat()
             if temp is None or timestamp in {None, ""}:

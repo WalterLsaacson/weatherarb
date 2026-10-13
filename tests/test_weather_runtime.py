@@ -2969,6 +2969,7 @@ class WeatherRuntimeTests(unittest.TestCase):
             "icaoId": "RKSI",
             "temp": temp,
             "reportTime": stamp,
+            "obsTime": int(datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()),
             "rawOb": "METAR RKSI 06{:02d}{:02d}Z".format(hour_utc, minute),
             "metarType": "METAR" if minute == 0 else "SPECI",
         }
@@ -3051,6 +3052,61 @@ class WeatherRuntimeTests(unittest.TestCase):
         self.assertEqual(observation.value, 23)
         self.assertEqual(observation.reason, "awaiting_final_confirmation")
         self.assertTrue(any("aviationweather.gov" in url for url in boom.urls))
+
+    def test_awc_requires_obs_time_and_ignores_rounded_report_time(self) -> None:
+        from weather_runtime.models import WeatherRule
+
+        adapter = WeatherSourceAdapter()
+        obs_time = int(datetime(2026, 10, 13, 4, 58, tzinfo=timezone.utc).timestamp())
+        awc_row = {
+            "icaoId": "KBKF",
+            "temp": 13.9,
+            "reportTime": "2026-10-13T05:00:00.000Z",
+            "obsTime": obs_time,
+            "rawOb": "METAR KBKF 130458Z 31012KT 10SM CLR 14/07 A2992 RMK AO2A SLP061 T01390074",
+            "metarType": "METAR",
+            "altim": 1013.3,
+        }
+        normalized = adapter._awc_observations([awc_row])
+        expected_timestamp = datetime.fromtimestamp(obs_time, tz=timezone.utc).isoformat()
+        self.assertEqual(normalized["observations"][0]["timestamp"], expected_timestamp)
+
+        missing_obs_time = {key: value for key, value in awc_row.items() if key != "obsTime"}
+        dropped = adapter._awc_observations([missing_obs_time])
+        self.assertEqual(dropped["observations"], [])
+
+        rule = WeatherRule(
+            market_id="5483120",
+            event_group_id="lowest-temperature-in-denver-on-october-12-2026",
+            adapter="weather_observation",
+            source={
+                "provider": "NOAA",
+                "station_id": "KBKF",
+                "sample_set": "hourly",
+                "hourly_window": "nws_faa",
+                "value_path": "temp",
+                "timestamp_path": "timestamp",
+                "value_unit": "C",
+            },
+            metric="daily_min",
+            observation_start="2026-10-12T00:00:00",
+            observation_end="2026-10-12T23:59:59",
+            unit="F",
+            buckets=[],
+            timezone="America/Denver",
+            rounding="whole_degree_as_published",
+        )
+        wrh_payload = {
+            "observations": [
+                {
+                    "timestamp": "2026-10-12T22:58:00-0600",
+                    "temp": 13.9,
+                    "slp": 1006.1,
+                    "metar": "METAR KBKF 130458Z 31012KT 10SM CLR 14/07 A2992 RMK AO2A SLP061 T01390074",
+                }
+            ]
+        }
+        self.assertFalse(adapter._awc_range_confirmed(rule, wrh_payload, normalized))
 
     def test_filtered_awc_speci_neither_covers_an_hour_nor_moves_the_extremum(self) -> None:
         closed = datetime(2026, 9, 6, 16, tzinfo=timezone.utc)
