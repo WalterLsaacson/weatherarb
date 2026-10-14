@@ -120,7 +120,7 @@ chmod 600 .env
 | `EXIT_INTERVAL_S` | 动态持仓扫描间隔秒数，默认 `1800` |
 | `EXIT_MAX_ORDERS_PER_CYCLE` | 每轮扫描最多新增的动态卖出单数量 |
 | `EXIT_UNAVAILABLE_RETRY_S` | 无订单簿/无效 token 的重试间隔秒数 |
-| `DIURNAL_FORECAST_GATE` | `true` 时，用 Open-Meteo 全天预报比较事件日与前一日天气类型；不同或取数失败则整天禁用 Diurnal |
+| `DIURNAL_FORECAST_GATE` | `true` 时，用 Open-Meteo 全天预报比较事件日与前一日天气类型，并用事件日预报温度门禁最低/最高温（最低温向下取整、最高温向上取整）；不同、取数失败或预报温度未达到当前运行值则整天禁用 Diurnal |
 | `FORECAST_CACHE_TTL_S` | 全天预报缓存秒数，默认 `3600` |
 | `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |
 | `POLY_API_KEY` / `SECRET` / `PASSPHRASE` | 可留空；缺省时由 SDK 用私钥派生 |

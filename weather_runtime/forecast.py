@@ -134,6 +134,8 @@ class OpenMeteoForecastAdapter:
                 "second_day": second_day,
                 "forecast_weather_class_first_day": first_day["weather_class"],
                 "forecast_weather_class_second_day": second_day["weather_class"],
+                "forecast_temperature_min": second_day["temperature_min"],
+                "forecast_temperature_max": second_day["temperature_max"],
                 "forecast_weather_match": (
                     status == "ok" and first_day["weather_class"] == second_day["weather_class"]
                 ),

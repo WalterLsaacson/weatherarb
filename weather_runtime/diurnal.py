@@ -539,6 +539,28 @@ def _bucket_edge(metric: str, value: Optional[float], bucket: Optional[dict[str,
     return False
 
 
+def _forecast_temperature(forecast: Optional[dict[str, Any]], field: str) -> Optional[float]:
+    if not isinstance(forecast, dict):
+        return None
+    second_day = forecast.get("second_day")
+    if isinstance(second_day, dict):
+        value = second_day.get(field)
+    else:
+        value = forecast.get("forecast_" + field)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _convert_forecast_temperature(value: Optional[float], unit: str) -> Optional[float]:
+    if value is None:
+        return None
+    if str(unit or "C").upper().replace("°", "").startswith("F"):
+        return value * 9.0 / 5.0 + 32.0
+    return value
+
+
 def _min_still_falling(points: list[tuple[datetime, dict[str, Any]]], now: datetime) -> bool:
     temps: list[tuple[datetime, float]] = []
     for local, point in points:
@@ -655,6 +677,32 @@ def build_diurnal(
         and forecast_first_class == forecast_second_class
     )
     forecast_gate_active = forecast is not None
+    forecast_temperature_min = _convert_forecast_temperature(
+        _forecast_temperature(forecast, "temperature_min"), unit
+    )
+    forecast_temperature_max = _convert_forecast_temperature(
+        _forecast_temperature(forecast, "temperature_max"), unit
+    )
+    forecast_temperature_min_floor = (
+        math.floor(forecast_temperature_min) if forecast_temperature_min is not None else None
+    )
+    forecast_temperature_max_ceil = (
+        math.ceil(forecast_temperature_max) if forecast_temperature_max is not None else None
+    )
+    if metric == "daily_min":
+        forecast_temperature_reached = (
+            forecast_temperature_min_floor is not None
+            and running_value is not None
+            and forecast_temperature_min_floor >= running_value
+        )
+    elif metric == "daily_max":
+        forecast_temperature_reached = (
+            forecast_temperature_max_ceil is not None
+            and running_value is not None
+            and forecast_temperature_max_ceil <= running_value
+        )
+    else:
+        forecast_temperature_reached = False
     passed = trigger_at is not None and current >= trigger_at
     near_edge = _bucket_edge(metric, running_value, running_bucket)
     block_reason = ""
@@ -665,6 +713,14 @@ def build_diurnal(
         block_reason = "forecast_weather_unknown"
     elif forecast_gate_active and not forecast_matches:
         block_reason = "forecast_weather_mismatch"
+    elif forecast_gate_active and metric == "daily_min" and forecast_temperature_min is None:
+        block_reason = "forecast_temperature_unknown"
+    elif forecast_gate_active and metric == "daily_max" and forecast_temperature_max is None:
+        block_reason = "forecast_temperature_unknown"
+    elif forecast_gate_active and metric == "daily_min" and not forecast_temperature_reached:
+        block_reason = "forecast_min_not_reached"
+    elif forecast_gate_active and metric == "daily_max" and not forecast_temperature_reached:
+        block_reason = "forecast_max_not_reached"
     elif continuity.get("status") == "regime_change":
         block_reason = "regime_change"
     elif weather_class == "unknown":
@@ -692,6 +748,14 @@ def build_diurnal(
         phase = "forecast_weather_unknown"
     elif forecast_gate_active and not forecast_matches:
         phase = "forecast_weather_mismatch"
+    elif forecast_gate_active and metric == "daily_min" and forecast_temperature_min is None:
+        phase = "forecast_temperature_unknown"
+    elif forecast_gate_active and metric == "daily_max" and forecast_temperature_max is None:
+        phase = "forecast_temperature_unknown"
+    elif forecast_gate_active and metric == "daily_min" and not forecast_temperature_reached:
+        phase = "forecast_min_not_reached"
+    elif forecast_gate_active and metric == "daily_max" and not forecast_temperature_reached:
+        phase = "forecast_max_not_reached"
     elif continuity.get("status") == "regime_change":
         phase = "regime_change"
     elif metric in {"daily_min", "daily_max"} and not yesterday_temps:
@@ -734,6 +798,14 @@ def build_diurnal(
         "forecast_weather_class_first_day": forecast_first_class,
         "forecast_weather_class_second_day": forecast_second_class,
         "forecast_weather_match": forecast_matches,
+        "forecast_temperature_min": forecast_temperature_min,
+        "forecast_temperature_max": forecast_temperature_max,
+        "forecast_temperature_min_floor": forecast_temperature_min_floor,
+        "forecast_temperature_max_ceil": forecast_temperature_max_ceil,
+        "forecast_temperature_reached": forecast_temperature_reached,
+        "forecast_temperature_unit": (
+            "F" if str(unit or "C").upper().replace("°", "").startswith("F") else "C"
+        ),
         "yesterday_min_at_local": _fmt_local(learned["min_anchor"]) if learned["min_anchor"] else "",
         "yesterday_max_at_local": _fmt_local(learned["max_anchor"]) if learned["max_anchor"] else "",
         "passed": passed,
