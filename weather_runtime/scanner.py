@@ -35,6 +35,11 @@ from .station_tz import coordinates_for_station
 from .storage import sha256_json
 
 
+SWEEP_TAIL_WINNER_YES = "sweep_tail_winner_yes"
+SWEEP_TAIL_LOSER_NO = "sweep_tail_loser_no"
+SWEEP_TAIL_REASONS = frozenset({SWEEP_TAIL_WINNER_YES, SWEEP_TAIL_LOSER_NO})
+
+
 def _iso(value: Optional[datetime] = None) -> str:
     return (value or datetime.now(timezone.utc)).astimezone(timezone.utc).isoformat()
 
@@ -93,11 +98,17 @@ _OPPORTUNITY_REASONS = {
     DIURNAL_MIN_REASON,
     DIURNAL_MAX_LOSER_NO,
     DIURNAL_MIN_LOSER_NO,
+    SWEEP_TAIL_WINNER_YES,
+    SWEEP_TAIL_LOSER_NO,
 }
 
 
 def _is_diurnal_reason(reason: Any) -> bool:
     return str(reason or "") in DIURNAL_REASONS
+
+
+def _is_sweep_tail_reason(reason: Any) -> bool:
+    return str(reason or "") in SWEEP_TAIL_REASONS
 
 
 def extrema_from_rows(rows: Iterable[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -132,6 +143,11 @@ class WeatherScannerConfig:
     weather_prefetch_workers: int = 4
     diurnal_forecast_gate: bool = False
     forecast_cache_ttl_s: float = 3600.0
+    sweep_tail_enabled: bool = False
+    sweep_tail_order_usdc: float = 5.0
+    sweep_tail_leader_min: float = 0.99
+    sweep_tail_loser_max: float = 0.01
+    sweep_tail_min_legs: int = 3
     require_manual_approval: bool = True
     require_explicit_fee: bool = True
     require_market_constraints: bool = True
@@ -282,6 +298,85 @@ class WeatherScanner:
         if snapshot is not None:
             cache[event_id] = snapshot
         return snapshot
+
+    def _sweep_tail_group(
+        self,
+        group_rules: list[WeatherRule],
+        market_map: dict[str, WeatherMarket],
+        group_markets: list[WeatherMarket],
+    ) -> Optional[dict[str, Any]]:
+        """Return a 99/1 multi-leg group using Gamma probabilities only."""
+
+        if not self.config.sweep_tail_enabled or not group_rules:
+            return None
+        rule_market_ids = {rule.market_id for rule in group_rules}
+        event_market_ids = {market.market_id for market in group_markets}
+        if rule_market_ids != event_market_ids:
+            return None
+        legs: list[dict[str, Any]] = []
+        seen_markets: set[str] = set()
+        seen_outcomes: set[str] = set()
+        for rule in group_rules:
+            market = market_map.get(rule.market_id)
+            if market is None or market.market_id in seen_markets or not market.tradable:
+                return None
+            outcome = str(rule.target_outcome or market.outcome or "").strip()
+            outcome_key = _norm_outcome(outcome)
+            if not outcome_key or outcome_key in seen_outcomes:
+                return None
+            if market.yes_probability is None or market.no_probability is None:
+                return None
+            if abs(
+                float(market.yes_probability) + float(market.no_probability) - 1.0
+            ) > 1e-6:
+                return None
+            seen_markets.add(market.market_id)
+            seen_outcomes.add(outcome_key)
+            legs.append(
+                {
+                    "market_id": market.market_id,
+                    "outcome": outcome,
+                    "yes_probability": float(market.yes_probability),
+                    "no_probability": float(market.no_probability),
+                    "yes_token_id": _yes_token(market),
+                    "no_token_id": _no_token(market),
+                }
+            )
+        if len(legs) < int(self.config.sweep_tail_min_legs):
+            return None
+        leader_indices = [
+            index
+            for index, leg in enumerate(legs)
+            if leg["yes_probability"]
+            >= float(self.config.sweep_tail_leader_min) - 1e-12
+        ]
+        if len(leader_indices) != 1:
+            return None
+        loser_indices = [
+            index for index in range(len(legs)) if index not in leader_indices
+        ]
+        if any(
+            legs[index]["yes_probability"]
+            > float(self.config.sweep_tail_loser_max) + 1e-12
+            for index in loser_indices
+        ):
+            return None
+        leader_index = leader_indices[0]
+        leader = legs[leader_index]
+        return {
+            "event_group_id": str(group_rules[0].event_group_id or ""),
+            "leader_outcome": leader["outcome"],
+            "leader_market_id": leader["market_id"],
+            "leader_yes_probability": leader["yes_probability"],
+            "leader_no_probability": leader["no_probability"],
+            "loser_max_yes_probability": max(
+                legs[index]["yes_probability"] for index in loser_indices
+            ),
+            "leg_count": len(legs),
+            "leader_min": float(self.config.sweep_tail_leader_min),
+            "loser_max": float(self.config.sweep_tail_loser_max),
+            "legs": legs,
+        }
 
     def _queue_diurnal_yes(
         self,
@@ -588,8 +683,10 @@ class WeatherScanner:
         )
 
     def _buy_notional_cap(self, row: dict[str, Any]) -> float:
-        """Diurnal Yes and No use DIURNAL_ORDER_USDC. Other buys use MAX_ORDER_USDC."""
+        """Strategy-specific notional caps, with MAX_ORDER_USDC as the fallback."""
 
+        if _is_sweep_tail_reason(row.get("reason")):
+            return float(self.config.sweep_tail_order_usdc)
         if _is_diurnal_reason(row.get("reason")):
             return float(self.config.diurnal_order_usdc)
         return float(self.config.max_usdc)
@@ -691,7 +788,11 @@ class WeatherScanner:
         }
         # Diurnal Yes is gated by DIURNAL_MIN_PRICE. The $1 edge shrinks as the
         # ask approaches 1, so a price inside the floor would otherwise miss it.
-        if edge < self.config.min_net_edge and not _is_diurnal_reason(row.get("reason")):
+        if (
+            edge < self.config.min_net_edge
+            and not _is_diurnal_reason(row.get("reason"))
+            and not _is_sweep_tail_reason(row.get("reason"))
+        ):
             row.update({"status": "no_trade", "reason": "edge_below_minimum"})
             return
         self._mark_opportunity(row)
@@ -841,6 +942,11 @@ class WeatherScanner:
             for item in markets
         ]
         market_map = {item.market_id: item for item in market_list if item.market_id}
+        markets_by_group: dict[str, list[WeatherMarket]] = {}
+        for market in market_list:
+            group_id = _norm_event_id(market.event_group_id)
+            if group_id and market.market_id:
+                markets_by_group.setdefault(group_id, []).append(market)
         rule_list = [item for item in rules if isinstance(item, WeatherRule)]
         group_targets: dict[str, dict[str, int]] = {}
         rules_by_group: dict[str, list[WeatherRule]] = {}
@@ -852,6 +958,7 @@ class WeatherScanner:
                 targets = group_targets.setdefault(str(rule.event_group_id), {})
                 targets[target] = targets.get(target, 0) + 1
         group_block: dict[str, str] = {}
+        sweep_tail_by_group: dict[str, dict[str, Any]] = {}
         for group_id, group_rules in rules_by_group.items():
             bucket_sets = {
                 json.dumps([bucket.to_dict() for bucket in item.buckets], sort_keys=True)
@@ -871,6 +978,13 @@ class WeatherScanner:
             sibling_reason = validate_event_group_siblings(group_markets, group_rules[0].buckets)
             if sibling_reason:
                 group_block[group_id] = sibling_reason
+            sweep_tail = self._sweep_tail_group(
+                group_rules,
+                market_map,
+                markets_by_group.get(group_id, []),
+            )
+            if sweep_tail is not None:
+                sweep_tail_by_group[group_id] = sweep_tail
         rows: list[dict[str, Any]] = []
         token_ids: list[str] = []
         priority_token_ids: list[str] = []
@@ -1031,6 +1145,39 @@ class WeatherScanner:
             )
             if snapshot is not None:
                 base["diurnal"] = snapshot
+            sweep_tail = sweep_tail_by_group.get(_norm_event_id(rule.event_group_id))
+            if sweep_tail is not None:
+                leader_bucket = bucket_for_outcome(
+                    sweep_tail["leader_outcome"], rule.buckets
+                )
+                if leader_bucket is None:
+                    base.update(
+                        {"status": "no_trade", "reason": "outcome_not_in_bucket_set"}
+                    )
+                    rows.append(base)
+                    continue
+                is_leader = (
+                    _norm_outcome(_rule_market_id(rule, market))
+                    == _norm_outcome(sweep_tail["leader_outcome"])
+                )
+                self._queue_matched_trade(
+                    base,
+                    rows,
+                    token_ids,
+                    market,
+                    bucket=leader_bucket,
+                    trade_side="YES" if is_leader else "NO",
+                    is_target=is_leader,
+                    source_status=observation.status,
+                    reason=SWEEP_TAIL_WINNER_YES
+                    if is_leader
+                    else SWEEP_TAIL_LOSER_NO,
+                    history=["DISCOVERED", "SWEEP_TAIL", "RULE_MATCHED"],
+                    priority_token_ids=priority_token_ids,
+                    priority=False,
+                )
+                base["sweep_tail"] = sweep_tail
+                continue
             if observation.status == "waiting_window":
                 base.update(
                     {
@@ -1439,6 +1586,12 @@ class WeatherScanner:
                         for row in group_rows
                         if row.get("status") == "opportunity" and _is_diurnal_reason(row.get("reason"))
                     ),
+                    "sweep_tail_candidate_count": sum(
+                        1
+                        for row in group_rows
+                        if row.get("status") == "opportunity"
+                        and _is_sweep_tail_reason(row.get("reason"))
+                    ),
                     "diurnal": diurnal_by_group.get(event_group_id),
                     "status_counts": _status_counts(group_rows),
                     "markets": [
@@ -1465,17 +1618,27 @@ class WeatherScanner:
         actionable = sum(
             1
             for row in rows
-            if row.get("trade_side") and not _is_diurnal_reason(row.get("reason"))
+            if row.get("trade_side")
+            and not _is_diurnal_reason(row.get("reason"))
+            and not _is_sweep_tail_reason(row.get("reason"))
         )
         finality_ready = sum(
             1
             for row in rows
-            if row.get("status") == "opportunity" and not _is_diurnal_reason(row.get("reason"))
+            if row.get("status") == "opportunity"
+            and not _is_diurnal_reason(row.get("reason"))
+            and not _is_sweep_tail_reason(row.get("reason"))
         )
         diurnal_ready = sum(
             1
             for row in rows
             if row.get("status") == "opportunity" and _is_diurnal_reason(row.get("reason"))
+        )
+        sweep_tail_ready = sum(
+            1
+            for row in rows
+            if row.get("status") == "opportunity"
+            and _is_sweep_tail_reason(row.get("reason"))
         )
         final_groups = sum(1 for group in group_views if group.get("source_status") == "final")
         mapped_groups = sum(
@@ -1506,6 +1669,7 @@ class WeatherScanner:
             "book_ready_rate": (finality_ready / actionable) if actionable else 0.0,
             "opportunities": finality_ready,
             "diurnal_opportunities": diurnal_ready,
+            "sweep_tail_opportunities": sweep_tail_ready,
             "waiting": sum(1 for row in rows if row.get("status") == "waiting"),
             "review": sum(1 for row in rows if row.get("status") == "review"),
             "no_trade": sum(1 for row in rows if row.get("status") == "no_trade"),

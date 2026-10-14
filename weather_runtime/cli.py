@@ -77,6 +77,10 @@ def discover_command(args: argparse.Namespace) -> int:
 
 
 def scan_command(args: argparse.Namespace) -> int:
+    from .env import load_dotenv, trading_config
+
+    load_dotenv()
+    trading = trading_config()
     fixture = args.fixture.resolve() if args.fixture else None
     if fixture:
         markets_path = fixture / "markets.json"
@@ -106,6 +110,11 @@ def scan_command(args: argparse.Namespace) -> int:
             max_ask=args.max_ask,
             min_net_edge=args.min_net_edge,
             require_explicit_fee=not args.allow_category_fee,
+            sweep_tail_enabled=bool(trading["sweep_tail_enabled"]),
+            sweep_tail_order_usdc=float(trading["sweep_tail_order_usdc"]),
+            sweep_tail_leader_min=float(trading["sweep_tail_leader_min"]),
+            sweep_tail_loser_max=float(trading["sweep_tail_loser_max"]),
+            sweep_tail_min_legs=int(trading["sweep_tail_min_legs"]),
         ),
         source_adapter=None,
         clob_client=None,
@@ -149,6 +158,11 @@ def take_command(args: argparse.Namespace) -> int:
             diurnal_order_usdc=float(trading["diurnal_order_usdc"]),
             diurnal_forecast_gate=bool(trading["diurnal_forecast_gate"]),
             forecast_cache_ttl_s=float(trading["forecast_cache_ttl_s"]),
+            sweep_tail_enabled=bool(trading["sweep_tail_enabled"]),
+            sweep_tail_order_usdc=float(trading["sweep_tail_order_usdc"]),
+            sweep_tail_leader_min=float(trading["sweep_tail_leader_min"]),
+            sweep_tail_loser_max=float(trading["sweep_tail_loser_max"]),
+            sweep_tail_min_legs=int(trading["sweep_tail_min_legs"]),
             target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
         ),
     )

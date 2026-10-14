@@ -33,6 +33,7 @@ from .diurnal import DIURNAL_REASONS
 from .rules import (
     RuleError,
     bucket_for_outcome,
+    bucket_for_value,
     bucket_impossible_while_open,
     load_rules,
     load_timezone,
@@ -41,9 +42,20 @@ from .rules import (
     parse_bucket,
     parse_rule,
 )
-from .scanner import WeatherScanner, WeatherScannerConfig, extrema_from_rows
+from .scanner import (
+    SWEEP_TAIL_REASONS,
+    WeatherScanner,
+    WeatherScannerConfig,
+    extrema_from_rows,
+)
 from .sources import JsonHttp, series_from_raw
-from .storage import append_jsonl, append_jsonl_dedup, load_json, write_json_atomic
+from .storage import (
+    append_jsonl,
+    append_jsonl_dedup,
+    load_json,
+    read_jsonl,
+    write_json_atomic,
+)
 
 
 _DATA_CLEANUP_INTERVAL_S = 36 * 3600.0
@@ -608,6 +620,9 @@ class RuntimeService:
         self._taken_tokens: set[str] = set()
         self._diurnal_taken_tokens: set[str] = set()
         self._diurnal_seen_tokens: set[str] = set()
+        self._sweep_tail_taken_tokens: set[str] = set()
+        self._sweep_tail_seen_groups: set[str] = set()
+        self._sweep_tail_leaders: dict[str, set[str]] = {}
         self._limit_taken_tokens: set[str] = set()
         self._limit_attempted_tokens: set[str] = set()
         self._open_limit_orders: dict[str, dict[str, Any]] = {}
@@ -616,6 +631,7 @@ class RuntimeService:
         self._hydrate_last_result()
         self._hydrate_taken()
         self._load_diurnal_seen()
+        self._load_sweep_tail_seen()
         self._maybe_cleanup_data_dir(force=False)
 
     def _diurnal_seen_path(self) -> Path:
@@ -651,6 +667,22 @@ class RuntimeService:
             write_json_atomic(self._diurnal_seen_path(), sorted(self._diurnal_seen_tokens))
         except OSError:
             return
+
+    def _sweep_tail_log_path(self) -> Path:
+        return self.data_dir / "sweep_tail_opportunities.jsonl"
+
+    def _load_sweep_tail_seen(self) -> None:
+        """Remember sweep-tail events so resolutions survive signal loss."""
+
+        for record in read_jsonl(self._sweep_tail_log_path()):
+            if str(record.get("record_type") or "") != "opportunity":
+                continue
+            event_id = str(record.get("event_group_id") or "")
+            leader_outcome = str(record.get("leader_outcome") or "")
+            if event_id:
+                self._sweep_tail_seen_groups.add(event_id)
+            if event_id and leader_outcome:
+                self._sweep_tail_leaders.setdefault(event_id, set()).add(leader_outcome)
 
     def _catalog_path(self) -> Path:
         return self.data_dir / "weather_catalog.json"
@@ -715,6 +747,8 @@ class RuntimeService:
                             }
                     elif str(record.get("reason") or "") in DIURNAL_REASONS:
                         self._diurnal_taken_tokens.update(keys)
+                    elif str(record.get("reason") or "") in SWEEP_TAIL_REASONS:
+                        self._sweep_tail_taken_tokens.update(keys)
                     else:
                         self._taken_tokens.update(keys)
         except OSError:
@@ -952,7 +986,14 @@ class RuntimeService:
                 if not path.is_file():
                     continue
                 name = path.name
-                if name in {".cleanup_at", "orders.jsonl", "health.json", "latest.json", "diurnal_seen.json"}:
+                if name in {
+                    ".cleanup_at",
+                    "orders.jsonl",
+                    "health.json",
+                    "latest.json",
+                    "diurnal_seen.json",
+                    "sweep_tail_opportunities.jsonl",
+                }:
                     continue
                 if name.endswith(_DATA_CLEANUP_DELETE_SUFFIXES) or name.endswith(".jsonl.old"):
                     try:
@@ -1006,6 +1047,136 @@ class RuntimeService:
             return report
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)}
+
+    def _persist_sweep_tail(self, result: dict[str, Any]) -> None:
+        """Persist each 99/1 sweep-tail signal and its eventual resolution."""
+
+        from .env import trading_config
+
+        cfg = trading_config()
+        stamp = str((result.get("summary") or {}).get("scanned_at") or "")
+        rows = [row for row in result.get("rows") or [] if isinstance(row, dict)]
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            sweep = row.get("sweep_tail")
+            if not isinstance(sweep, dict):
+                continue
+            event_id = str(row.get("event_group_id") or "")
+            if event_id:
+                groups.setdefault(event_id, []).append(row)
+
+        opportunity_rows: list[dict[str, Any]] = []
+        for event_id, group_rows in groups.items():
+            sweep = group_rows[0].get("sweep_tail")
+            if not isinstance(sweep, dict):
+                continue
+            leader_outcome = str(sweep.get("leader_outcome") or "")
+            intended_orders = []
+            for leg in sweep.get("legs") or []:
+                if not isinstance(leg, dict):
+                    continue
+                is_leader = str(leg.get("outcome") or "") == leader_outcome
+                intended_orders.append(
+                    {
+                        "market_id": leg.get("market_id"),
+                        "outcome": leg.get("outcome"),
+                        "trade_side": "YES" if is_leader else "NO",
+                        "token_id": leg.get("yes_token_id")
+                        if is_leader
+                        else leg.get("no_token_id"),
+                        "price_limit": float(cfg.get("max_ask") or 0.995),
+                    }
+                )
+            opportunity_rows.append(
+                {
+                    "record_type": "opportunity",
+                    "scan_at": stamp,
+                    "event_group_id": event_id,
+                    "leader_outcome": leader_outcome,
+                    "leader_market_id": sweep.get("leader_market_id"),
+                    "leader_yes_probability": sweep.get("leader_yes_probability"),
+                    "leader_no_probability": sweep.get("leader_no_probability"),
+                    "loser_max_yes_probability": sweep.get("loser_max_yes_probability"),
+                    "leg_count": sweep.get("leg_count"),
+                    "leader_min": sweep.get("leader_min"),
+                    "loser_max": sweep.get("loser_max"),
+                    "legs": sweep.get("legs") or [],
+                    "intended_orders": intended_orders,
+                    "rows": [_slim_row(row) for row in group_rows],
+                    "dry_run": not (
+                        bool(cfg.get("live_orders")) and bool(cfg.get("sweep_tail_orders"))
+                    ),
+                }
+            )
+            self._sweep_tail_seen_groups.add(event_id)
+            if leader_outcome:
+                self._sweep_tail_leaders.setdefault(event_id, set()).add(leader_outcome)
+
+        if opportunity_rows:
+            path = self._sweep_tail_log_path()
+            append_jsonl_dedup(
+                path,
+                opportunity_rows,
+                key_fn=lambda row: "{}|{}|{}".format(
+                    row.get("event_group_id"), row.get("record_type"), row.get("leader_outcome")
+                ),
+                known_keys=self._jsonl_key_cache.get(str(path)),
+                key_cache=self._jsonl_key_cache,
+            )
+
+        final_rows_by_event: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            observation = row.get("observation")
+            if not isinstance(observation, dict):
+                continue
+            if str(observation.get("status") or "") != "final":
+                continue
+            event_id = str(row.get("event_group_id") or "")
+            if event_id and event_id not in final_rows_by_event:
+                final_rows_by_event[event_id] = row
+
+        resolution_rows: list[dict[str, Any]] = []
+        for event_id in self._sweep_tail_seen_groups:
+            row = final_rows_by_event.get(event_id)
+            if row is None:
+                continue
+            observation = row.get("observation") or {}
+            rule = row.get("rule") if isinstance(row.get("rule"), dict) else {}
+            buckets = [
+                parse_bucket(item)
+                for item in rule.get("buckets") or []
+                if isinstance(item, dict)
+            ]
+            final_bucket = bucket_for_value(
+                observation.get("value"),
+                buckets,
+                rounding=str(rule.get("rounding") or "whole_degree_as_published"),
+            )
+            for leader_outcome in sorted(self._sweep_tail_leaders.get(event_id, set())):
+                resolution_rows.append(
+                    {
+                        "record_type": "resolution",
+                        "scan_at": stamp,
+                        "event_group_id": event_id,
+                        "leader_outcome": leader_outcome,
+                        "final_value": observation.get("value"),
+                        "final_bucket_outcome": final_bucket.outcome if final_bucket else None,
+                        "observation_status": observation.get("status"),
+                        "source_timestamp": observation.get("source_timestamp"),
+                        "observed_at": observation.get("observed_at"),
+                    }
+                )
+        if resolution_rows:
+            path = self._sweep_tail_log_path()
+            append_jsonl_dedup(
+                path,
+                resolution_rows,
+                key_fn=lambda row: "{}|{}|{}".format(
+                    row.get("event_group_id"), row.get("record_type"), row.get("leader_outcome")
+                ),
+                known_keys=self._jsonl_key_cache.get(str(path)),
+                key_cache=self._jsonl_key_cache,
+            )
 
     def _persist(self, result: dict[str, Any]) -> None:
         stamp = (result.get("summary") or {}).get("scanned_at") or datetime.now(timezone.utc).isoformat()
@@ -1070,6 +1241,7 @@ class RuntimeService:
             known_keys=self._jsonl_key_cache.get(str(candidates_path)),
             key_cache=self._jsonl_key_cache,
         )
+        self._persist_sweep_tail(result)
         source_path = self.data_dir / "source_observations.jsonl"
         self._rotate_jsonl(source_path)
         append_jsonl_dedup(
@@ -1415,6 +1587,7 @@ class RuntimeService:
 
         status = public_trading_status()
         status["taken_tokens"] = len(self._taken_tokens)
+        status["sweep_tail_taken_tokens"] = len(self._sweep_tail_taken_tokens)
         status["limit_taken_tokens"] = len(self._limit_taken_tokens)
         status["open_limit_orders"] = len(self._open_limit_orders)
         return status
@@ -1424,10 +1597,11 @@ class RuntimeService:
 
         cfg = trading_config()
         live_orders = bool(cfg.get("live_orders"))
+        sweep_tail_live = bool(cfg.get("live_orders")) and bool(cfg.get("sweep_tail_orders"))
         diurnal_live = _diurnal_side_enabled(cfg, {"trade_side": "YES"}) or _diurnal_side_enabled(
             cfg, {"trade_side": "NO"}
         )
-        if self.fixture or (not live_orders and not diurnal_live):
+        if self.fixture or (not live_orders and not diurnal_live and not sweep_tail_live):
             return []
         takes: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1442,6 +1616,7 @@ class RuntimeService:
                 continue
             reason = str(row.get("reason") or "")
             diurnal = reason in DIURNAL_REASONS
+            sweep_tail = reason in SWEEP_TAIL_REASONS
             keys = _instrument_keys(row, token_id)
             if diurnal:
                 if not _diurnal_side_enabled(cfg, row):
@@ -1456,6 +1631,11 @@ class RuntimeService:
                     continue
                 if keys & self._diurnal_taken_tokens:
                     self._persist_diurnal_seen()
+                    continue
+            elif sweep_tail:
+                if not sweep_tail_live:
+                    continue
+                if keys & self._sweep_tail_taken_tokens or token_id in seen:
                     continue
             elif not live_orders:
                 continue
@@ -1472,9 +1652,14 @@ class RuntimeService:
                 event_group_id=event_id,
                 target_outcome=outcome,
                 live=True,
-                require_locked_no=not diurnal,
-                token_ledger="diurnal" if diurnal else "finality",
+                require_locked_no=not (diurnal or sweep_tail),
+                token_ledger=(
+                    "diurnal" if diurnal else ("sweep_tail" if sweep_tail else "finality")
+                ),
             )
+            if sweep_tail and taken.get("ok"):
+                with self.lock:
+                    self._sweep_tail_taken_tokens.update(keys)
             if diurnal and not _diurnal_buy_settled(taken):
                 self._forget_diurnal_book(keys)
             elif diurnal:
@@ -1867,9 +2052,25 @@ class RuntimeService:
         token_id = str(row.get("book_token_id") or row.get("winning_token_id") or "")
         if not token_id:
             return {"ok": False, "error": "missing_token", "row": _slim_row(row)}
-        diurnal_ledger = token_ledger == "diurnal"
-        own_tokens = self._diurnal_taken_tokens if diurnal_ledger else self._taken_tokens
-        blocked_tokens = own_tokens if diurnal_ledger else (self._taken_tokens | self._limit_taken_tokens)
+        row_reason = str(row.get("reason") or "")
+        diurnal_ledger = token_ledger == "diurnal" or (
+            token_ledger == "finality" and row_reason in DIURNAL_REASONS
+        )
+        sweep_tail_ledger = token_ledger == "sweep_tail" or (
+            token_ledger == "finality" and row_reason in SWEEP_TAIL_REASONS
+        )
+        if sweep_tail_ledger:
+            require_locked_no = False
+        if diurnal_ledger:
+            own_tokens = self._diurnal_taken_tokens
+        elif sweep_tail_ledger:
+            own_tokens = self._sweep_tail_taken_tokens
+        else:
+            own_tokens = self._taken_tokens
+        if diurnal_ledger or sweep_tail_ledger:
+            blocked_tokens = own_tokens
+        else:
+            blocked_tokens = self._taken_tokens | self._limit_taken_tokens
         if live and (_instrument_keys(row, token_id) & blocked_tokens):
             return {
                 "ok": False,
@@ -1903,7 +2104,12 @@ class RuntimeService:
                     "error": "market_not_tradable",
                     "market_id": market.market_id,
                 }
-        order_budget = float(cfg["diurnal_order_usdc"] if diurnal_ledger else cfg["max_order_usdc"])
+        if diurnal_ledger:
+            order_budget = float(cfg["diurnal_order_usdc"])
+        elif sweep_tail_ledger:
+            order_budget = float(cfg["sweep_tail_order_usdc"])
+        else:
+            order_budget = float(cfg["max_order_usdc"])
         if live:
             try:
                 balance_usdc = float(fetch_collateral_usdc(cfg))
@@ -1924,16 +2130,20 @@ class RuntimeService:
         row["status"] = "rule_matched"
         original_max_usdc = float(self.scanner.config.max_usdc)
         original_diurnal_usdc = float(self.scanner.config.diurnal_order_usdc)
+        original_sweep_tail_usdc = float(self.scanner.config.sweep_tail_order_usdc)
         original_target = float(self.scanner.config.target_shares)
         self.scanner.config.max_usdc = order_budget
         if diurnal_ledger:
             self.scanner.config.diurnal_order_usdc = order_budget
+        if sweep_tail_ledger:
+            self.scanner.config.sweep_tail_order_usdc = order_budget
         self.scanner.config.target_shares = max(original_target, order_budget * 1000.0)
         try:
             self.scanner._evaluate_matched_row(row, books, {market.market_id: market}, utc_now())
         finally:
             self.scanner.config.max_usdc = original_max_usdc
             self.scanner.config.diurnal_order_usdc = original_diurnal_usdc
+            self.scanner.config.sweep_tail_order_usdc = original_sweep_tail_usdc
             self.scanner.config.target_shares = original_target
         if row.get("status") != "opportunity":
             return {
@@ -2000,7 +2210,15 @@ class RuntimeService:
                 error = "insufficient_balance"
             return {"ok": False, "error": error, "price": price, "size": size, "budget_usdc": order_budget}
         if min_order > 0 and size + 1e-12 < min_order:
-            cap = float(cfg["diurnal_order_usdc"] if diurnal_ledger else cfg["max_order_usdc"])
+            cap = float(
+                cfg["diurnal_order_usdc"]
+                if diurnal_ledger
+                else (
+                    cfg["sweep_tail_order_usdc"]
+                    if sweep_tail_ledger
+                    else cfg["max_order_usdc"]
+                )
+            )
             below_balance = live and order_budget + 1e-9 < cap
             return {
                 "ok": False,
@@ -2040,6 +2258,10 @@ class RuntimeService:
                 else:
                     disabled = "diurnal_yes_orders_disabled"
                     hint = "Set DIURNAL_YES_ORDERS=true in .env to buy diurnal Yes"
+            elif sweep_tail_ledger:
+                live_allowed = bool(cfg.get("sweep_tail_orders"))
+                disabled = "sweep_tail_orders_disabled"
+                hint = "Set SWEEP_TAIL_ORDERS=true in .env, then pass --live"
             else:
                 live_allowed = bool(cfg.get("live_orders"))
                 disabled = "live_orders_disabled"
@@ -2060,7 +2282,10 @@ class RuntimeService:
                 submit_cfg["diurnal_live_submit"] = True
             with self.lock:
                 fill_keys = _instrument_keys(row, token_id)
-                if fill_keys & own_tokens or (not diurnal_ledger and fill_keys & self._limit_taken_tokens):
+                if fill_keys & own_tokens or (
+                    not (diurnal_ledger or sweep_tail_ledger)
+                    and fill_keys & self._limit_taken_tokens
+                ):
                     return {
                         "ok": False,
                         "error": "already_taken",

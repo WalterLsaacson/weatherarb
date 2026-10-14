@@ -377,6 +377,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         diurnal_order_usdc=float(trading["diurnal_order_usdc"]),
         diurnal_forecast_gate=bool(trading["diurnal_forecast_gate"]),
         forecast_cache_ttl_s=float(trading["forecast_cache_ttl_s"]),
+        sweep_tail_enabled=bool(trading["sweep_tail_enabled"]),
+        sweep_tail_order_usdc=float(trading["sweep_tail_order_usdc"]),
+        sweep_tail_leader_min=float(trading["sweep_tail_leader_min"]),
+        sweep_tail_loser_max=float(trading["sweep_tail_loser_max"]),
+        sweep_tail_min_legs=int(trading["sweep_tail_min_legs"]),
         target_shares=max(1.0, float(trading["max_order_usdc"]) * 1000.0),
     )
     live = bool(trading["live_orders"])

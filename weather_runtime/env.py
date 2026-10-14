@@ -70,6 +70,20 @@ def trading_config() -> dict[str, Any]:
         "forecast_cache_ttl_s": float(
             as_float(os.environ.get("FORECAST_CACHE_TTL_S"), 3600.0) or 3600.0
         ),
+        "sweep_tail_enabled": bool(as_bool(os.environ.get("SWEEP_TAIL_ENABLED"), False)),
+        "sweep_tail_orders": bool(as_bool(os.environ.get("SWEEP_TAIL_ORDERS"), False)),
+        "sweep_tail_order_usdc": float(
+            as_float(os.environ.get("SWEEP_TAIL_ORDER_USDC"), 5.0) or 5.0
+        ),
+        "sweep_tail_leader_min": float(
+            as_float(os.environ.get("SWEEP_TAIL_LEADER_MIN"), 0.99) or 0.99
+        ),
+        "sweep_tail_loser_max": float(
+            as_float(os.environ.get("SWEEP_TAIL_LOSER_MAX"), 0.01) or 0.01
+        ),
+        "sweep_tail_min_legs": int(
+            as_float(os.environ.get("SWEEP_TAIL_MIN_LEGS"), 3.0) or 3.0
+        ),
         "max_order_usdc": float(as_float(os.environ.get("MAX_ORDER_USDC"), 5.0) or 5.0),
         "min_net_edge": float(as_float(os.environ.get("MIN_NET_EDGE"), 0.0075) or 0.0075),
         "max_ask": float(as_float(os.environ.get("MAX_ASK"), 0.995) or 0.995),
@@ -110,6 +124,12 @@ def public_trading_status() -> dict[str, Any]:
         "diurnal_min_price": cfg["diurnal_min_price"],
         "diurnal_forecast_gate": cfg["diurnal_forecast_gate"],
         "forecast_cache_ttl_s": cfg["forecast_cache_ttl_s"],
+        "sweep_tail_enabled": cfg["sweep_tail_enabled"],
+        "sweep_tail_orders": cfg["sweep_tail_orders"],
+        "sweep_tail_order_usdc": cfg["sweep_tail_order_usdc"],
+        "sweep_tail_leader_min": cfg["sweep_tail_leader_min"],
+        "sweep_tail_loser_max": cfg["sweep_tail_loser_max"],
+        "sweep_tail_min_legs": cfg["sweep_tail_min_legs"],
         "has_private_key": cfg["has_private_key"],
         "has_api_creds": cfg["has_api_creds"],
         "has_funder": bool(cfg["funder"]),

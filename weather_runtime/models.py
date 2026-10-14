@@ -72,6 +72,8 @@ class WeatherMarket:
     token_ids: List[str] = field(default_factory=list)
     yes_token_id: str = ""
     no_token_id: str = ""
+    yes_probability: Optional[float] = None
+    no_probability: Optional[float] = None
     resolution_source: str = ""
     end_date: str = ""
     active: bool = False

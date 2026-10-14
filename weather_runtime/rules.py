@@ -344,6 +344,23 @@ def normalize_market(row: dict[str, Any]) -> WeatherMarket:
         for value in _list(_first(row, "clobTokenIds", "clob_token_ids", "token_ids", default=[]))
         if value
     ]
+    outcome_prices_raw = _first(row, "outcomePrices", "outcome_prices", default=[])
+    if isinstance(outcome_prices_raw, str):
+        try:
+            outcome_prices_raw = json.loads(outcome_prices_raw)
+        except ValueError:
+            outcome_prices_raw = []
+    outcome_prices = (
+        [value for value in _list(outcome_prices_raw)]
+        if isinstance(outcome_prices_raw, list)
+        else []
+    )
+    yes_probability = as_float(outcome_prices[0]) if len(outcome_prices) == 2 else None
+    no_probability = as_float(outcome_prices[1]) if len(outcome_prices) == 2 else None
+    if yes_probability is not None and not 0.0 <= yes_probability <= 1.0:
+        yes_probability = None
+    if no_probability is not None and not 0.0 <= no_probability <= 1.0:
+        no_probability = None
     category = str(_first(row, "category", "marketCategory", default="") or "").strip().lower()
     event_group_id = extract_event_group_id(row)
     outcome = str(_first(row, "outcome", "groupItemTitle", "group_item_title", default="") or "").strip()
@@ -400,6 +417,8 @@ def normalize_market(row: dict[str, Any]) -> WeatherMarket:
         token_ids=token_ids,
         yes_token_id=token_ids[0] if token_ids else "",
         no_token_id=token_ids[1] if len(token_ids) > 1 else "",
+        yes_probability=yes_probability,
+        no_probability=no_probability,
         resolution_source=resolution_source,
         end_date=str(_first(row, "endDate", "end_date", default="") or ""),
         active=bool(as_bool(_first(row, "active", default=False), False)),
