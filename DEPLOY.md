@@ -1,285 +1,527 @@
-# weatherarb 部署手册（迁移到新服务器）
+# weatherarb 部署手册
 
-目标：在新机器上 `clone` 后按本文部署，达到与当前生产机相同效果：
+本文描述在一台新 Linux 服务器上从零 clone、配置、验证并常驻运行 weatherarb 的完整流程。默认安装路径为 `/opt/weatherarb`；如果改用其他路径，必须同步修改 systemd unit 中的 `WorkingDirectory`、`ExecStart` 和日志路径。
 
-- 常驻扫描 + 看板（`0.0.0.0:8793`）
-- Gamma sync + Synoptic/CLOB 只读拉取
-- `LIVE_ORDERS=true` / `LIMIT_ORDERS=true` 时自动挂/撤限价单
-- systemd 开机自启，日志落到 `data/run/weatherarb.log`
+部署完成后的效果：
 
-本文路径默认安装到 `/opt/weatherarb`。可改成任意目录，但 **systemd 里三处路径要一起改**。
+- 常驻扫描 Polymarket 天气市场，提供看板与 API，默认监听 `0.0.0.0:8793`
+- 从 Gamma 同步市场，从 Synoptic / NOAA 拉取观测，从 CLOB 拉取盘口
+- 支持锁定桶限价单、日趋势 FAK、动态 0.999 退出、扫尾盘 dry-run/live
+- 通过 systemd 开机自启，进程崩溃自动重启
 
----
+## 1. 部署前检查
 
-## 0. 迁移注意（先读）
+### 1.1 系统要求
 
-1. **不要两台机器同时用同一钱包 live 跑。** 否则会重复挂单。新机验证通过后，先停旧机再开新机 live。
-2. `.env` **不会进 git**，必须从旧机手动拷贝。
-3. 若希望新机继承「已挂过哪些 token」的去重状态，可额外拷贝旧机  
-   `data/pm-weather-live/orders.jsonl`（可选；不拷贝会重新扫描后按当前锁重新挂）。
-4. 系统建议：**Ubuntu 22.04+ x86_64**，能直连外网（或自行配代理）。
-5. Live 下单需要 **Python 3.11+**（官方 `polymarket-client`）。系统自带 3.10 不够。
-
-需要访问的公网（直连）：
-
-| 用途 | 主机示例 |
+| 项目 | 要求 |
 |---|---|
-| 市场目录 | `gamma-api.polymarket.com` |
-| 盘口 / 下单 | `clob.polymarket.com` |
-| 气象（NOAA Synoptic） | `api.synopticdata.com`、`www.weather.gov` |
-| 看板端口 | TCP `8793`（按需对公网或仅内网开放） |
+| 系统 | Ubuntu 22.04 或更新版本，x86_64 |
+| Python | 3.11+，live 下单依赖 `polymarket-client` |
+| 内存 | 至少 2GB；启动后约 100-300MB，长跑需监控缓慢增长，接近 1.2GB 时安排重启 |
+| 磁盘 | 至少 10GB；系统会自动清理部分滚动日志 |
+| 网络 | 能访问 Gamma、CLOB、Open-Meteo、Synoptic / NOAA |
 
----
+需要访问的外部服务：
 
-## 1. 安装系统依赖
+| 用途 | 主机 |
+|---|---|
+| 市场目录与结算价格 | `gamma-api.polymarket.com` |
+| 盘口与订单 | `clob.polymarket.com` |
+| 全天天气预报 | `api.open-meteo.com` |
+| 气象站观测 | `api.synopticdata.com`、`www.weather.gov` |
+
+如服务器不能直连，可在 `.env` 配置 `WEATHER_PROXY` / `WEATHER_PROXY_FALLBACK` / `PM_PROXY`。
+
+### 1.2 Live 安全规则
+
+**绝对不要让两台机器同时使用同一个钱包 live 运行。** 否则会重复下单、重复挂单或重复管理同一持仓。
+
+推荐迁移顺序：
+
+1. 新机先以 `LIVE_ORDERS=false` 完成冒烟与验收
+2. 停止旧机 live 服务
+3. 迁移交易状态文件
+4. 启动新机 live 服务
+5. 确认新机稳定后，旧机保持停止，不要再启动
+
+`.env` 不进 Git，必须在新机手动创建。不要把私钥写入文档、issue、聊天记录或截图。
+
+## 2. 安装系统依赖
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y curl ca-certificates git build-essential
 ```
 
-安装 `uv`（用来装 Python 3.11 和虚拟环境）：
+安装 `uv`，用它管理 Python 3.11 和虚拟环境：
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
-# 可写入 ~/.bashrc
 uv --version
 ```
 
----
+建议把 `export PATH="$HOME/.local/bin:$PATH"` 写入 `~/.bashrc`。
 
-## 2. Clone 代码
+## 3. Clone 代码
+
+HTTPS 方式：
 
 ```bash
 sudo mkdir -p /opt
-sudo git clone git@github.com:WalterLsaacson/weatherarb.git /opt/weatherarb
-# 若用 HTTPS：
-# sudo git clone https://github.com/WalterLsaacson/weatherarb.git /opt/weatherarb
-
+sudo git clone https://github.com/WalterLsaacson/weatherarb.git /opt/weatherarb
 sudo chown -R "$USER:$USER" /opt/weatherarb
 cd /opt/weatherarb
 git checkout main
 git pull --ff-only
 ```
 
-SSH 推拉若沿用本机那把部署密钥，可在**本仓库**设置（不要改全局 `user.*`）：
+SSH 方式：
 
 ```bash
-# 示例：密钥路径按新机实际位置修改
-git config core.sshCommand 'ssh -i /root/.ssh/dqdhook-server -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new'
+sudo mkdir -p /opt
+sudo git clone git@github.com:WalterLsaacson/weatherarb.git /opt/weatherarb
+sudo chown -R "$USER:$USER" /opt/weatherarb
+cd /opt/weatherarb
 ```
 
----
+如果使用专用 SSH key，只配置在本仓库，避免修改全局 Git 身份：
 
-## 3. Python 3.11 虚拟环境 + live 依赖
+```bash
+git config core.sshCommand "ssh -i /path/to/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+```
+
+## 4. 创建 Python 3.11 虚拟环境
 
 ```bash
 cd /opt/weatherarb
 uv python install 3.11
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python -r requirements-live.txt
+```
 
+验证：
+
+```bash
 .venv/bin/python --version
-# 期望：Python 3.11.x
 .venv/bin/python -c "from polymarket.clients.secure import SecureClient; print('SDK OK', SecureClient)"
 ```
 
-只跑 dry-run / 看板、不下单时，可以跳过 `requirements-live.txt`，用系统 `python3` 也能起 fixture；**要与本机同样 live 效果则必须装 SDK。**
+如果只部署看板 / dry-run，理论上可以不安装 `requirements-live.txt`，但为了运维一致性，建议始终安装。
 
----
+## 5. 运行测试
 
-## 4. 配置 `.env`
+```bash
+cd /opt/weatherarb
+.venv/bin/python -m unittest discover -s tests
+```
+
+预期最后一行是 `OK`。测试过程中可能打印 `LIVE auto-take`、`LIMIT LIVE`、`EXIT SELL` 等内容，这些来自 fixtures 和 mock，不会访问交易所，也不是真实订单。
+
+## 6. 配置 `.env`
 
 ```bash
 cd /opt/weatherarb
 cp deploy/env.example .env
 chmod 600 .env
-# 把旧机 .env 内容贴进来，或逐项填写
+vi .env
 ```
 
-与本机对齐的关键字段：**私钥 / FUNDER / SYNOPTIC_API_TOKEN / LIVE_ORDERS / LIMIT_ORDERS 及限额**。示例见 `deploy/env.example`。
-
-常用含义：
+必须填写：
 
 | 变量 | 说明 |
 |---|---|
 | `PRIVATE_KEY` | Polymarket 签名私钥 |
-| `FUNDER` | 资金地址（proxy / 实际出资地址） |
-| `SIGNATURE_TYPE` | 本机为 `3`（与账户类型一致） |
-| `CHAIN_ID` | `137`（Polygon） |
-| `LIVE_ORDERS` | `true` 才真实下单；否则 dry-run |
-| `LIMIT_ORDERS` | `true` 时对锁定桶挂 GTC |
-| `LIMIT_ORDER_PRICE` | 0.01 档限价，本机 `0.99` |
-| `LIMIT_ORDER_PRICE_001` | 0.001 档限价，本机 `0.995` |
-| `MAX_ORDER_USDC` | FAK 吃单名义本金上限 |
-| `LIMIT_ORDER_USDC` | GTC 挂单目标名义本金；live 时实际为 `min(可用余额, LIMIT_ORDER_USDC)` |
-| `DYNAMIC_EXIT` | `true` 时，对未预留的天气持仓自动挂 GTC 卖出 |
-| `EXIT_PRICE_001` | 动态卖出限价，默认 `0.999`；仅 0.001 档市场会挂单，0.01 档市场直接跳过 |
-| `EXIT_MIN_SIZE` | 动态卖出最小持仓数量，同时受交易所最小下单数量约束 |
-| `EXIT_INTERVAL_S` | 动态持仓扫描间隔秒数，默认 `1800` |
-| `EXIT_MAX_ORDERS_PER_CYCLE` | 每轮扫描最多新增的动态卖出单数量 |
-| `EXIT_UNAVAILABLE_RETRY_S` | 无订单簿/无效 token 的重试间隔秒数 |
-| `DIURNAL_FORECAST_GATE` | `true` 时，用 Open-Meteo 全天预报比较事件日与前一日天气类型，并用事件日预报温度门禁最低/最高温（最低温向下取整、最高温向上取整）；不同、取数失败或预报温度未达到当前运行值则整天禁用 Diurnal |
-| `SWEEP_TAIL_ENABLED` | `true` 时启用多腿概率扫尾发现；仅依据 Gamma `outcomePrices` 判断唯一 `>=0.99` 档位与其他 `<=0.01` 档位 |
-| `SWEEP_TAIL_ORDERS` | 独立真实下单开关；`false` 时只记录 `data/pm-weather-live/sweep_tail_opportunities.jsonl`，不提交扫尾盘订单 |
-| `SWEEP_TAIL_ORDER_USDC` | 扫尾盘单腿订单名义金额；执行价仍受 `MAX_ASK=0.995` 限制 |
-| `FORECAST_CACHE_TTL_S` | 全天预报缓存秒数，默认 `3600` |
-| `SYNOPTIC_API_TOKEN` | Synoptic 气象 API token |
-| `POLY_API_KEY` / `SECRET` / `PASSPHRASE` | 可留空；缺省时由 SDK 用私钥派生 |
+| `FUNDER` | 出资 / proxy 钱包地址 |
+| `SIGNATURE_TYPE` | 与钱包类型匹配；当前生产使用 `3` |
+| `SYNOPTIC_API_TOKEN` | Synoptic / MesoWest API token |
 
-改完 `.env` 后必须 `systemctl restart weatherarb`。
+以下是与当前生产策略一致的推荐基线，不含密钥。第一次部署时建议先保持所有 live 开关为 `false`，完成在线 dry-run 后再开启：
 
----
+```env
+LIVE_ORDERS=true
+MAX_ORDER_USDC=5
+MIN_NET_EDGE=0.0075
+MAX_ASK=0.995
+MAX_SLIPPAGE=0.003
 
-## 5. 数据目录（可选迁移）
+LIMIT_ORDERS=true
+LIMIT_ORDER_USDC=5
+LIMIT_ORDER_PRICE=0.99
+LIMIT_ORDER_PRICE_001=0.995
+LIMIT_ORDER_MIN_PRICE=0.01
+LIMIT_ORDER_MAX_PRICE=0.99
 
-```bash
-mkdir -p /opt/weatherarb/data/run /opt/weatherarb/data/pm-weather-live
+DYNAMIC_EXIT=true
+EXIT_PRICE_001=0.999
+EXIT_MIN_SIZE=5
+EXIT_INTERVAL_S=1800
+EXIT_MAX_ORDERS_PER_CYCLE=10
+EXIT_UNAVAILABLE_RETRY_S=3600
+
+DIURNAL_ORDERS=true
+DIURNAL_YES_ORDERS=true
+DIURNAL_NO_ORDERS=true
+DIURNAL_ORDER_USDC=5
+DIURNAL_MIN_PRICE=0.90
+DIURNAL_FORECAST_GATE=true
+FORECAST_CACHE_TTL_S=3600
+
+SWEEP_TAIL_ENABLED=true
+SWEEP_TAIL_ORDERS=false
+SWEEP_TAIL_ORDER_USDC=5
+SWEEP_TAIL_LEADER_MIN=0.99
+SWEEP_TAIL_LOSER_MAX=0.01
+SWEEP_TAIL_MIN_LEGS=3
 ```
 
-可选从旧机拷贝（停旧机 live 之后再拷更安全）：
+关键开关说明：
 
-```bash
-# 在旧机打包
-# tar czf weatherarb-data.tgz -C /root/workspace/weatherarb/data pm-weather-live
+| 变量 | 行为 |
+|---|---|
+| `LIVE_ORDERS` | 所有真实 FAK / 自动下单的总开关 |
+| `LIMIT_ORDERS` | 锁定桶 GTC 限价单 |
+| `DYNAMIC_EXIT` | 买入成交后自动挂 0.999 GTC 卖出；且受 `LIVE_ORDERS` 控制 |
+| `DIURNAL_ORDERS` | 日趋势策略 legacy 总开关 |
+| `DIURNAL_YES_ORDERS` | 日趋势买当前挡 YES；未设置时沿用 `DIURNAL_ORDERS` |
+| `DIURNAL_NO_ORDERS` | 日趋势买其他挡 NO |
+| `DIURNAL_FORECAST_GATE` | 事件日与前一日全天天气类型必须一致，且预报温度必须覆盖当前运行值；最低温向下取整，最高温向上取整 |
+| `SWEEP_TAIL_ENABLED` | 扫尾盘发现与记录 |
+| `SWEEP_TAIL_ORDERS` | 扫尾盘真实下单独立开关；`false` 表示 dry-run |
 
-# 在新机
-# tar xzf weatherarb-data.tgz -C /opt/weatherarb/data
-```
+修改 `.env` 后必须重启服务。
 
-至少建议拷贝：
+## 7. 迁移交易状态
 
-- `orders.jsonl`：已提交 GTC / 去重状态
-- 不强制：`latest.json`、`rules.auto.json`、`weather_catalog.json`（缺了会重新 sync）
-
-进程会每 **36 小时**自动清理体积较大的 `scan.jsonl` / `source_observations.jsonl` 等滚动日志；`orders.jsonl` 会保留。
-
----
-
-## 6. 先手动试跑（推荐）
-
-**Fixture 冒烟（不下单、不访问外网市场）：**
+如果这是全新钱包、全新数据集，可以跳过本节，直接创建数据目录：
 
 ```bash
 cd /opt/weatherarb
-.venv/bin/python run_weather.py --fixture fixtures --data-dir /tmp/weatherarb-fixture --host 127.0.0.1 --port 8793 --no-open
-# 浏览器或 curl：http://127.0.0.1:8793/api/health
-# Ctrl+C 结束
+mkdir -p data/pm-weather-live data/run
 ```
 
-**与生产相同的在线命令（确认 `.env` 后再开）：**
+如果是从旧 live 机器迁移，**必须先停旧机**，再打包状态文件：
+
+```bash
+# 旧机
+sudo systemctl stop weatherarb
+cd /root/workspace/weatherarb/data/pm-weather-live
+tar --ignore-failed-read -czf /tmp/weatherarb-state.tgz \
+  orders.jsonl \
+  exit_orders.jsonl \
+  dynamic_exit.json \
+  diurnal_seen.json \
+  sweep_tail_opportunities.jsonl
+```
+
+把 `/tmp/weatherarb-state.tgz` 传到新机后：
+
+```bash
+# 新机
+cd /opt/weatherarb
+mkdir -p data/pm-weather-live data/run
+tar -xzf /tmp/weatherarb-state.tgz -C data/pm-weather-live
+chmod 600 data/pm-weather-live/dynamic_exit.json
+```
+
+文件用途：
+
+| 文件 | 是否建议迁移 | 原因 |
+|---|---|---|
+| `orders.jsonl` | 必须 | 已提交 / 已成交 token 去重，避免重复买 |
+| `exit_orders.jsonl` | 必须 | 动态退出历史，避免重复挂卖单 |
+| `dynamic_exit.json` | 必须 | 当前卖单状态、成交量、closed 标记 |
+| `diurnal_seen.json` | 强烈建议 | 日趋势已买 / 已见过状态 |
+| `sweep_tail_opportunities.jsonl` | 建议 | 扫尾盘机会、执行审计、resolution 记录 |
+
+以下文件**不需要**迁移，服务会自动重建：
+
+- `latest.json`
+- `market_snapshot.json`
+- `rules.auto.json`
+- `weather_catalog.json`
+- `scan.jsonl`
+- `source_observations.jsonl`
+- `synoptic_watch.jsonl`
+- `candidates.jsonl`
+- `health.json`
+
+不要直接打包整个 `data/` 目录。历史观测和扫尾日志可能非常大，不是部署必需品，还会拖慢启动并增加内存压力。
+
+服务会每 36 小时自动清理或截断部分滚动日志，但长期保留的订单、去重、动态退出状态不会被清空。
+
+## 8. 冒烟验证
+
+### 8.1 Fixture 冒烟
+
+不访问外部市场，也不下单：
 
 ```bash
 cd /opt/weatherarb
-.venv/bin/python run_weather.py \
-  --sync \
-  --data-dir data/pm-weather-live \
-  --interval 30 \
-  --host 0.0.0.0 \
+mkdir -p /tmp/weatherarb-fixture data/run
+LIVE_ORDERS=false LIMIT_ORDERS=false DYNAMIC_EXIT=false \
+  .venv/bin/python run_weather.py \
+  --fixture fixtures \
+  --data-dir /tmp/weatherarb-fixture \
+  --host 127.0.0.1 \
   --port 8793 \
   --no-open
 ```
 
-看到类似输出即正常：
-
-```text
-Weather scanner + board → http://0.0.0.0:8793/
-Mode → LIVE auto-take · max 5.0 USDC · ...
-```
-
-若 `.env` 里 `LIVE_ORDERS` 不是 true，会显示 `Mode → dry-run/read-only`。
-
-健康检查：
+另开一个终端：
 
 ```bash
-curl -sS http://127.0.0.1:8793/api/health
-curl -sS http://127.0.0.1:8793/api/status | python3 -m json.tool | head
+curl -fsS http://127.0.0.1:8793/api/health
+curl -fsS http://127.0.0.1:8793/api/status
 ```
 
-看板：`http://<新机IP>:8793/`
+确认后 `Ctrl+C` 结束进程。
 
----
+### 8.2 在线 dry-run
 
-## 7. 安装 systemd 常驻（与本机一致）
+代码读取 `.env` 时使用 `os.environ.setdefault`，因此命令行中显式传入的变量会覆盖 `.env`。以下命令即使 `.env` 里是 live，也会强制 dry-run：
 
 ```bash
 cd /opt/weatherarb
-# 若安装路径不是 /opt/weatherarb，先编辑 WorkingDirectory / ExecStart / 日志路径
-sudo cp deploy/weatherarb.service /etc/systemd/system/weatherarb.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now weatherarb.service
-sudo systemctl status weatherarb.service --no-pager -l
+mkdir -p /tmp/weatherarb-smoke
+LIVE_ORDERS=false \
+LIMIT_ORDERS=false \
+DYNAMIC_EXIT=false \
+DIURNAL_ORDERS=false \
+DIURNAL_YES_ORDERS=false \
+DIURNAL_NO_ORDERS=false \
+SWEEP_TAIL_ORDERS=false \
+  .venv/bin/python run_weather.py \
+  --sync \
+  --data-dir /tmp/weatherarb-smoke \
+  --interval 30 \
+  --host 127.0.0.1 \
+  --port 8794 \
+  --no-open
 ```
 
-常用命令：
+验收：
 
 ```bash
-sudo systemctl restart weatherarb
-sudo systemctl stop weatherarb
-journalctl -u weatherarb -n 100 --no-pager
-tail -f /opt/weatherarb/data/run/weatherarb.log
+curl -fsS http://127.0.0.1:8794/api/health
+curl -fsS http://127.0.0.1:8794/api/status
 ```
 
-生产启动参数（写死在 unit 里，勿漏）：
+健康接口应返回 `"ok": true`。观察 `ticks` 和 `last_scan_at` 持续刷新。确认无异常后 `Ctrl+C`。
+
+## 9. 安装 systemd 服务
+
+默认路径为 `/opt/weatherarb`：
+
+```bash
+cd /opt/weatherarb
+mkdir -p data/run
+sudo cp deploy/weatherarb.service /etc/systemd/system/weatherarb.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now weatherarb
+systemctl is-active weatherarb
+```
+
+如果安装路径不是 `/opt/weatherarb`，先在仓库内生成一份修改路径后的 unit，再安装：
+
+```bash
+cd /path/to/weatherarb
+cp deploy/weatherarb.service /tmp/weatherarb.service
+sed -i "s#/opt/weatherarb#$PWD#g" /tmp/weatherarb.service
+sudo cp /tmp/weatherarb.service /etc/systemd/system/weatherarb.service
+rm /tmp/weatherarb.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now weatherarb
+```
+
+常用管理命令：
+
+```bash
+sudo systemctl start weatherarb
+sudo systemctl stop weatherarb
+sudo systemctl restart weatherarb
+systemctl status weatherarb --no-pager -l
+journalctl -u weatherarb -n 200 --no-pager
+tail -f data/run/weatherarb.log
+```
+
+生产启动参数：
 
 ```text
 run_weather.py --sync --data-dir data/pm-weather-live --interval 30 --host 0.0.0.0 --port 8793 --no-open
 ```
 
----
+## 10. 生产验收清单
 
-## 8. 验收清单（对齐本机效果）
-
-- [ ] `systemctl is-active weatherarb` → `active`
-- [ ] `curl http://127.0.0.1:8793/api/health` → `"ok": true`
-- [ ] `/api/status` 中 `dry_run: false`，`trading.live_orders: true`，`limit_orders: true`
-- [ ] `trading.has_private_key: true`，`has_funder: true`
-- [ ] 一两分钟内 `ticks` 增加；`last_scan_at` 刷新；扫描总耗时通常约数十秒级（冷启动可能稍长）
-- [ ] 日志出现 `LIMIT LIVE ...` / `LIMIT CANCEL LIVE ...`（有锁定桶时）
-- [ ] 旧机已 `systemctl stop weatherarb`（避免双开）
-
----
-
-## 9. 防火墙 / 安全
+依次确认：
 
 ```bash
-# 若用 ufw，仅示例：开放看板（按需收紧来源 IP）
-# sudo ufw allow 8793/tcp
+systemctl is-active weatherarb
+curl -fsS http://127.0.0.1:8793/api/health
+curl -fsS http://127.0.0.1:8793/api/status
+systemctl show weatherarb -p MainPID -p NRestarts -p MemoryCurrent -p Result
+free -h
+stat -c "%s %n" data/pm-weather-live/latest.json data/pm-weather-live/health.json
 ```
 
-建议：
+验收标准：
 
-- `.env` 权限 `600`，不要提交到 git
-- 看板默认只读 UI，但公网暴露仍建议限制来源 IP
-- 迁移完成后轮换或确认私钥只在一台 live 机器上使用
+- [ ] `systemctl is-active weatherarb` 返回 `active`
+- [ ] 健康接口 `"ok": true`
+- [ ] `ticks` 增加，`last_scan_at` 刷新
+- [ ] live 部署时，状态接口显示私钥和 funder 已配置、live 开关符合预期
+- [ ] `NRestarts` 稳定，不因 OOM 反复增加
+- [ ] 启动后内存在约 100-300MB 量级；长跑中若 RSS 接近 1.2GB，安排计划内重启
+- [ ] `data/run/weatherarb.log` 无持续 traceback
+- [ ] 旧机 `weatherarb` 保持 `inactive`
 
----
+有真实机会时，日志可能出现：
 
-## 10. 故障排查
+```text
+LIMIT LIVE ...
+LIVE auto-take ...
+EXIT SELL ... @ 0.999 ...
+```
 
-| 现象 | 处理 |
-|---|---|
-| `ModuleNotFoundError: polymarket` | 确认用的是 `.venv/bin/python`，且已 `uv pip install -r requirements-live.txt` |
-| `Mode → dry-run` | 检查 `.env` 的 `LIVE_ORDERS=true` 后 restart |
-| 气象阶段极慢 / 大量 unavailable | 检查 `SYNOPTIC_API_TOKEN`、到 `api.synopticdata.com` 的连通性 |
-| 端口起不来 | `ss -ltnp \| grep 8793`；改 unit 里 `--port` |
-| 重复挂单 | 是否旧机仍在 live；或未带上旧 `orders.jsonl` 导致去重集为空（会重新挂当前锁） |
-| 服务起不来 | `tail -100 data/run/weatherarb.log` 与 `journalctl -u weatherarb -e` |
+没有机会时不会出现这些日志；不要把“没有机会”判断为服务异常。
 
----
+动态退出按 `EXIT_INTERVAL_S` 周期运行，默认 30 分钟。买入成交后不要期望立即出现卖单日志。
 
-## 11. 本机对照摘要
+## 11. 升级流程
 
-| 项 | 本机当前值 |
-|---|---|
-| 代码目录 | `/root/workspace/weatherarb`（新机建议 `/opt/weatherarb`） |
-| 解释器 | `.venv` + Python 3.11 + `polymarket-client==0.10.0` |
-| 端口 | `8793` |
-| 扫描间隔 | `30s` |
-| 数据目录 | `data/pm-weather-live` |
-| 日志 | `data/run/weatherarb.log` |
-| unit 名 | `weatherarb.service` |
-| live | `LIVE_ORDERS=true`，`LIMIT_ORDERS=true`，限价 `0.99`，单笔 `5` USDC |
+```bash
+sudo systemctl stop weatherarb
+cd /opt/weatherarb
+git fetch origin
+git pull --ff-only
+uv pip install --python .venv/bin/python -r requirements-live.txt
+.venv/bin/python -m unittest discover -s tests
+sudo systemctl start weatherarb
+systemctl is-active weatherarb
+```
 
-完成以上步骤后，新机行为应与本机一致：持续扫描天气终局、看板可访问，并在锁定桶上自动维护 GTC 限价单。
+如果 `.env` 有变化：
+
+```bash
+vi .env
+sudo systemctl restart weatherarb
+```
+
+## 12. 日志与磁盘维护
+
+日常检查：
+
+```bash
+du -sh data/pm-weather-live
+find data/pm-weather-live -maxdepth 1 -type f -printf "%s %f\n" | sort -nr | head -n 20
+```
+
+系统会自动处理大部分滚动日志。如果 `sweep_tail_opportunities.jsonl` 明显过大，可在停机窗口归档并只保留末尾：
+
+```bash
+sudo systemctl stop weatherarb
+cd /opt/weatherarb/data/pm-weather-live
+gzip -c sweep_tail_opportunities.jsonl > sweep_tail_opportunities.$(date -u +%Y%m%dT%H%M%SZ).jsonl.gz
+tail -n 5000 sweep_tail_opportunities.jsonl > sweep_tail_opportunities.recent.jsonl
+mv sweep_tail_opportunities.recent.jsonl sweep_tail_opportunities.jsonl
+sudo systemctl start weatherarb
+```
+
+历史归档只用于复盘，不参与下单；如果磁盘紧张，可以转移到对象存储或下载到本地后删除服务器上的 gzip。
+
+## 13. 安全建议
+
+- `.env` 必须保持 `600`
+- 看板端口不要无限制暴露公网；如需远程访问，用防火墙限制来源 IP 或通过 SSH tunnel
+- 确认私钥只存在于一台 live 机器
+- 迁移后确认旧机服务不会开机自启
+- 定期备份订单、退出状态和去重状态
+- 不要把 `data/` 或 `.env` 提交到 Git
+
+## 14. 故障排查
+
+### Python / SDK
+
+```text
+ModuleNotFoundError: polymarket
+```
+
+说明虚拟环境未安装 live 依赖，或用了系统 Python。执行：
+
+```bash
+uv pip install --python .venv/bin/python -r requirements-live.txt
+```
+
+### 服务无法启动
+
+```bash
+journalctl -u weatherarb -n 200 --no-pager
+tail -n 200 data/run/weatherarb.log
+```
+
+常见原因：
+
+- systemd unit 路径仍是 `/opt/weatherarb`
+- `data/run` 不存在
+- `.env` 权限或格式错误
+- Python 虚拟环境路径错误
+
+### 端口占用
+
+```bash
+ss -ltnp | grep 8793
+```
+
+先停止旧进程或改用其他端口。
+
+### 网络超时
+
+```bash
+curl -I https://gamma-api.polymarket.com
+curl -I https://clob.polymarket.com
+```
+
+确认网络、代理和 `SYNOPTIC_API_TOKEN`。如果部分服务超时，看板可能仍能启动，但不会有完整机会。
+
+### 内存反复重启
+
+```bash
+journalctl -u weatherarb --since "1 hour ago" --no-pager | grep -Ei "oom|killed|memory"
+free -h
+systemctl show weatherarb -p NRestarts -p MemoryCurrent
+```
+
+当前版本长跑时 RSS 可能缓慢增长。不要等 OOM killer 触发；在无紧急持仓处理需求时执行计划内重启：
+
+```bash
+sudo systemctl restart weatherarb
+systemctl show weatherarb -p MemoryCurrent
+```
+
+处理原则：
+
+- 不要把旧机完整 `data/` 目录直接搬到新机
+- 不要迁移巨大的 `latest.json` 和历史观测日志
+- 确认使用包含盘口快照压缩和启动水合保护的代码版本
+- 必要时归档并截断 `sweep_tail_opportunities.jsonl`
+
+### 疑似重复下单
+
+立即处理：
+
+```bash
+sudo systemctl stop weatherarb
+journalctl -u weatherarb -n 200 --no-pager
+```
+
+确认是否两台机器同时 live，是否漏迁 `orders.jsonl` / `diurnal_seen.json`。交易所侧还需人工检查未成交订单并撤单。
+
+### 配置未生效
+
+`.env` 修改后必须：
+
+```bash
+sudo systemctl restart weatherarb
+```
+
+命令行变量优先级高于 `.env`，冒烟时传入的 `LIVE_ORDERS=false` 只对当次进程生效。
