@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import os
 import shutil
 import tempfile
@@ -18,7 +19,7 @@ from weather_runtime.scanner import (
     WeatherScanner,
     WeatherScannerConfig,
 )
-from weather_runtime.service import RuntimeService
+from weather_runtime.service import RuntimeService, _sweep_tail_log_key
 from weather_runtime.storage import read_jsonl, write_json_atomic
 
 
@@ -86,6 +87,29 @@ def _scanner() -> WeatherScanner:
 
 
 class SweepTailTests(unittest.TestCase):
+    def test_sweep_tail_execution_log_key_ignores_volatile_book_fields(self) -> None:
+        def execution(book_fetched_at: str) -> dict[str, Any]:
+            return {
+                "record_type": "execution",
+                "event_group_id": "sweep-event",
+                "leader_outcome": "26",
+                "execution_orders": [
+                    {
+                        "token_id": "token",
+                        "status": "opportunity",
+                        "reason": SWEEP_TAIL_WINNER_YES,
+                        "best_ask": 0.99,
+                        "execution_price": 0.99,
+                        "book_fetched_at": book_fetched_at,
+                    }
+                ],
+            }
+
+        self.assertEqual(
+            _sweep_tail_log_key(execution("2026-09-05T01:00:00Z")),
+            _sweep_tail_log_key(execution("2026-09-05T01:30:00Z")),
+        )
+
     def test_outcome_prices_string_is_parsed(self) -> None:
         market = normalize_market(_market_payloads()[0])
         self.assertEqual(market.yes_probability, 0.005)
@@ -134,6 +158,29 @@ class SweepTailTests(unittest.TestCase):
         self.assertEqual(result["summary"]["sweep_tail_opportunities"], 0)
         self.assertTrue(all(row["status"] == "no_trade" for row in result["rows"]))
         self.assertTrue(all(row["reason"] == "ask_above_limit" for row in result["rows"]))
+
+    def test_scan_compacts_book_snapshots(self) -> None:
+        books = _books()
+        for book in books.values():
+            book.asks = [
+                {"price": 0.98 + index / 1000, "size": 1} for index in range(30)
+            ]
+            book.bids = [
+                {"price": 0.5 - index / 1000, "size": 1} for index in range(30)
+            ]
+        result = _scanner().scan(
+            [normalize_market(row) for row in _market_payloads()],
+            load_rules(FIXTURES / "rules.json"),
+            books=books,
+            now=SCAN_NOW,
+            fetch_books=False,
+        )
+        for row in result["rows"]:
+            self.assertLessEqual(len(row["book"]["asks"]), 8)
+            self.assertLessEqual(len(row["book"]["bids"]), 8)
+        for book in result["books"].values():
+            self.assertLessEqual(len(book["asks"]), 8)
+            self.assertLessEqual(len(book["bids"]), 8)
 
     def test_group_rejects_duplicate_leader_high_loser_and_missing_probability(self) -> None:
         scanner = _scanner()
@@ -189,14 +236,53 @@ class SweepTailTests(unittest.TestCase):
             resolutions = [
                 row for row in records if row.get("record_type") == "resolution"
             ]
+            executions = [
+                row for row in records if row.get("record_type") == "execution"
+            ]
             self.assertEqual(len(opportunities), 1)
             self.assertEqual(len(resolutions), 1)
+            self.assertEqual(len(executions), 1)
             self.assertEqual(opportunities[0]["leader_outcome"], "26")
             self.assertEqual(opportunities[0]["leg_count"], 11)
             self.assertEqual(len(opportunities[0]["intended_orders"]), 11)
             self.assertTrue(opportunities[0]["dry_run"])
+            self.assertTrue(opportunities[0]["has_order_opportunity"])
+            self.assertEqual(opportunities[0]["executable_order_count"], 11)
+            self.assertEqual(opportunities[0]["required_order_count"], 11)
+            self.assertEqual(opportunities[0]["missing_order_count"], 0)
+            self.assertTrue(opportunities[0]["full_group_executable"])
+            self.assertEqual(executions[0]["executable_order_count"], 11)
+            self.assertEqual(executions[0]["required_order_count"], 11)
+            self.assertEqual(executions[0]["missing_order_count"], 0)
+            self.assertTrue(executions[0]["full_group_executable"])
+            self.assertEqual(len(executions[0]["order_opportunities"]), 11)
+            self.assertEqual(len(executions[0]["execution_orders"]), 11)
             self.assertEqual(resolutions[0]["final_bucket_outcome"], "26")
             self.assertFalse((data_dir / "orders.jsonl").exists())
+
+            service._persist_sweep_tail(result)
+            records = read_jsonl(data_dir / "sweep_tail_opportunities.jsonl")
+            self.assertEqual(
+                len([row for row in records if row.get("record_type") == "execution"]),
+                1,
+            )
+
+            changed = copy.deepcopy(result)
+            changed["rows"][0]["status"] = "no_trade"
+            changed["rows"][0]["reason"] = "book_missing"
+            service._persist_sweep_tail(changed)
+            records = read_jsonl(data_dir / "sweep_tail_opportunities.jsonl")
+            self.assertEqual(
+                len([row for row in records if row.get("record_type") == "execution"]),
+                2,
+            )
+            latest_execution = [
+                row for row in records if row.get("record_type") == "execution"
+            ][-1]
+            self.assertEqual(latest_execution["executable_order_count"], 10)
+            self.assertEqual(latest_execution["required_order_count"], 11)
+            self.assertEqual(latest_execution["missing_order_count"], 1)
+            self.assertFalse(latest_execution["full_group_executable"])
 
     def test_live_sweep_tail_does_not_require_locked_no(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -238,6 +324,48 @@ class SweepTailTests(unittest.TestCase):
                     take.assert_called_once_with(
                         event_group_id="sweep-event",
                         target_outcome="26",
+                        live=True,
+                        require_locked_no=False,
+                        token_ledger="sweep_tail",
+                    )
+
+    def test_live_sweep_tail_allows_partial_leg_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            fixture = Path(temp) / "fixture"
+            data_dir = Path(temp) / "data"
+            shutil.copytree(FIXTURES, fixture)
+            service = RuntimeService(
+                root=fixture,
+                data_dir=data_dir,
+                fixture=None,
+                sync=False,
+                scanner_config=WeatherScannerConfig(sweep_tail_enabled=True),
+            )
+
+            def leg(index: int, executable: bool) -> dict:
+                return {
+                    "status": "opportunity" if executable else "no_trade",
+                    "reason": SWEEP_TAIL_LOSER_NO if executable else "book_missing",
+                    "order_side": "BUY",
+                    "book_token_id": f"sweep-token-{index}",
+                    "event_group_id": "sweep-event",
+                    "target_outcome": str(index),
+                    "trade_side": "NO",
+                }
+
+            rows = [leg(0, True)] + [leg(index, False) for index in range(1, 11)]
+            with patch.dict(
+                os.environ,
+                {"LIVE_ORDERS": "true", "SWEEP_TAIL_ORDERS": "true"},
+            ):
+                with patch.object(service, "take_opportunity", return_value={"ok": True}) as take:
+                    self.assertEqual(
+                        service._auto_take_opportunities({"rows": rows}),
+                        [{"ok": True}],
+                    )
+                    take.assert_called_once_with(
+                        event_group_id="sweep-event",
+                        target_outcome="0",
                         live=True,
                         require_locked_no=False,
                         token_ledger="sweep_tail",

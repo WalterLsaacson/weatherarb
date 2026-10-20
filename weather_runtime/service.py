@@ -170,6 +170,28 @@ def _compact_book(book: Any) -> dict[str, Any]:
     }
 
 
+def _sweep_tail_log_key(row: dict[str, Any]) -> str:
+    event_id = str(row.get("event_group_id") or "")
+    record_type = str(row.get("record_type") or "")
+    leader_outcome = str(row.get("leader_outcome") or "")
+    if record_type != "execution":
+        return "{}|{}|{}".format(event_id, record_type, leader_outcome)
+    signature = json.dumps(
+        [
+            [
+                item.get("token_id"),
+                item.get("status"),
+                item.get("reason"),
+            ]
+            for item in row.get("execution_orders") or []
+            if isinstance(item, dict)
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "{}|{}|{}|{}".format(event_id, record_type, leader_outcome, signature)
+
+
 def _list_row(row: dict[str, Any]) -> dict[str, Any]:
     observation = row.get("observation") if isinstance(row.get("observation"), dict) else {}
     market = row.get("market") if isinstance(row.get("market"), dict) else {}
@@ -674,15 +696,30 @@ class RuntimeService:
     def _load_sweep_tail_seen(self) -> None:
         """Remember sweep-tail events so resolutions survive signal loss."""
 
-        for record in read_jsonl(self._sweep_tail_log_path()):
-            if str(record.get("record_type") or "") != "opportunity":
-                continue
-            event_id = str(record.get("event_group_id") or "")
-            leader_outcome = str(record.get("leader_outcome") or "")
-            if event_id:
-                self._sweep_tail_seen_groups.add(event_id)
-            if event_id and leader_outcome:
-                self._sweep_tail_leaders.setdefault(event_id, set()).add(leader_outcome)
+        path = self._sweep_tail_log_path()
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except OSError:
+            return
+        with handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                event_id = str(record.get("event_group_id") or "")
+                leader_outcome = str(record.get("leader_outcome") or "")
+                self._jsonl_key_cache.setdefault(str(path), set()).add(
+                    _sweep_tail_log_key(record)
+                )
+                if event_id:
+                    self._sweep_tail_seen_groups.add(event_id)
+                if event_id and leader_outcome:
+                    self._sweep_tail_leaders.setdefault(event_id, set()).add(leader_outcome)
 
     def _catalog_path(self) -> Path:
         return self.data_dir / "weather_catalog.json"
@@ -690,7 +727,13 @@ class RuntimeService:
     def _hydrate_last_result(self) -> None:
         if self.fixture:
             return
-        latest = load_json(self.data_dir / "latest.json", default={})
+        latest_path = self.data_dir / "latest.json"
+        try:
+            if latest_path.stat().st_size > 12_000_000:
+                return
+        except OSError:
+            return
+        latest = load_json(latest_path, default={})
         if not isinstance(latest, dict):
             return
         groups = latest.get("event_groups")
@@ -1066,6 +1109,7 @@ class RuntimeService:
                 groups.setdefault(event_id, []).append(row)
 
         opportunity_rows: list[dict[str, Any]] = []
+        execution_rows: list[dict[str, Any]] = []
         for event_id, group_rows in groups.items():
             sweep = group_rows[0].get("sweep_tail")
             if not isinstance(sweep, dict):
@@ -1087,6 +1131,75 @@ class RuntimeService:
                         "price_limit": float(cfg.get("max_ask") or 0.995),
                     }
                 )
+            order_by_market = {
+                str(order.get("market_id") or ""): order
+                for order in intended_orders
+            }
+            execution_orders = []
+            for row in group_rows:
+                market_id = str(row.get("market_id") or "")
+                order = order_by_market.get(market_id)
+                if order is None:
+                    continue
+                token_id = str(
+                    row.get("book_token_id")
+                    or row.get("winning_token_id")
+                    or order.get("token_id")
+                    or ""
+                )
+                economics = row.get("economics") if isinstance(row.get("economics"), dict) else {}
+                book = row.get("book") if isinstance(row.get("book"), dict) else {}
+                execution_orders.append(
+                    {
+                        "market_id": order.get("market_id"),
+                        "outcome": order.get("outcome"),
+                        "trade_side": order.get("trade_side"),
+                        "token_id": token_id,
+                        "price_limit": order.get("price_limit"),
+                        "status": row.get("status"),
+                        "reason": row.get("reason"),
+                        "best_ask": economics.get("best_ask"),
+                        "execution_price": economics.get("execution_price"),
+                        "execution_shares": economics.get("execution_shares"),
+                        "worst_price": economics.get("worst_price"),
+                        "ask_depth_at_limit": economics.get("ask_depth_at_limit"),
+                        "book_age_s": economics.get("book_age_s"),
+                        "book_fetched_at": book.get("fetched_at"),
+                        "book_missing": bool(book.get("book_missing")),
+                        "tick_size": economics.get("tick_size") or book.get("tick_size"),
+                        "min_order_size": economics.get("min_order_size") or book.get("min_order_size"),
+                    }
+                )
+            order_opportunities = [
+                item
+                for item in execution_orders
+                if item.get("status") == "opportunity"
+            ]
+            blocked_reasons: dict[str, int] = {}
+            for item in execution_orders:
+                if item.get("status") == "opportunity":
+                    continue
+                reason = str(item.get("reason") or item.get("status") or "unknown")
+                blocked_reasons[reason] = blocked_reasons.get(reason, 0) + 1
+            execution_summary = {
+                "record_type": "execution",
+                "scan_at": stamp,
+                "event_group_id": event_id,
+                "leader_outcome": leader_outcome,
+                "leader_yes_probability": sweep.get("leader_yes_probability"),
+                "loser_max_yes_probability": sweep.get("loser_max_yes_probability"),
+                "leg_count": sweep.get("leg_count"),
+                "has_order_opportunity": bool(order_opportunities),
+                "executable_order_count": len(order_opportunities),
+                "required_order_count": len(execution_orders),
+                "missing_order_count": len(execution_orders) - len(order_opportunities),
+                "full_group_executable": bool(execution_orders)
+                and len(order_opportunities) == len(execution_orders),
+                "blocked_reason_counts": blocked_reasons,
+                "order_opportunities": order_opportunities,
+                "execution_orders": execution_orders,
+            }
+            execution_rows.append(execution_summary)
             opportunity_rows.append(
                 {
                     "record_type": "opportunity",
@@ -1102,6 +1215,14 @@ class RuntimeService:
                     "loser_max": sweep.get("loser_max"),
                     "legs": sweep.get("legs") or [],
                     "intended_orders": intended_orders,
+                    "has_order_opportunity": bool(order_opportunities),
+                    "executable_order_count": len(order_opportunities),
+                    "required_order_count": len(execution_orders),
+                    "missing_order_count": len(execution_orders) - len(order_opportunities),
+                    "full_group_executable": bool(execution_orders)
+                    and len(order_opportunities) == len(execution_orders),
+                    "blocked_reason_counts": blocked_reasons,
+                    "order_opportunities": order_opportunities,
                     "rows": [_slim_row(row) for row in group_rows],
                     "dry_run": not (
                         bool(cfg.get("live_orders")) and bool(cfg.get("sweep_tail_orders"))
@@ -1117,10 +1238,18 @@ class RuntimeService:
             append_jsonl_dedup(
                 path,
                 opportunity_rows,
-                key_fn=lambda row: "{}|{}|{}".format(
-                    row.get("event_group_id"), row.get("record_type"), row.get("leader_outcome")
-                ),
-                known_keys=self._jsonl_key_cache.get(str(path)),
+                key_fn=_sweep_tail_log_key,
+                known_keys=self._jsonl_key_cache.setdefault(str(path), set()),
+                key_cache=self._jsonl_key_cache,
+            )
+
+        if execution_rows:
+            path = self._sweep_tail_log_path()
+            append_jsonl_dedup(
+                path,
+                execution_rows,
+                key_fn=_sweep_tail_log_key,
+                known_keys=self._jsonl_key_cache.setdefault(str(path), set()),
                 key_cache=self._jsonl_key_cache,
             )
 
@@ -1171,10 +1300,8 @@ class RuntimeService:
             append_jsonl_dedup(
                 path,
                 resolution_rows,
-                key_fn=lambda row: "{}|{}|{}".format(
-                    row.get("event_group_id"), row.get("record_type"), row.get("leader_outcome")
-                ),
-                known_keys=self._jsonl_key_cache.get(str(path)),
+                key_fn=_sweep_tail_log_key,
+                known_keys=self._jsonl_key_cache.setdefault(str(path), set()),
                 key_cache=self._jsonl_key_cache,
             )
 

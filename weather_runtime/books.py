@@ -43,7 +43,7 @@ def normalize_book(token_id: str, payload: Any) -> Book:
         tick_size=as_float(payload.get("tick_size") or payload.get("tickSize")),
         min_order_size=as_float(payload.get("min_order_size") or payload.get("minOrderSize")),
         fetched_at=fetched_at,
-        raw=dict(payload),
+        raw={},
     )
 
 

@@ -62,6 +62,16 @@ def _without_raw(payload: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+_BOOK_SNAPSHOT_DEPTH = 8
+
+
+def _compact_book_payload(book: Book) -> dict[str, Any]:
+    payload = _without_raw(book.to_dict())
+    payload["asks"] = [dict(level) for level in book.asks[:_BOOK_SNAPSHOT_DEPTH]]
+    payload["bids"] = [dict(level) for level in book.bids[:_BOOK_SNAPSHOT_DEPTH]]
+    return payload
+
+
 def _yes_token(market: WeatherMarket) -> str:
     return str(market.yes_token_id or (market.token_ids[0] if market.token_ids else "") or "")
 
@@ -613,7 +623,7 @@ class WeatherScanner:
         )
         fetched = books.get(token_id) if token_id else None
         if fetched is not None:
-            row["book"] = _without_raw(self._book(fetched, token_id).to_dict())
+            row["book"] = _compact_book_payload(self._book(fetched, token_id))
         return token_id
 
     def _evaluate_matched_row(
@@ -631,7 +641,7 @@ class WeatherScanner:
             row.update({"status": "no_trade", "reason": "neg_risk_rejected"})
             return
         book = self._book(books.get(token_id), token_id)
-        row["book"] = _without_raw(book.to_dict())
+        row["book"] = _compact_book_payload(book)
         if market is None:
             row.update({"status": "no_trade", "reason": "market_not_found"})
             return
@@ -1700,7 +1710,7 @@ class WeatherScanner:
             "event_groups": group_views,
             "source_evidence": list(source_evidence.values()),
             "books": {
-                token_id: _without_raw(self._book(value, token_id).to_dict())
+                token_id: _compact_book_payload(self._book(value, token_id))
                 for token_id, value in books.items()
             },
         }
